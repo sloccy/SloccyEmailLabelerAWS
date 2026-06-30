@@ -6,39 +6,80 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrock"
+	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
 var fenceRe = regexp.MustCompile(`(?s)^` + "```" + `(?:json)?\s*|\s*` + "```" + `$`)
 
-// Client wraps the Bedrock runtime client with model configuration.
-type Client struct {
-	br    *bedrockruntime.Client
-	model string
+// Settings is the minimal interface the Client needs to look up per-call model
+// overrides. *db.Store and *db.FakeStore both satisfy this.
+type Settings interface {
+	GetSetting(ctx context.Context, key string) (string, error)
 }
 
-// NewClient creates a Bedrock client. host, numCtx, and timeout are ignored
-// (retained for signature compatibility with the old Ollama client).
-func NewClient(host, model string, numCtx int, timeout interface{}) *Client {
-	if model == "" {
-		model = os.Getenv("BEDROCK_MODEL")
+// Setting keys for the two independent model selections.
+const (
+	SettingClassifyModel = "classify_model"
+	SettingImproveModel  = "improve_model"
+)
+
+// ModelOption is one entry in the model-selection dropdown.
+type ModelOption struct {
+	ID    string // value sent to Bedrock (modelId or inferenceProfileId)
+	Label string // human-readable display name
+}
+
+// Client wraps the Bedrock runtime client with per-call model resolution.
+type Client struct {
+	br           *bedrockruntime.Client
+	bc           *bedrock.Client // control-plane, for listing
+	defaultModel string
+	settings     Settings
+}
+
+// NewClient creates a Bedrock client.
+// settings provides per-call model lookups (classify_model / improve_model keys).
+// defaultModel is the fallback when neither a setting nor BEDROCK_MODEL is set.
+func NewClient(settings Settings, defaultModel string) *Client {
+	if defaultModel == "" {
+		defaultModel = os.Getenv("BEDROCK_MODEL")
 	}
-	if model == "" {
-		model = "us.amazon.nova-micro-v1:0"
+	if defaultModel == "" {
+		defaultModel = "us.amazon.nova-micro-v1:0"
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	if err != nil {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
 	}
-	return &Client{br: bedrockruntime.NewFromConfig(cfg), model: model}
+	return &Client{
+		br:           bedrockruntime.NewFromConfig(cfg),
+		bc:           bedrock.NewFromConfig(cfg),
+		defaultModel: defaultModel,
+		settings:     settings,
+	}
 }
 
-func (c *Client) Model() string { return c.model }
+// Model returns the default model (used by tests and the troubleshooting UI).
+func (c *Client) Model() string { return c.defaultModel }
+
+// resolveModel looks up the setting key in the store; falls back to defaultModel.
+func (c *Client) resolveModel(ctx context.Context, key string) string {
+	if c.settings != nil {
+		if v, err := c.settings.GetSetting(ctx, key); err == nil && v != "" {
+			return v
+		}
+	}
+	return c.defaultModel
+}
 
 // ============================================================
 // Public types (unchanged from ollama.go for caller compatibility)
@@ -128,7 +169,7 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
-func (c *Client) classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string) {
+func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string, string) {
 	body := buildBody(email, prompts)
 	numPredict := int32(32)
 	if n := int32(len(prompts) * 10); n > numPredict {
@@ -144,7 +185,8 @@ func (c *Client) classifyPayload(email Email, prompts []Prompt) ([]types.Message
 		MaxTokens:   aws.Int32(numPredict),
 		Temperature: aws.Float32(0),
 	}
-	return msgs, inf, body
+	model := c.resolveModel(ctx, SettingClassifyModel)
+	return msgs, inf, body, model
 }
 
 // BuildClassifyRequestJSON returns the serialised Bedrock Converse payload (for Troubleshooting UI).
@@ -152,11 +194,11 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 	if len(prompts) == 0 {
 		return ""
 	}
-	msgs, inf, _ := c.classifyPayload(email, prompts)
+	msgs, inf, _, model := c.classifyPayload(context.Background(), email, prompts)
 	payload := map[string]any{
-		"modelId":            c.model,
-		"messages":           msgs,
-		"inferenceConfig":    inf,
+		"modelId":         model,
+		"messages":        msgs,
+		"inferenceConfig": inf,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -170,22 +212,21 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		return ClassifyResult{}, nil
 	}
 
-	msgs, inf, body := c.classifyPayload(email, prompts)
-	_ = body
+	msgs, inf, _, model := c.classifyPayload(ctx, email, prompts)
 
-	reqJSON, _ := json.Marshal(map[string]any{"modelId": c.model, "messages": msgs, "inferenceConfig": inf})
+	reqJSON, _ := json.Marshal(map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf})
 	res := ClassifyResult{RequestJSON: string(reqJSON)}
 
 	subject := email.Subject
 	if len(subject) > 60 {
 		subject = subject[:60]
 	}
-	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s)", subject, len(prompts)))
+	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s)", subject, len(prompts), model))
 
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:            aws.String(c.model),
-		Messages:           msgs,
-		InferenceConfig:    inf,
+		ModelId:         aws.String(model),
+		Messages:        msgs,
+		InferenceConfig: inf,
 	})
 	if err != nil {
 		store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
@@ -244,6 +285,7 @@ func (c *Client) StreamGeneratePromptInstruction(ctx context.Context, descriptio
 }
 
 func (c *Client) streamGenerate(ctx context.Context, description string, ch chan<- StreamChunk) error {
+	model := c.resolveModel(ctx, SettingImproveModel)
 	systemPrompt := "You write email filter rules for an AI classifier. Output only the rule text. No preamble, no drafts, no self-critique, no quotes, no explanation."
 	userMsg := fmt.Sprintf(
 		"Write a 2-4 sentence classifier instruction for emails matching: %q\n\n"+
@@ -254,7 +296,7 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 		description)
 
 	out, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-		ModelId: aws.String(c.model),
+		ModelId: aws.String(model),
 		System:  []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: systemPrompt}},
 		Messages: []types.Message{
 			{
@@ -307,6 +349,7 @@ Rules for rewriting:
 Remember: output ONLY the rewritten instructions text. No other text whatsoever.`
 
 func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error) {
+	model := c.resolveModel(ctx, SettingImproveModel)
 	var msgs []types.Message
 
 	if len(req.PriorConversation) > 0 {
@@ -338,7 +381,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	}
 
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId: aws.String(c.model),
+		ModelId: aws.String(model),
 		System:  []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: improveSystemPrompt}},
 		Messages: msgs,
 		InferenceConfig: &types.InferenceConfiguration{
@@ -367,6 +410,75 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	conv = append(conv, ChatMessage{Role: "assistant", Content: suggestion})
 
 	return suggestion, conv, nil
+}
+
+// ============================================================
+// Model listing (control-plane)
+// ============================================================
+
+// ListAvailableModels returns Bedrock models that support the Converse API and
+// streaming. It unions foundation model IDs with system-defined inference
+// profile IDs, deduplicating by ID, and returns them sorted by label.
+func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error) {
+	seen := make(map[string]bool)
+	var opts []ModelOption
+
+	// Foundation models: filter to text-in/text-out, streaming, on-demand.
+	fmOut, err := c.bc.ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{
+		ByOutputModality: bedrocktypes.ModelModalityText,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list foundation models: %w", err)
+	}
+	for _, m := range fmOut.ModelSummaries {
+		id := aws.ToString(m.ModelId)
+		if id == "" || seen[id] {
+			continue
+		}
+		// Must support text input.
+		if !slices.Contains(m.InputModalities, bedrocktypes.ModelModalityText) {
+			continue
+		}
+		// Must support streaming (needed for StreamGeneratePromptInstruction).
+		if m.ResponseStreamingSupported == nil || !*m.ResponseStreamingSupported {
+			continue
+		}
+		// Must be available on-demand (not fine-tune-only).
+		if !slices.Contains(m.InferenceTypesSupported, bedrocktypes.InferenceTypeOnDemand) {
+			continue
+		}
+		label := aws.ToString(m.ModelName)
+		if label == "" {
+			label = id
+		}
+		seen[id] = true
+		opts = append(opts, ModelOption{ID: id, Label: label})
+	}
+
+	// System-defined inference profiles (cross-region; e.g. us.amazon.nova-micro-v1:0).
+	// These are the IDs required for models that mandate an inference profile.
+	ipOut, err := c.bc.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+		TypeEquals: bedrocktypes.InferenceProfileTypeSystemDefined,
+	})
+	if err != nil {
+		// Non-fatal: some regions may not support this API yet.
+		ipOut = &bedrock.ListInferenceProfilesOutput{}
+	}
+	for _, p := range ipOut.InferenceProfileSummaries {
+		id := aws.ToString(p.InferenceProfileId)
+		if id == "" || seen[id] {
+			continue
+		}
+		label := aws.ToString(p.InferenceProfileName)
+		if label == "" {
+			label = id
+		}
+		seen[id] = true
+		opts = append(opts, ModelOption{ID: id, Label: label})
+	}
+
+	sort.Slice(opts, func(i, j int) bool { return opts[i].Label < opts[j].Label })
+	return opts, nil
 }
 
 // ============================================================
