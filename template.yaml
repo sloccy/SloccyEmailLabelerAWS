@@ -31,7 +31,8 @@ Parameters:
 Globals:
   Function:
     # PackageType: Image functions must not set Runtime/Handler.
-    Architectures: [arm64]
+    # x86_64 matches the amd64 GitHub Actions runner that builds the image (native, no QEMU).
+    Architectures: [x86_64]
     Environment:
       Variables:
         DDB_TABLE: !Ref OlamailTable
