@@ -12,7 +12,7 @@ type StoreLogger interface {
 	Log(level, message string)
 }
 
-// ClientIface is the LLM client contract used by processor and poller.
+// ClientIface is the LLM client contract used by processor, poller, and server.
 // *Client satisfies this; *FakeClient satisfies it for tests.
 type ClientIface interface {
 	Model() string
@@ -20,6 +20,7 @@ type ClientIface interface {
 	BuildClassifyRequestJSON(email Email, prompts []Prompt) string
 	StreamGeneratePromptInstruction(ctx context.Context, description string) <-chan StreamChunk
 	ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error)
+	ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 }
 
 // FakeClient is a test double for ClientIface. It returns a canned JSON
@@ -79,4 +80,10 @@ func (c *FakeClient) StreamGeneratePromptInstruction(ctx context.Context, _ stri
 
 func (c *FakeClient) ImprovePromptInstructions(_ context.Context, _ ImproveRequest) (string, []ChatMessage, error) {
 	return "fake improved", nil, nil
+}
+
+func (c *FakeClient) ListAvailableModels(_ context.Context) ([]ModelOption, error) {
+	return []ModelOption{
+		{ID: "fake-model", Label: "Fake Model"},
+	}, nil
 }

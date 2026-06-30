@@ -60,6 +60,11 @@ type server struct {
 	// OAuth state: short-lived in-memory map (single instance, no need for persistent storage)
 	oauthMu    sync.Mutex
 	oauthState map[string]time.Time
+
+	// Cached Bedrock model list (refreshed at most once per hour)
+	modelsMu        sync.Mutex
+	modelsCache     []llm.ModelOption
+	modelsFetchedAt time.Time
 }
 
 func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, p *poller.Poller, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
@@ -566,20 +571,56 @@ func dbPromptToView(p db.Prompt, accountMap map[int64]string) promptView {
 // Settings
 // ============================================================
 
+const modelCacheTTL = time.Hour
+
+// cachedModels returns the Bedrock model list, refreshing at most once per hour.
+func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	if time.Since(s.modelsFetchedAt) < modelCacheTTL && len(s.modelsCache) > 0 {
+		return s.modelsCache
+	}
+	models, err := s.ollama.ListAvailableModels(ctx)
+	if err != nil {
+		slog.Warn("list bedrock models", "err", err)
+		return s.modelsCache // return stale on error
+	}
+	s.modelsCache = models
+	s.modelsFetchedAt = time.Now()
+	return models
+}
+
+func settingsTemplateData(pi int, classifyModel, improveModel string, models []llm.ModelOption) map[string]any {
+	return map[string]any{
+		tmplKeyPollInterval: pi,
+		"ClassifyModel":     classifyModel,
+		"ImproveModel":      improveModel,
+		"Models":            models,
+	}
+}
+
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	pollInterval, _ := s.store.GetSetting(ctx, "poll_interval")
 	pi, _ := strconv.Atoi(pollInterval)
-	data := map[string]any{
-		tmplKeyPollInterval: pi,
-		"BedrockModel":      s.cfg.BedrockModel,
+	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
+	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
+	if classifyModel == "" {
+		classifyModel = s.cfg.BedrockModel
 	}
-	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "")
+	if improveModel == "" {
+		improveModel = s.cfg.BedrockModel
+	}
+	models := s.cachedModels(ctx)
+	s.fragmentResponse(w, "templates/fragments/settings_form.html",
+		settingsTemplateData(pi, classifyModel, improveModel, models), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
+
+	// Poll interval
 	pi := r.FormValue("poll_interval")
 	n, err := strconv.Atoi(pi)
 	if err != nil || n < s.cfg.MinPollInterval {
@@ -590,11 +631,37 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		s.poller.UpdateInterval(n)
 	}
 
-	data := map[string]any{
-		tmplKeyPollInterval: n,
-		"BedrockModel":      s.cfg.BedrockModel,
+	// Model selections — validate against available models to ignore garbage input
+	models := s.cachedModels(ctx)
+	validID := func(id string) bool {
+		for _, m := range models {
+			if m.ID == id {
+				return true
+			}
+		}
+		return false
 	}
-	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
+
+	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
+	if classifyModel == "" {
+		classifyModel = s.cfg.BedrockModel
+	}
+	if v := r.FormValue("classify_model"); v != "" && validID(v) {
+		classifyModel = v
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
+	}
+
+	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
+	if improveModel == "" {
+		improveModel = s.cfg.BedrockModel
+	}
+	if v := r.FormValue("improve_model"); v != "" && validID(v) {
+		improveModel = v
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
+	}
+
+	s.fragmentResponse(w, "templates/fragments/settings_form.html",
+		settingsTemplateData(n, classifyModel, improveModel, models), "Settings saved")
 }
 
 // ============================================================

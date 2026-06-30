@@ -45,11 +45,17 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 	if err := store.SeedSetting("poll_interval", strconv.Itoa(cfg.PollInterval)); err != nil {
 		log.Fatalf("seed settings: %v", err)
 	}
+	if err := store.SeedSetting(llm.SettingClassifyModel, cfg.BedrockModel); err != nil {
+		log.Fatalf("seed classify_model: %v", err)
+	}
+	if err := store.SeedSetting(llm.SettingImproveModel, cfg.BedrockModel); err != nil {
+		log.Fatalf("seed improve_model: %v", err)
+	}
 	secretKey, err := store.GetOrCreateSecretKey()
 	if err != nil {
 		log.Fatalf("secret key: %v", err)
 	}
-	llmClient := llm.NewClient("", cfg.BedrockModel, 0, time.Duration(0))
+	llmClient := llm.NewClient(store, cfg.BedrockModel)
 	gmailAuth := gmail.NewAuth(cfg.CredentialsFile)
 	return store, llmClient, gmailAuth, secretKey
 }
