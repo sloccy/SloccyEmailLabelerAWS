@@ -18,6 +18,8 @@ type Config struct {
 	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
 	DataDir            string // unused in Lambda; retained for Open() compat
 	Mode               string // "web" or "scan"
+	CfAccessTeamDomain string // e.g. https://yourteam.cloudflareaccess.com; enables Access JWT verification
+	CfAccessAud        string // Cloudflare Access application Audience (AUD) tag
 }
 
 func loadConfig() Config {
@@ -34,6 +36,8 @@ func loadConfig() Config {
 		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),
 		DataDir:            getEnv("DATA_DIR", "/tmp"),
 		Mode:               getEnv("MODE", "web"),
+		CfAccessTeamDomain: getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
+		CfAccessAud:        getEnv("CF_ACCESS_AUD", ""),
 	}
 }
 

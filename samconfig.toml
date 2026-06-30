@@ -13,4 +13,9 @@ confirm_changeset = false
 fail_on_empty_changeset = false
 parameter_overrides = [
     "CredentialsSsmArn=arn:aws:ssm:us-east-1:508768431323:parameter/ollamail/credentials",
+    # To protect the Web UI with Cloudflare Access (Google SSO), fill these in with your
+    # team domain and the Access application's AUD tag, then push. Setting CfAccessAud
+    # flips the Function URL to public (NONE) and the app starts enforcing the Access JWT.
+    "CfAccessTeamDomain=",
+    "CfAccessAud=",
 ]
