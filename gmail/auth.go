@@ -8,6 +8,9 @@ import (
 	"os"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -34,11 +37,41 @@ func NewAuth(credentialsFile string) *Auth {
 	return &Auth{credentialsFile: credentialsFile}
 }
 
+// ssmFetch reads a SecureString parameter and returns its decrypted value.
+// Overridable in tests to avoid hitting real AWS.
+var ssmFetch = func(ctx context.Context, name string) (string, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("load aws config: %w", err)
+	}
+	out, err := ssm.NewFromConfig(cfg).GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(name),
+		WithDecryption: aws.Bool(true),
+	})
+	if err != nil {
+		return "", fmt.Errorf("ssm get parameter %q: %w", name, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", fmt.Errorf("ssm parameter %q has no value", name)
+	}
+	return *out.Parameter.Value, nil
+}
+
 func (a *Auth) loadConfig() (*oauth2.Config, error) {
 	a.once.Do(func() {
-		// CREDENTIALS_JSON env var takes precedence (used in Lambda via SSM/Secrets Manager).
+		// Credential source precedence:
+		//  1. CREDENTIALS_JSON env var (raw JSON).
+		//  2. SSM SecureString named by CREDENTIALS_SSM_PARAM (used in Lambda).
+		//  3. Local credentials file (used in local/dev runs).
 		var data []byte
 		if raw := os.Getenv("CREDENTIALS_JSON"); raw != "" {
+			data = []byte(raw)
+		} else if param := os.Getenv("CREDENTIALS_SSM_PARAM"); param != "" {
+			raw, err := ssmFetch(context.Background(), param)
+			if err != nil {
+				a.cachedErr = fmt.Errorf("load credentials from ssm: %w", err)
+				return
+			}
 			data = []byte(raw)
 		} else {
 			var err error

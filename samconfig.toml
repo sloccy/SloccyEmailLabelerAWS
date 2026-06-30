@@ -1,0 +1,16 @@
+# SAM deploy configuration. Read by `sam deploy` locally and in CI (deploy.yml).
+# Contains no secrets — only the stack name, region, capabilities, and the ARN of the
+# SSM parameter that holds the Google OAuth credentials.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "ollamail"
+region = "us-east-1"
+resolve_s3 = true
+resolve_image_repos = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = [
+    "CredentialsSsmArn=arn:aws:ssm:us-east-1:508768431323:parameter/ollamail/credentials",
+]

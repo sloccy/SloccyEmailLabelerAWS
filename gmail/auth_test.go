@@ -1,12 +1,69 @@
 package gmail
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+// validCredsJSON is a minimal Google "web" OAuth client credentials document
+// that google.ConfigFromJSON accepts.
+const validCredsJSON = `{"web":{"client_id":"cid","client_secret":"sec",` +
+	`"auth_uri":"https://accounts.google.com/o/oauth2/auth",` +
+	`"token_uri":"https://oauth2.googleapis.com/token",` +
+	`"redirect_uris":["http://localhost"]}}`
+
+// ============================================================
+// loadConfig credential source precedence
+// ============================================================
+
+func TestLoadConfigCredentialSources(t *testing.T) {
+	t.Run("CREDENTIALS_JSON env wins, no SSM call", func(t *testing.T) {
+		t.Setenv("CREDENTIALS_JSON", validCredsJSON)
+		t.Setenv("CREDENTIALS_SSM_PARAM", "/should/not/be/read")
+
+		old := ssmFetch
+		t.Cleanup(func() { ssmFetch = old })
+		ssmFetch = func(context.Context, string) (string, error) {
+			t.Fatal("ssmFetch must not be called when CREDENTIALS_JSON is set")
+			return "", nil
+		}
+
+		cfg, err := NewAuth("/nonexistent.json").loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if cfg.ClientID != "cid" {
+			t.Errorf("ClientID = %q, want cid", cfg.ClientID)
+		}
+	})
+
+	t.Run("falls back to SSM when only CREDENTIALS_SSM_PARAM is set", func(t *testing.T) {
+		t.Setenv("CREDENTIALS_SSM_PARAM", "/ollamail/credentials")
+
+		old := ssmFetch
+		t.Cleanup(func() { ssmFetch = old })
+		var gotName string
+		ssmFetch = func(_ context.Context, name string) (string, error) {
+			gotName = name
+			return validCredsJSON, nil
+		}
+
+		cfg, err := NewAuth("/nonexistent.json").loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if gotName != "/ollamail/credentials" {
+			t.Errorf("ssmFetch name = %q", gotName)
+		}
+		if cfg.ClientID != "cid" {
+			t.Errorf("ClientID = %q, want cid", cfg.ClientID)
+		}
+	})
+}
 
 // ============================================================
 // TokenFromJSON
