@@ -19,3 +19,7 @@ COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 /lambda-adapter /opt
 # The Go binary implements the Runtime API in scan mode (lambda.Start) and runs the HTTP
 # server in web mode (wrapped by the adapter).
 COPY --from=build /bootstrap /var/runtime/bootstrap
+
+# provided.al2023's entrypoint requires a handler-name argument. The custom-runtime
+# binary (aws-lambda-go) ignores it, so any non-empty name works.
+CMD ["bootstrap"]
