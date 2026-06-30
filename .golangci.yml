@@ -1,0 +1,81 @@
+version: "2"
+
+linters:
+  enable:
+    # Core correctness
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    # Bug prevention
+    - bodyclose
+    - nilerr
+    - noctx
+    - durationcheck
+    - fatcontext
+    - rowserrcheck
+    - sqlclosecheck
+    - unparam
+    - copyloopvar
+    - makezero
+    - nosprintfhostport
+    - errchkjson
+    # Security
+    - gosec
+    - bidichk
+    - forcetypeassert
+    - reassign
+    # Code quality
+    - gocritic
+    - errorlint
+    - unconvert
+    - nakedret
+    - intrange
+    - modernize
+    - exhaustive
+    - nilnesserr
+    - exptostd
+    - errname
+    - gocheckcompilerdirectives
+    - iface
+    - revive
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+    - mirror
+    # Hygiene
+    - misspell
+    - dupword
+    - asciicheck
+    - musttag
+    - loggercheck
+    - nolintlint
+    - canonicalheader
+    - recvcheck
+    - sloglint
+    - predeclared
+    # Additional
+    - goconst
+    - nilnil
+    - prealloc
+    - perfsprint
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+    goconst:
+      ignore-tests: true
+    gosec:
+      excludes:
+        - G120 # request body size limited globally via MaxBytesReader middleware
+    staticcheck:
+      checks: ["all", "-QF1008", "-ST1000"]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

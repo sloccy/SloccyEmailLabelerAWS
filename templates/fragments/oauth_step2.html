@@ -1,0 +1,6 @@
+<div class="flex-grow-1">
+  <div class="fw-medium mb-2">Open the link and approve access</div>
+  <div class="small text-muted mb-2">Open the link below in your browser. After approving, your browser will try to open a page that fails to load — that is expected.</div>
+  <div class="url-box visible font-monospace small bg-base-200 border rounded p-2 text-primary mb-2" data-url="{{.AuthURL}}">{{.AuthURL}}</div>
+  <button class="btn btn-outline-secondary btn-sm" onclick="copyAuthUrl(this)">Copy Link</button>
+</div>

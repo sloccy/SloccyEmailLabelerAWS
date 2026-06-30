@@ -1,0 +1,10 @@
+{{if .}}
+  {{range .}}
+    {{template "prompt_card_view" .}}
+  {{end}}
+{{else}}
+<div class="empty">
+  <div class="empty-icon"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h11l13 13-10 10L4 15V4z" stroke-linejoin="round"/><circle cx="11" cy="11" r="2" fill="currentColor" stroke="none"/></svg></div>
+  No prompts yet. Add one to start labeling.
+</div>
+{{end}}

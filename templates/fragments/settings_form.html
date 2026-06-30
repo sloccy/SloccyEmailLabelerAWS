@@ -1,0 +1,36 @@
+<form id="settings-form" hx-patch="/fragments/settings" hx-target="#settings-container" hx-swap="innerHTML">
+  <div class="card">
+    <div class="card-body p-0">
+      <div class="d-flex align-items-center justify-content-between py-3 px-4 border-bottom setting-row">
+        <div><div class="fw-medium">Poll interval</div><div class="small text-muted mt-1">How often to scan for new emails (seconds). Minimum 30.</div></div>
+        <div class="flex-shrink-0 ms-4"><input type="number" class="form-control form-control-sm" name="poll_interval" min="30" step="30" value="{{.PollInterval}}" style="width:100px;text-align:right;"></div>
+      </div>
+      <div class="d-flex align-items-center justify-content-between py-3 px-4 border-bottom setting-row">
+        <div><div class="fw-medium">Ollama model</div><div class="small text-muted mt-1">Set via OLLAMA_MODEL in docker-compose.yml</div></div>
+        <div class="flex-shrink-0 ms-4"><span class="badge border border-primary text-primary font-monospace">{{.OllamaModel}}</span></div>
+      </div>
+      <div class="d-flex align-items-center justify-content-between py-3 px-4 setting-row">
+        <div><div class="fw-medium">Ollama host</div><div class="small text-muted mt-1">Set via OLLAMA_HOST in docker-compose.yml</div></div>
+        <div class="flex-shrink-0 ms-4"><span class="badge border border-primary text-primary font-monospace">{{.OllamaHost}}</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="my-3">
+    <button type="submit" class="btn btn-primary btn-sm">Save Changes</button>
+  </div>
+</form>
+
+<div class="card mt-4">
+  <div class="card-body p-0">
+    <div class="py-3 px-4 border-bottom">
+      <div class="fw-medium">Backup &amp; Restore</div>
+      <div class="small text-muted mt-1">Export all accounts, prompts, settings, and retention rules to a JSON file. Import adds data without overwriting existing configuration. OAuth credentials are not exported — you will need to re-authenticate accounts after import.</div>
+    </div>
+    <div class="d-flex gap-2 py-3 px-4">
+      <button type="button" class="btn btn-sm btn-secondary" onclick="window.location.href='/api/config/export'">Export Configuration</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="document.getElementById('config-import-input').click()">Import Configuration</button>
+      <input type="file" id="config-import-input" accept=".json" style="display:none" onchange="handleConfigImport(this)">
+    </div>
+    <div id="import-result" class="px-4 pb-3" style="display:none"></div>
+  </div>
+</div>

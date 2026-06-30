@@ -1,0 +1,67 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollamail-ollama
+    privileged: true
+    cpuset: "0,1,2,3,4"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=2
+      # Set to your poll interval (or just above). OLLAMA_KEEP_ALIVE counts
+      # from when the last LLM query finishes, and the poller uses wall-clock
+      # scheduling, so the model is always still warm when the next tick fires.
+      - OLLAMA_KEEP_ALIVE=60s
+    restart: unless-stopped
+    networks:
+      - internal
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  app:
+    build: .
+    image: ghcr.io/sloccy/ollamail:latest
+    container_name: ollamail-app
+    ports:
+      - "5001:5000"
+    volumes:
+      - /home/docker/docker/ollamail/data:/data
+      - /home/docker/docker/ollamail/credentials:/credentials
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:8b-q4_K_M
+      - DATA_DIR=/data
+      - CREDENTIALS_FILE=/credentials/credentials.json
+      - BASE_URL=http://10.0.0.5:5001
+      # Only process emails received within this many hours (default: 24)
+      # Increase for a longer catch-up window, e.g. 168 = last 7 days
+      - GMAIL_LOOKBACK_HOURS=24
+      # How long to wait (seconds) for Ollama to respond / pull a model (default: 600)
+      - OLLAMA_TIMEOUT=600
+      # LLM context window size in tokens (default: 4096)
+      # Increase if you have many rules or long emails, at the cost of more VRAM
+      #- OLLAMA_NUM_CTX=4096
+      # Max tokens the LLM can generate per response (default: 200)
+      # The JSON classification response is small, so 200 is plenty
+      #- OLLAMA_GENERATE_NUM_PREDICT=200
+      # How many emails to fetch per inbox scan (default: 50)
+      # Only unprocessed emails are classified, so higher values are safe
+      - GMAIL_MAX_RESULTS=10
+      - TZ=${TZ:-America/Denver}
+
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    networks:
+      - internal
+
+volumes:
+  ollama_data:
+
+networks:
+  internal:

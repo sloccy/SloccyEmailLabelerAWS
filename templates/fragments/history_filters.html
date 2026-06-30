@@ -1,0 +1,47 @@
+<div class="mb-0">
+  <label class="form-label">Account</label>
+  <select name="account_id" id="hist-filter-account" class="form-select form-select-sm"
+    hx-get="/fragments/history"
+    hx-target="#hist-body"
+    hx-swap="innerHTML"
+    hx-trigger="change"
+    hx-include="#hist-filter-form">
+    <option value="">All accounts</option>
+    {{range .Accounts}}
+    <option value="{{.ID}}">{{.Email}}</option>
+    {{end}}
+  </select>
+</div>
+<div class="mb-0">
+  <label class="form-label">Rule</label>
+  <select name="prompt_id" id="hist-filter-rule" class="form-select form-select-sm"
+    hx-get="/fragments/history"
+    hx-target="#hist-body"
+    hx-swap="innerHTML"
+    hx-trigger="change"
+    hx-include="#hist-filter-form">
+    <option value="">All rules</option>
+    <option value="none">Uncategorized</option>
+    {{range .Prompts}}
+    <option value="{{.ID}}">{{.Name}}</option>
+    {{end}}
+  </select>
+</div>
+<div class="mb-0">
+  <label class="form-label">Subject</label>
+  <input type="text" class="form-control form-control-sm" name="subject" id="hist-filter-subject" placeholder="Search subject…"
+    hx-get="/fragments/history"
+    hx-target="#hist-body"
+    hx-swap="innerHTML"
+    hx-trigger="input delay:350ms"
+    hx-include="#hist-filter-form">
+</div>
+<div class="mb-0">
+  <label class="form-label">Sender</label>
+  <input type="text" class="form-control form-control-sm" name="sender" id="hist-filter-sender" placeholder="Search sender…"
+    hx-get="/fragments/history"
+    hx-target="#hist-body"
+    hx-swap="innerHTML"
+    hx-trigger="input delay:350ms"
+    hx-include="#hist-filter-form">
+</div>

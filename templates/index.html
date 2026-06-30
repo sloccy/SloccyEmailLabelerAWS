@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OllaMail</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link href="/static/vendor/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/vendor/bootstrap.bundle.min.js" defer></script>
+  <script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>
+<div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-logo border-bottom mb-3 pb-3">
+      <img src="/static/logo.webp" alt="OllaMail">
+    </div>
+    <nav class="flex-grow-1">
+      <ul class="nav-menu">
+        <li><a class="active" data-page="dashboard" href="#dashboard"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span> Dashboard</a></li>
+        <li><a data-page="accounts" href="#accounts"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.314 2.686-6 6-6s6 2.686 6 6" stroke-linecap="round"/></svg></span> Accounts</a></li>
+        <li><a data-page="prompts" href="#prompts"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 2h5.5l6.5 6.5-5 5L2.5 7V2z" stroke-linejoin="round"/><circle cx="5.5" cy="5.5" r="1" fill="currentColor" stroke="none"/></svg></span> Prompts</a></li>
+        <li><a data-page="prompt-suggestions" href="#prompt-suggestions" id="nav-prompt-suggestions"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 2h12v9H2z" rx="1" stroke-linejoin="round"/><path d="M5 6h6M5 8.5h4" stroke-linecap="round"/></svg></span> Prompt Updates <span class="badge text-bg-primary rounded-pill ms-1 d-none" id="suggestions-badge"></span></a></li>
+        <li><a data-page="builder" href="#builder"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 14l8-8" stroke-linecap="round"/><path d="M10.5 2l1.2 2.3 2.3 1.2-2.3 1.2-1.2 2.3-1.2-2.3-2.3-1.2 2.3-1.2z" fill="currentColor" stroke="none"/></svg></span> Builder</a></li>
+        <li><a data-page="settings" href="#settings"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3" stroke-linecap="round"/></svg></span> Settings</a></li>
+        <li><a data-page="logs" href="#logs"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4h10M3 8h10M3 12h6" stroke-linecap="round"/></svg></span> Logs</a></li>
+        <li><a data-page="history" href="#history"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2.5 1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span> History</a></li>
+        <li><a data-page="retention" href="#retention"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="3" rx="1"/><path d="M3 6v7h10V6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 9.5h4" stroke-linecap="round"/></svg></span> Retention</a></li>
+        <li><a data-page="troubleshooting" href="#troubleshooting"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3" stroke-linecap="round"/><circle cx="8" cy="11" r="0.75" fill="currentColor" stroke="none"/></svg></span> Troubleshooting</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-footer mt-auto pt-3 border-top">
+      <div class="d-inline-flex align-items-center gap-1 font-monospace small text-muted">
+        <span class="status-dot" id="pollerDot"></span>
+        <span id="pollerLabel">idle</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <!-- Dashboard -->
+    <div class="page active" id="page-dashboard">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Dashboard</h2><div class="small text-muted">Overview of your email scanning setup</div></div>
+        <div><button class="btn btn-outline-info btn-sm" id="btn-scan-now" hx-post="/fragments/scan" hx-swap="none" hx-disabled-elt="this" hx-on::before-request="toast('Scan started\u2026','info')">&#9654; Scan Now</button></div>
+      </div>
+      <div id="dashboard-content"
+        hx-get="/fragments/dashboard"
+        hx-trigger="load, every 30s [document.getElementById('page-dashboard').classList.contains('active') &amp;&amp; document.visibilityState === 'visible'], refreshDashboard from:body"
+        hx-swap="innerHTML">
+        <div class="d-flex flex-column gap-3 p-2">
+          <div class="d-flex gap-3">
+            <div class="skeleton flex-grow-1 rounded-3" style="height:5rem"></div>
+            <div class="skeleton flex-grow-1 rounded-3" style="height:5rem"></div>
+            <div class="skeleton flex-grow-1 rounded-3" style="height:5rem"></div>
+            <div class="skeleton flex-grow-1 rounded-3" style="height:5rem"></div>
+          </div>
+          <div class="skeleton mt-2" style="height:1rem;width:8rem"></div>
+          <div class="skeleton" style="height:2rem;width:100%"></div>
+          <div class="skeleton" style="height:2rem;width:100%"></div>
+          <div class="skeleton" style="height:2rem;width:75%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Accounts -->
+    <div class="page" id="page-accounts">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Accounts</h2><div class="small text-muted">Gmail accounts being monitored</div></div>
+        <div><button class="btn btn-primary btn-sm" onclick="togglePanel('add-account-panel')">+ Add Account</button></div>
+      </div>
+      <div class="card p-4 mb-4 d-none" id="add-account-panel">
+        <h6 class="text-primary mb-3">Connect a Gmail Account</h6>
+        <div>
+          <div class="d-flex gap-3 mb-4" id="oauth-step-1">
+            <div class="badge border border-primary text-primary font-monospace flex-shrink-0 step-badge">1</div>
+            <div class="flex-grow-1">
+              <div class="fw-medium mb-2">Generate authorization link</div>
+              <div class="small text-muted mb-2">Click below to generate a Google authorization URL.</div>
+              <button class="btn btn-primary btn-sm"
+                hx-post="/fragments/oauth/start"
+                hx-target="#oauth-step-2-body"
+                hx-swap="innerHTML"
+                hx-on:htmx:after-request="if(event.detail.successful) document.getElementById('oauth-step-1').classList.add('done')">Generate Link</button>
+            </div>
+          </div>
+          <div class="d-flex gap-3 mb-4" id="oauth-step-2">
+            <div class="badge border border-primary text-primary font-monospace flex-shrink-0 step-badge">2</div>
+            <div id="oauth-step-2-body">
+              <div class="flex-grow-1">
+                <div class="fw-medium mb-2">Open the link and approve access</div>
+                <div class="small text-muted mb-2">Click "Generate Link" first.</div>
+              </div>
+            </div>
+          </div>
+          <div class="d-flex gap-3 mb-4" id="oauth-step-3">
+            <div class="badge border border-primary text-primary font-monospace flex-shrink-0 step-badge">3</div>
+            <div class="flex-grow-1">
+              <div class="fw-medium mb-2">Paste the redirect URL</div>
+              <div class="small text-muted mb-2">After approving, your browser will redirect to <code class="font-monospace">http://localhost/?code=...</code> which fails to load. Copy the full URL from your address bar and paste it here.</div>
+              <form hx-post="/fragments/oauth/exchange"
+                    hx-target="#accounts-list"
+                    hx-swap="innerHTML"
+                    hx-on:htmx:after-request="if(event.detail.successful) document.getElementById('add-account-panel').classList.add('d-none')">
+                <div class="mb-3">
+                  <input type="text" class="form-control form-control-sm font-monospace" name="url" id="oauth-redirect-url" placeholder="http://localhost/?state=...&code=...">
+                </div>
+                <button type="submit" class="btn btn-primary btn-sm">Connect Account</button>
+                <button type="button" class="btn btn-outline-secondary btn-sm ms-2" onclick="togglePanel('add-account-panel')">Cancel</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="accounts-list"
+        hx-get="/fragments/accounts"
+        hx-trigger="intersect once"
+        hx-swap="innerHTML">
+        <div class="d-flex flex-column gap-3 p-2">
+          <div class="skeleton rounded-3" style="height:5rem;width:100%"></div>
+          <div class="skeleton rounded-3" style="height:5rem;width:100%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Prompts -->
+    <div class="page" id="page-prompts">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Prompts</h2><div class="small text-muted">Rules the AI uses to decide which labels to apply</div></div>
+        <div><button class="btn btn-outline-secondary btn-sm" onclick="exportPrompts()" id="btn-export">&#8595; Export</button> <button class="btn btn-primary btn-sm" onclick="togglePanel('add-prompt-panel')">+ Add Prompt</button></div>
+      </div>
+
+      <div class="d-flex align-items-center gap-3 mb-4">
+        <label class="form-label mb-0 text-muted small text-nowrap">Show rules for:</label>
+        <select id="prompt-filter-account" name="account_id" class="form-select form-select-sm w-auto"
+          hx-get="/fragments/account-options?type=filter"
+          hx-trigger="intersect once"
+          hx-swap="innerHTML"
+          hx-on:htmx:after-swap="syncAccountSelects()">
+        </select>
+      </div>
+
+      <div class="card p-4 mb-4 d-none" id="add-prompt-panel">
+        <h6 class="text-primary mb-3">New Labeling Rule</h6>
+        <form hx-post="/fragments/prompts"
+              hx-target="#prompts-list"
+              hx-swap="innerHTML"
+              hx-on:htmx:after-request="if(event.detail.successful){ this.reset(); document.getElementById('add-prompt-panel').classList.add('d-none'); }">
+          <div class="form-grid-2">
+            <div>
+              <label class="form-label">Rule name</label>
+              <input type="text" class="form-control form-control-sm" name="name" placeholder="e.g. Urgent emails">
+            </div>
+            <div>
+              <label class="form-label">Gmail label to apply</label>
+              <input type="text" class="form-control form-control-sm" name="label_name" placeholder="e.g. AI/Urgent">
+              <div class="form-text">Label will be created in Gmail if it doesn't exist.</div>
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Apply to account</label>
+            <select name="account_id" id="new-prompt-account" class="form-select form-select-sm"></select>
+            <div class="form-text">Global rules run on every account. Account-specific rules only run for that account.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Instructions for the AI</label>
+            <textarea class="form-control form-control-sm textarea-tall" name="instructions" id="new-prompt-instructions" placeholder="Describe what kind of emails should get this label. Be specific."></textarea>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Actions when matched</label>
+            {{template "action_checkboxes" (dict "Prefix" "new-action" "ActionArchive" false "ActionSpam" false "ActionTrash" false "ActionMarkRead" false)}}
+          </div>
+          <div class="d-flex align-items-center gap-2 border-top pt-3 mb-3">
+            <input type="checkbox" class="form-check-input mt-0" name="stop_processing" value="1" id="new-stop-processing">
+            <label class="mb-0" for="new-stop-processing">Stop processing further rules if this one matches</label>
+          </div>
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary btn-sm">Save Rule</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="togglePanel('add-prompt-panel')">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="prompts-list"
+        hx-get="/fragments/prompts"
+        hx-trigger="intersect once, change from:#prompt-filter-account"
+        hx-include="#prompt-filter-account"
+        hx-swap="innerHTML">
+        <div class="d-flex flex-column gap-3 p-2">
+          <div class="skeleton rounded-3" style="height:6rem;width:100%"></div>
+          <div class="skeleton rounded-3" style="height:6rem;width:100%"></div>
+          <div class="skeleton rounded-3" style="height:6rem;width:75%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Builder -->
+    <div class="page" id="page-builder">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Prompt Builder</h2><div class="small text-muted">Describe what to filter — AI drafts the rule instruction</div></div>
+      </div>
+      <div style="max-width:600px;">
+        <div class="mb-3">
+          <label class="form-label">Describe the emails you want to label</label>
+          <textarea class="form-control" id="builder-description" style="min-height:6rem" placeholder="e.g. Promotional emails and newsletters from online stores that I didn't explicitly sign up for..."></textarea>
+        </div>
+        <button class="btn btn-primary btn-sm" id="btn-generate" onclick="generatePrompt()">&#9670; Generate Instruction</button>
+
+        <div id="builder-result" style="display:none;margin-top:28px;">
+          <hr>
+          <div id="builder-sse-container">
+            <h6 class="section-title">Generated instruction</h6>
+            <div class="mb-3">
+              <textarea class="form-control" id="builder-instruction" style="min-height:6rem"></textarea>
+              <div class="form-text">Edit if needed, then send it to the Prompts page.</div>
+            </div>
+          </div>
+          <button class="btn btn-outline-secondary btn-sm" id="btn-use-prompt" disabled onclick="useBuilderInstruction()">&#8599; Use this prompt</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="page" id="page-settings">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Settings</h2><div class="small text-muted">Configure scanning behavior</div></div>
+      </div>
+      <div style="max-width:520px;">
+        <div id="settings-container"
+          hx-get="/fragments/settings"
+          hx-trigger="intersect once"
+          hx-swap="innerHTML">
+          <div class="d-flex flex-column gap-3 p-2">
+            <div class="skeleton rounded-2" style="height:2.5rem;width:100%"></div>
+            <div class="skeleton rounded-2" style="height:2.5rem;width:100%"></div>
+            <div class="skeleton rounded-2" style="height:2.5rem;width:75%"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="page" id="page-logs">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Logs</h2><div class="small text-muted">Last 100 events</div></div>
+        <div><button class="btn btn-outline-secondary btn-sm" onclick="toggleLogDownloadPanel()">&#8659; Download</button> <button class="btn btn-outline-secondary btn-sm" hx-get="/fragments/logs" hx-target="#logs-content" hx-swap="innerHTML">&#8635; Refresh</button></div>
+      </div>
+      <div class="card p-4 mb-4 d-none" id="log-download-panel">
+        <h6 class="text-primary mb-3">Download Logs</h6>
+        <div class="form-grid-2 mb-3" style="max-width:560px;">
+          <div>
+            <label class="form-label" for="log-dl-start">From</label>
+            <input type="datetime-local" class="form-control form-control-sm" id="log-dl-start">
+          </div>
+          <div>
+            <label class="form-label" for="log-dl-end">To</label>
+            <input type="datetime-local" class="form-control form-control-sm" id="log-dl-end">
+          </div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="downloadLogs()">Download CSV</button>
+      </div>
+      <div id="logs-content"
+        hx-get="/fragments/logs"
+        hx-trigger="intersect once"
+        hx-swap="innerHTML">
+        <div class="d-flex flex-column gap-2 p-2">
+          <div class="skeleton" style="height:1.75rem;width:100%"></div>
+          <div class="skeleton" style="height:1.75rem;width:100%"></div>
+          <div class="skeleton" style="height:1.75rem;width:100%"></div>
+          <div class="skeleton" style="height:1.75rem;width:83%"></div>
+          <div class="skeleton" style="height:1.75rem;width:80%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- History -->
+    <div class="page" id="page-history">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Categorization History</h2><div class="small text-muted">Emails recently labeled by your rules</div></div>
+      </div>
+      <form id="hist-filter-form" class="d-flex flex-wrap gap-3 mb-4 align-items-end"
+        hx-get="/fragments/history/filters"
+        hx-trigger="intersect once"
+        hx-swap="innerHTML">
+        <div class="d-flex gap-3">
+          <div class="skeleton rounded-2" style="height:2.25rem;width:10rem"></div>
+          <div class="skeleton rounded-2" style="height:2.25rem;width:10rem"></div>
+          <div class="skeleton rounded-2" style="height:2.25rem;width:8rem"></div>
+        </div>
+      </form>
+      <div class="overflow-x-auto">
+        <table class="table table-hover table-sm table-striped align-middle history-table">
+          <thead>
+            <tr>
+              <th class="col-time">Time</th>
+              <th class="col-account d-none d-md-table-cell">Account</th>
+              <th class="col-subject">Subject</th>
+              <th class="col-sender">Sender</th>
+              <th class="col-rule">Rule</th>
+              <th class="col-actions">Actions</th>
+              <th class="col-edit"></th>
+            </tr>
+          </thead>
+          <tbody id="hist-body"
+            hx-get="/fragments/history"
+            hx-trigger="intersect once, refreshHistory from:body"
+            hx-swap="innerHTML">
+            <tr><td colspan="7"><div class="text-center text-muted py-5"><div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>No history yet. Labels will appear here after emails are scanned.</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Retention -->
+    <div class="page" id="page-retention">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Retention</h2><div class="small text-muted">Automatically move old emails to Trash</div></div>
+      </div>
+      <div class="d-flex align-items-center gap-3 mb-4">
+        <label class="form-label mb-0">Account</label>
+        <select id="retention-account-select" name="account_id" class="form-select form-select-sm w-auto"
+          hx-get="/fragments/account-options?type=retention"
+          hx-trigger="intersect once"
+          hx-swap="innerHTML">
+        </select>
+      </div>
+      <div id="retention-panel" style="max-width:620px;"
+        hx-get="/fragments/retention-query"
+        hx-trigger="change from:#retention-account-select"
+        hx-include="#retention-account-select"
+        hx-swap="innerHTML"></div>
+    </div>
+
+    <!-- Prompt Suggestions -->
+    <div class="page" id="page-prompt-suggestions">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Prompt Updates</h2><div class="small text-muted">AI-suggested improvements from manual corrections</div></div>
+      </div>
+      <div id="suggestions-list-container"
+        hx-get="/fragments/prompt-suggestions"
+        hx-trigger="intersect once, every 15s, refreshSuggestions from:window"
+        hx-swap="innerHTML">
+        <div class="d-flex flex-column gap-3">
+          <div class="skeleton rounded-3" style="height:4rem"></div>
+          <div class="skeleton rounded-3" style="height:4rem"></div>
+        </div>
+      </div>
+      <div id="suggestion-detail-container" class="mt-4"></div>
+    </div>
+
+    <!-- Troubleshooting -->
+    <div class="page" id="page-troubleshooting">
+      <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
+        <div><h2 class="fw-bold mb-1">Troubleshooting</h2><div class="small text-muted">Last 3 processed emails — Gmail data, LLM request, and LLM response</div></div>
+      </div>
+      <div hx-get="/fragments/troubleshooting" hx-trigger="intersect once" hx-swap="innerHTML">
+        <div class="skeleton rounded-3" style="height:200px"></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Recategorize Modal -->
+<div class="modal fade" id="recategorize-modal" tabindex="-1" aria-labelledby="recategorize-modal-label" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content" id="recategorize-modal-body">
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="position-fixed bottom-0 end-0 p-3" style="z-index:9999">
+  <div id="toast" class="toast align-items-center border-0" role="alert" aria-atomic="true">
+    <div class="d-flex">
+      <div class="toast-body" id="toast-body"></div>
+      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>
