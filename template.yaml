@@ -137,7 +137,8 @@ Resources:
         Variables:
           MODE: web
           AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
-          PORT: "8080"
+          # App listens on AWS_LWA_PORT; the adapter forwards Function URL requests here.
+          AWS_LWA_PORT: "8080"
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
