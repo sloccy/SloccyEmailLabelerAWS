@@ -1,16 +1,15 @@
-# Build stage — runs natively on the builder's arch, cross-compiles to arm64.
-# $BUILDPLATFORM keeps the build host-native (no QEMU) while GOARCH targets Lambda.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+# Build stage — builds natively on the CI runner (amd64), no cross-compile/QEMU.
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o /ollamail .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /ollamail .
 
 # Lambda runtime image (provided.al2023 = Amazon Linux 2023 + Lambda Runtime Interface).
-# Pinned to arm64 to match the function's Architectures: [arm64].
-FROM --platform=linux/arm64 public.ecr.aws/lambda/provided:al2023
+# Pinned to x86_64 to match the function's Architectures: [x86_64].
+FROM --platform=linux/amd64 public.ecr.aws/lambda/provided:al2023
 
 # Lambda Web Adapter — enables the web function to receive HTTP via Function URL.
 # Only the web function sets AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap.
