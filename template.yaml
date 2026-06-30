@@ -152,7 +152,10 @@ Resources:
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
       Timeout: 120
-      ReservedConcurrentExecutions: 1
+      # NOTE: ReservedConcurrentExecutions omitted — this account's Lambda concurrency
+      # quota is too low to reserve (would drop unreserved below the required minimum of 10).
+      # Overlap is safe: scans dedupe processed emails in DynamoDB. Re-add `ReservedConcurrentExecutions: 1`
+      # after requesting a concurrency-limit increase via Service Quotas.
       Environment:
         Variables:
           MODE: scan
