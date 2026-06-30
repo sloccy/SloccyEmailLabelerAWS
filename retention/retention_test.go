@@ -5,26 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
 )
 
-func newTestStore(t *testing.T) *db.Store {
+func newTestStore(t *testing.T) *db.FakeStore {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := db.Open(path)
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := s.Migrate(); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return db.NewFake()
 }
 
 // gmailServer sets up a fake Gmail API server and returns a gmail.Client backed by it.

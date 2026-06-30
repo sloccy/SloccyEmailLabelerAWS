@@ -7,23 +7,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sloccy/ollamail/db"
-	"github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
-	"github.com/sloccy/ollamail/processor"
-	"github.com/sloccy/ollamail/retention"
+	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
+	"github.com/sloccy/ollamail-aws/processor"
+	"github.com/sloccy/ollamail-aws/retention"
 )
 
 const cleanupInterval = time.Hour
 
-type processorFn func(ctx context.Context, store *db.Store, ollamaClient *llm.Client, gmailAuth *gmail.Auth, account db.Account, prompts []db.Prompt, cfg processor.ProcessConfig) (*gmail.ServiceWrapper, error)
+type processorFn func(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, gmailAuth *gmail.Auth, account db.Account, prompts []db.Prompt, cfg processor.ProcessConfig) (*gmail.ServiceWrapper, error)
 
-type cleanupFn func(ctx context.Context, store *db.Store, svc *gmail.Client, accountID int64)
+type cleanupFn func(ctx context.Context, store db.StoreIface, svc *gmail.Client, accountID int64)
 
 // Poller runs background email scans on a configurable interval.
 type Poller struct {
-	store        *db.Store
-	ollamaClient *llm.Client
+	store        db.StoreIface
+	ollamaClient llm.ClientIface
 	gmailAuth    *gmail.Auth
 	cfg          *Config
 
@@ -60,7 +60,7 @@ type Status struct {
 	NextRun string
 }
 
-func New(store *db.Store, ollamaClient *llm.Client, auth *gmail.Auth, cfg *Config) *Poller {
+func New(store db.StoreIface, ollamaClient llm.ClientIface, auth *gmail.Auth, cfg *Config) *Poller {
 	return &Poller{
 		store:          store,
 		ollamaClient:   ollamaClient,

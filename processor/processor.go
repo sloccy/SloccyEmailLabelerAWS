@@ -8,9 +8,9 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 // EmailModify tracks label changes for a single message.
@@ -22,7 +22,7 @@ type EmailModify struct {
 
 // setupAccountContext loads OAuth config, creates a Gmail client, and filters
 // prompts for the given account. Shared by ProcessAccount and BackfillLlmDebug.
-func setupAccountContext(ctx context.Context, store *db.Store, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt) (*gmailpkg.Client, []db.Prompt, error) {
+func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt) (*gmailpkg.Client, []db.Prompt, error) {
 	oauthCfg, err := gmailAuth.ConfigFromFile()
 	if err != nil {
 		return nil, nil, fmt.Errorf("load oauth config: %w", err)
@@ -50,7 +50,7 @@ func marshalGmailDebug(msg gmailpkg.Message) string {
 
 // ProcessAccount processes all new emails for one account.
 // Returns the Gmail service so it can be reused by retention.
-func ProcessAccount(ctx context.Context, store *db.Store, ollamaClient *llm.Client, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 	svc, prompts, err := setupAccountContext(ctx, store, gmailAuth, account, allPrompts)
 	if err != nil {
 		return nil, err
@@ -132,8 +132,8 @@ func ProcessAccount(ctx context.Context, store *db.Store, ollamaClient *llm.Clie
 
 func processEmail(
 	ctx context.Context,
-	store *db.Store,
-	ollamaClient *llm.Client,
+	store db.StoreIface,
+	ollamaClient llm.ClientIface,
 	account db.Account,
 	msg gmailpkg.Message,
 	prompts []db.Prompt,

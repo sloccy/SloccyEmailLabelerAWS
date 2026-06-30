@@ -5,15 +5,15 @@ import (
 	"log/slog"
 	"runtime/debug"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
 )
 
 const maxRetentionIDs = 2500
 const maxPages = 5
 
 // Cleanup trashes emails that exceed retention rules for the given account.
-func Cleanup(ctx context.Context, store *db.Store, svc *gmailpkg.Client, accountID int64) {
+func Cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, accountID int64) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("retention panic", "account_id", accountID, "err", r, "stack", string(debug.Stack()))
@@ -25,7 +25,7 @@ func Cleanup(ctx context.Context, store *db.Store, svc *gmailpkg.Client, account
 	}
 }
 
-func cleanup(ctx context.Context, store *db.Store, svc *gmailpkg.Client, accountID int64) error {
+func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, accountID int64) error {
 	labelRules, err := store.GetLabelRetention(ctx, accountID)
 	if err != nil {
 		return err

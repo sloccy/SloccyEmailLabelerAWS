@@ -3,46 +3,26 @@ package processor
 import (
 	"database/sql"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 // ============================================================
 // Helpers
 // ============================================================
 
-func newTestStore(t *testing.T) *db.Store {
+func newTestStore(t *testing.T) *db.FakeStore {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := db.Open(path)
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := s.Migrate(); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return db.NewFake()
 }
 
-func newLLMServer(t *testing.T, response string) *llm.Client {
+func newLLMServer(t *testing.T, response string) *llm.FakeClient {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		resp := map[string]any{"message": map[string]string{"content": response}}
-		b, _ := json.Marshal(resp)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(b) //nolint:errcheck,gosec
-	}))
-	t.Cleanup(srv.Close)
-	return llm.NewClient(srv.URL, "test-model", 4096, 5*time.Second)
+	return llm.NewFakeClient(response)
 }
 
 // ============================================================
@@ -265,11 +245,7 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 
 func TestProcessEmail_LLMError(t *testing.T) {
 	store := newTestStore(t)
-	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "ollama down", http.StatusInternalServerError)
-	}))
-	t.Cleanup(errSrv.Close)
-	ollamaClient := llm.NewClient(errSrv.URL, "m", 4096, time.Second)
+	ollamaClient := llm.NewFakeErrorClient()
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "err1", Subject: "Test"}

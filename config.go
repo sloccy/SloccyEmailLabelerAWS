@@ -6,28 +6,23 @@ import (
 )
 
 type Config struct {
-	OllamaHost         string
-	OllamaModel        string
-	OllamaTimeout      int // seconds
-	OllamaNumCtx       int
+	BedrockModel       string
 	GmailMaxResults    int
 	GmailLookbackHours int
 	EmailBodyTrunc     int
 	LogRetentionDays   int
-	PollInterval       int // seconds
-	MinPollInterval    int // seconds
+	PollInterval       int // informational only; EventBridge controls cadence
+	MinPollInterval    int
 	HistoryMaxLimit    int
 	DebugLogging       bool
-	CredentialsFile    string
-	DataDir            string
+	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
+	DataDir            string // unused in Lambda; retained for Open() compat
+	Mode               string // "web" or "scan"
 }
 
 func loadConfig() Config {
 	return Config{
-		OllamaHost:         getEnv("OLLAMA_HOST", "http://localhost:11434"),
-		OllamaModel:        getEnv("OLLAMA_MODEL", "qwen3.5:4b-q4_K_M"),
-		OllamaTimeout:      getEnvInt("OLLAMA_TIMEOUT", 600),
-		OllamaNumCtx:       getEnvInt("OLLAMA_NUM_CTX", 4096),
+		BedrockModel:       getEnv("BEDROCK_MODEL", "us.amazon.nova-micro-v1:0"),
 		GmailMaxResults:    getEnvInt("GMAIL_MAX_RESULTS", 50),
 		GmailLookbackHours: getEnvInt("GMAIL_LOOKBACK_HOURS", 24),
 		EmailBodyTrunc:     getEnvInt("EMAIL_BODY_TRUNCATION", 3000),
@@ -37,7 +32,8 @@ func loadConfig() Config {
 		HistoryMaxLimit:    getEnvInt("HISTORY_MAX_LIMIT", 500),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
 		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),
-		DataDir:            getEnv("DATA_DIR", "/data"),
+		DataDir:            getEnv("DATA_DIR", "/tmp"),
+		Mode:               getEnv("MODE", "web"),
 	}
 }
 

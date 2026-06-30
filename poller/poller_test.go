@@ -2,35 +2,24 @@ package poller
 
 import (
 	"context"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
-	"github.com/sloccy/ollamail/processor"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
+	"github.com/sloccy/ollamail-aws/processor"
 )
 
-func newTestStore(t *testing.T) *db.Store {
+func newTestStore(t *testing.T) *db.FakeStore {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := db.Open(path)
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := s.Migrate(); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return db.NewFake()
 }
 
 // newTestPoller creates a Poller wired to a test store with no-op
-// processAccount and cleanup functions by default. The interval is set to
-// a short duration so tests don't have to wait long for ticks.
-func newTestPoller(t *testing.T, store *db.Store) *Poller {
+// processAccount and cleanup functions by default.
+func newTestPoller(t *testing.T, store *db.FakeStore) *Poller {
 	t.Helper()
 	cfg := &Config{
 		LookbackHours:  1,
@@ -39,13 +28,12 @@ func newTestPoller(t *testing.T, store *db.Store) *Poller {
 		LogRetention:   30,
 		DebugLogging:   false,
 	}
-	// NewClient/NewAuth args don't matter; the seam fns replace their usage.
-	p := New(store, llm.NewClient("http://localhost", "m", 4096, time.Second), gmailpkg.NewAuth("/dev/null"), cfg)
+	p := New(store, llm.NewFakeClient(""), gmailpkg.NewAuth("/dev/null"), cfg)
 	// Override with no-ops so tests don't hit real dependencies.
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		return nil, nil //nolint:nilnil
 	}
-	p.cleanup = func(_ context.Context, _ *db.Store, _ *gmailpkg.Client, _ int64) {}
+	p.cleanup = func(_ context.Context, _ db.StoreIface, _ *gmailpkg.Client, _ int64) {}
 	return p
 }
 
@@ -84,7 +72,7 @@ func TestRunNow(t *testing.T) {
 	p := newTestPoller(t, store)
 
 	var called atomic.Int32
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		called.Add(1)
 		return nil, nil //nolint:nilnil
 	}
@@ -136,7 +124,7 @@ func TestRunNow_NonReentrant(t *testing.T) {
 	release := make(chan struct{})
 	var callCount atomic.Int32
 
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		callCount.Add(1)
 		close(started)  // signal scan #1 is running
 		<-release       // block until released
@@ -224,7 +212,7 @@ func TestLoop_CallsProcessorPerActiveAccount(t *testing.T) {
 	store.ToggleAccount(context.Background(), inactiveID) //nolint:errcheck,gosec
 
 	var callCount atomic.Int32
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		callCount.Add(1)
 		return nil, nil //nolint:nilnil
 	}
@@ -253,7 +241,7 @@ func TestLoop_SkipsInactiveAccounts(t *testing.T) {
 	}
 
 	var called atomic.Int32
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		called.Add(1)
 		return nil, nil //nolint:nilnil
 	}
@@ -276,13 +264,13 @@ func TestLoop_CallsCleanupWhenWrapperReturned(t *testing.T) {
 		Email: "clean@test.com", CredentialsJson: `{}`,
 	})
 
-	p.processAccount = func(_ context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		// Return a non-nil wrapper → cleanup should be called.
 		return &gmailpkg.ServiceWrapper{Svc: nil}, nil
 	}
 
 	var cleanupCalled atomic.Int32
-	p.cleanup = func(_ context.Context, _ *db.Store, _ *gmailpkg.Client, _ int64) {
+	p.cleanup = func(_ context.Context, _ db.StoreIface, _ *gmailpkg.Client, _ int64) {
 		cleanupCalled.Add(1)
 	}
 
@@ -305,7 +293,7 @@ func TestCancellationDuringScan(t *testing.T) {
 	})
 
 	scanStarted := make(chan struct{})
-	p.processAccount = func(ctx context.Context, _ *db.Store, _ *llm.Client, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+	p.processAccount = func(ctx context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 		close(scanStarted)
 		// Block until context is canceled.
 		<-ctx.Done()

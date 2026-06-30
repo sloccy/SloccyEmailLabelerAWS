@@ -36,10 +36,17 @@ func NewAuth(credentialsFile string) *Auth {
 
 func (a *Auth) loadConfig() (*oauth2.Config, error) {
 	a.once.Do(func() {
-		data, err := os.ReadFile(a.credentialsFile)
-		if err != nil {
-			a.cachedErr = fmt.Errorf("read credentials file: %w", err)
-			return
+		// CREDENTIALS_JSON env var takes precedence (used in Lambda via SSM/Secrets Manager).
+		var data []byte
+		if raw := os.Getenv("CREDENTIALS_JSON"); raw != "" {
+			data = []byte(raw)
+		} else {
+			var err error
+			data, err = os.ReadFile(a.credentialsFile)
+			if err != nil {
+				a.cachedErr = fmt.Errorf("read credentials file: %w", err)
+				return
+			}
 		}
 		cfg, err := google.ConfigFromJSON(data, scopes...)
 		if err != nil {
