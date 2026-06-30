@@ -160,6 +160,19 @@ Resources:
           CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
           CF_ACCESS_AUD: !Ref CfAccessAud
 
+  # Allow anonymous invocation of the Web Function URL when it is public (AuthType NONE).
+  # SAM only auto-creates this when AuthType is statically NONE; our AuthType is an !If,
+  # so we add it explicitly. Access is still gated: the app rejects any request without a
+  # valid Cloudflare Access JWT, and Cloudflare sits in front.
+  WebFunctionUrlPublicPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CfAccessEnabled
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
   # ----------------------------------------------------------------
