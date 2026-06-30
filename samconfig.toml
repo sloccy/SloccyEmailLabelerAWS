@@ -11,11 +11,12 @@ resolve_image_repos = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 fail_on_empty_changeset = false
+# To protect the Web UI with Cloudflare Access (Google SSO), add these two entries to the
+# list below with real values, then push:
+#   "CfAccessTeamDomain=https://yourteam.cloudflareaccess.com",
+#   "CfAccessAud=<your Access application AUD tag>",
+# Setting CfAccessAud flips the Function URL to public (NONE) and the app enforces the
+# Access JWT. (Empty values are not allowed here — omit the params to stay AWS_IAM.)
 parameter_overrides = [
     "CredentialsSsmArn=arn:aws:ssm:us-east-1:508768431323:parameter/ollamail/credentials",
-    # To protect the Web UI with Cloudflare Access (Google SSO), fill these in with your
-    # team domain and the Access application's AUD tag, then push. Setting CfAccessAud
-    # flips the Function URL to public (NONE) and the app starts enforcing the Access JWT.
-    "CfAccessTeamDomain=",
-    "CfAccessAud=",
 ]
