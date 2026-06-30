@@ -86,7 +86,7 @@ func TestRunNow(t *testing.T) {
 	// Add an account → processAccount should be called once.
 	accID, err := store.UpsertAccount(context.Background(), db.UpsertAccountParams{
 		Email:           "test@example.com",
-		CredentialsJson: `{}`,
+		CredentialsJSON: `{}`,
 	})
 	if err != nil {
 		t.Fatalf("UpsertAccount: %v", err)
@@ -114,7 +114,7 @@ func TestRunNow_NonReentrant(t *testing.T) {
 	// Need an active account so processAccount is actually invoked.
 	_, err := store.UpsertAccount(context.Background(), db.UpsertAccountParams{
 		Email:           "block@test.com",
-		CredentialsJson: `{}`,
+		CredentialsJSON: `{}`,
 	})
 	if err != nil {
 		t.Fatalf("UpsertAccount: %v", err)
@@ -202,12 +202,12 @@ func TestLoop_CallsProcessorPerActiveAccount(t *testing.T) {
 	// Insert 2 active accounts.
 	for _, email := range []string{"acc1@test.com", "acc2@test.com"} {
 		store.UpsertAccount(context.Background(), db.UpsertAccountParams{ //nolint:errcheck,gosec
-			Email: email, CredentialsJson: `{}`,
+			Email: email, CredentialsJSON: `{}`,
 		})
 	}
 	// Insert 1 inactive account.
 	inactiveID, _ := store.UpsertAccount(context.Background(), db.UpsertAccountParams{
-		Email: "inactive@test.com", CredentialsJson: `{}`,
+		Email: "inactive@test.com", CredentialsJSON: `{}`,
 	})
 	store.ToggleAccount(context.Background(), inactiveID) //nolint:errcheck,gosec
 
@@ -232,7 +232,7 @@ func TestLoop_SkipsInactiveAccounts(t *testing.T) {
 	p := newTestPoller(t, store)
 
 	id, _ := store.UpsertAccount(context.Background(), db.UpsertAccountParams{
-		Email: "inactive@test.com", CredentialsJson: `{}`,
+		Email: "inactive@test.com", CredentialsJSON: `{}`,
 	})
 	// Toggle to make inactive (Active starts at 1 from UpsertAccount schema default).
 	acc, _ := store.GetAccount(context.Background(), id)
@@ -261,7 +261,7 @@ func TestLoop_CallsCleanupWhenWrapperReturned(t *testing.T) {
 	p := newTestPoller(t, store)
 
 	store.UpsertAccount(context.Background(), db.UpsertAccountParams{ //nolint:errcheck,gosec
-		Email: "clean@test.com", CredentialsJson: `{}`,
+		Email: "clean@test.com", CredentialsJSON: `{}`,
 	})
 
 	p.processAccount = func(_ context.Context, _ db.StoreIface, _ llm.ClientIface, _ *gmailpkg.Auth, _ db.Account, _ []db.Prompt, _ processor.ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
@@ -289,7 +289,7 @@ func TestCancellationDuringScan(t *testing.T) {
 	p := newTestPoller(t, store)
 
 	store.UpsertAccount(context.Background(), db.UpsertAccountParams{ //nolint:errcheck,gosec
-		Email: "slow@test.com", CredentialsJson: `{}`,
+		Email: "slow@test.com", CredentialsJSON: `{}`,
 	})
 
 	scanStarted := make(chan struct{})
@@ -312,7 +312,7 @@ func TestCancellationDuringScan(t *testing.T) {
 func TestActiveZeroMeansFalse(t *testing.T) {
 	store := newTestStore(t)
 	id, _ := store.UpsertAccount(context.Background(), db.UpsertAccountParams{
-		Email: "toggle@test.com", CredentialsJson: `{}`,
+		Email: "toggle@test.com", CredentialsJSON: `{}`,
 	})
 
 	acc, _ := store.GetAccount(context.Background(), id)

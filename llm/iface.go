@@ -25,6 +25,8 @@ type ClientIface interface {
 
 // FakeClient is a test double for ClientIface. It returns a canned JSON
 // response or a canned error, without making any network calls.
+const fakeModelID = "fake-model"
+
 type FakeClient struct {
 	response string
 	callErr  error
@@ -33,12 +35,12 @@ type FakeClient struct {
 
 // NewFakeClient returns a FakeClient that parses response as a JSON classify result.
 func NewFakeClient(response string) *FakeClient {
-	return &FakeClient{response: response, model: "fake-model"}
+	return &FakeClient{response: response, model: fakeModelID}
 }
 
 // NewFakeErrorClient returns a FakeClient whose ClassifyEmailBatch always errors.
 func NewFakeErrorClient() *FakeClient {
-	return &FakeClient{callErr: &Error{Msg: "fake LLM error"}, model: "fake-model"}
+	return &FakeClient{callErr: &Error{Msg: "fake LLM error"}, model: fakeModelID}
 }
 
 func (c *FakeClient) Model() string { return c.model }
@@ -84,6 +86,6 @@ func (c *FakeClient) ImprovePromptInstructions(_ context.Context, _ ImproveReque
 
 func (c *FakeClient) ListAvailableModels(_ context.Context) ([]ModelOption, error) {
 	return []ModelOption{
-		{ID: "fake-model", Label: "Fake Model"},
+		{ID: fakeModelID, Label: "Fake Model"},
 	}, nil
 }

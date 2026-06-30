@@ -27,9 +27,9 @@ func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gm
 	if err != nil {
 		return nil, nil, fmt.Errorf("load oauth config: %w", err)
 	}
-	svc, err := gmailpkg.NewService(ctx, account.CredentialsJson, oauthCfg, func(newCreds string) {
+	svc, err := gmailpkg.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 		_ = store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-			CredentialsJson: newCreds,
+			CredentialsJSON: newCreds,
 			ID:              account.ID,
 		})
 	})

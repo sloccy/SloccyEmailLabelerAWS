@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -52,9 +53,21 @@ func Now() string {
 // DynamoDB item helpers
 // ============================================================
 
-func sv(v string) types.AttributeValue  { return &types.AttributeValueMemberS{Value: v} }
-func nv(v int64) types.AttributeValue   { return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)} }
-func boolv(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
+func sv(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
+func nv(v int64) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}
+}
+
+// i32 clamps an int64 into the int32 range (DynamoDB Limit fields are int32).
+func i32(v int64) int32 {
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if v < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(v)
+}
 
 func nullStrAttr(v sql.NullString) types.AttributeValue {
 	if !v.Valid {
@@ -140,7 +153,7 @@ func (s *Store) nextID(ctx context.Context, entity string) (int64, error) {
 			return id, nil
 		}
 	}
-	return 0, fmt.Errorf("counter response missing seq")
+	return 0, errors.New("counter response missing seq")
 }
 
 // ============================================================
@@ -167,10 +180,7 @@ func (s *Store) queryAll(ctx context.Context, input *dynamodb.QueryInput) ([]map
 // batchDeleteByKey deletes items in batches of 25.
 func (s *Store) batchDelete(ctx context.Context, keys []map[string]types.AttributeValue) error {
 	for i := 0; i < len(keys); i += 25 {
-		end := i + 25
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+25, len(keys))
 		batch := keys[i:end]
 		reqs := make([]types.WriteRequest, len(batch))
 		for j, k := range batch {
@@ -252,7 +262,7 @@ func (s *Store) GetAllSettings(ctx context.Context) ([]Setting, error) {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :prefix)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":     sv("META"),
+			exprPK:    sv("META"),
 			":prefix": sv("SETTING#"),
 		},
 	})
@@ -307,13 +317,13 @@ func (s *Store) AddLog(ctx context.Context, arg AddLogParams) error {
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":      sv("LOG"),
-			"SK":      sv(tsKey(ts, id)),
-			"id":      nv(id),
-			"ts":      sv(ts),
-			"level":   sv(arg.Level),
-			"msg":     sv(arg.Message),
-			"ttl":     nv(ttlDays(90)), // generous TTL; TrimLogs is also called
+			"PK":    sv("LOG"),
+			"SK":    sv(tsKey(ts, id)),
+			"id":    nv(id),
+			"ts":    sv(ts),
+			"level": sv(arg.Level),
+			"msg":   sv(arg.Message),
+			attrTTL: nv(ttlDays(90)), // generous TTL; TrimLogs is also called
 		},
 	})
 	return err
@@ -324,10 +334,10 @@ func (s *Store) GetLogs(ctx context.Context, limit int64) ([]Log, error) {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("LOG"),
+			exprPK: sv("LOG"),
 		},
 		ScanIndexForward: aws.Bool(false),
-		Limit:            aws.Int32(int32(limit)),
+		Limit:            aws.Int32(i32(limit)),
 	})
 	if err != nil {
 		return nil, err
@@ -349,9 +359,9 @@ func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk AND SK BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("LOG"),
-			":lo": sv(arg.Timestamp),
-			":hi": sv(arg.Timestamp_2 + "\xff"),
+			exprPK: sv("LOG"),
+			":lo":  sv(arg.Timestamp),
+			":hi":  sv(arg.Timestamp2 + "\xff"),
 		},
 		ScanIndexForward: aws.Bool(true),
 	})
@@ -373,15 +383,15 @@ func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log
 // TrimLogs deletes log items older than the cutoff timestamp.
 func (s *Store) TrimLogs(ctx context.Context, retentionDays int) error {
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format("2006-01-02 15:04:05")
-	return s.Queries_TrimLogs(ctx, cutoff)
+	return s.QueriesTrimLogs(ctx, cutoff)
 }
 
-func (s *Store) Queries_TrimLogs(ctx context.Context, cutoff string) error {
+func (s *Store) QueriesTrimLogs(ctx context.Context, cutoff string) error {
 	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk AND SK < :cutoff"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":     sv("LOG"),
+			exprPK:    sv("LOG"),
 			":cutoff": sv(cutoff),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
@@ -400,13 +410,13 @@ func (s *Store) Queries_TrimLogs(ctx context.Context, cutoff string) error {
 // Accounts
 // ============================================================
 
-func accountItem(s *Store, table string, a Account) map[string]types.AttributeValue {
+func accountItem(a Account) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
 		"PK":      sv("ACCOUNT"),
 		"SK":      sv(padID(a.ID)),
 		"id":      nv(a.ID),
 		"email":   sv(a.Email),
-		"creds":   sv(a.CredentialsJson),
+		"creds":   sv(a.CredentialsJSON),
 		"addedAt": sv(a.AddedAt),
 		"active":  nv(a.Active),
 	}
@@ -422,7 +432,7 @@ func itemToAccount(it map[string]types.AttributeValue) Account {
 	return Account{
 		ID:              getInt64(it, "id"),
 		Email:           getStr(it, "email"),
-		CredentialsJson: getStr(it, "creds"),
+		CredentialsJSON: getStr(it, "creds"),
 		AddedAt:         getStr(it, "addedAt"),
 		LastScanAt:      getNullStr(it, "lastScan"),
 		Active:          getInt64(it, "active"),
@@ -434,7 +444,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("ACCOUNT"),
+			exprPK: sv("ACCOUNT"),
 		},
 	})
 	if err != nil {
@@ -497,7 +507,7 @@ func (s *Store) GetAccountByEmail(ctx context.Context, email string) (int64, err
 	if out.Item == nil {
 		return 0, fmt.Errorf("account not found: %s", email)
 	}
-	return getInt64(out.Item, "accountId"), nil
+	return getInt64(out.Item, attrAccountID), nil
 }
 
 func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int64, error) {
@@ -509,11 +519,11 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 		if err2 != nil {
 			return 0, err2
 		}
-		a.CredentialsJson = arg.CredentialsJson
+		a.CredentialsJSON = arg.CredentialsJSON
 		a.Active = 1
 		if _, err3 := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(s.table),
-			Item:      accountItem(s, s.table, a),
+			Item:      accountItem(a),
 		}); err3 != nil {
 			return 0, err3
 		}
@@ -527,7 +537,7 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 	a := Account{
 		ID:              id,
 		Email:           arg.Email,
-		CredentialsJson: arg.CredentialsJson,
+		CredentialsJSON: arg.CredentialsJSON,
 		AddedAt:         Now(),
 		Active:          1,
 	}
@@ -536,15 +546,15 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 		TransactItems: []types.TransactWriteItem{
 			{Put: &types.Put{
 				TableName: aws.String(s.table),
-				Item:      accountItem(s, s.table, a),
+				Item:      accountItem(a),
 			}},
 			{Put: &types.Put{
 				TableName:           aws.String(s.table),
 				ConditionExpression: aws.String("attribute_not_exists(PK)"),
 				Item: map[string]types.AttributeValue{
-					"PK":        sv("ACCT_EMAIL#" + arg.Email),
-					"SK":        sv("0"),
-					"accountId": nv(id),
+					"PK":          sv("ACCT_EMAIL#" + arg.Email),
+					"SK":          sv("0"),
+					attrAccountID: nv(id),
 				},
 			}},
 		},
@@ -560,7 +570,7 @@ func (s *Store) CreateAccountPlaceholder(ctx context.Context, email string) (int
 	if id, err := s.GetAccountByEmail(ctx, email); err == nil {
 		return id, nil
 	}
-	return s.UpsertAccount(ctx, UpsertAccountParams{Email: email, CredentialsJson: ""})
+	return s.UpsertAccount(ctx, UpsertAccountParams{Email: email, CredentialsJSON: ""})
 }
 
 func (s *Store) UpdateAccountCredentials(ctx context.Context, arg UpdateAccountCredentialsParams) error {
@@ -572,7 +582,7 @@ func (s *Store) UpdateAccountCredentials(ctx context.Context, arg UpdateAccountC
 		},
 		UpdateExpression: aws.String("SET creds = :c"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":c": sv(arg.CredentialsJson),
+			":c": sv(arg.CredentialsJSON),
 		},
 	})
 	return err
@@ -605,7 +615,7 @@ func (s *Store) ToggleAccount(ctx context.Context, id int64) (int64, error) {
 	}
 	if _, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      accountItem(s, s.table, a),
+		Item:      accountItem(a),
 	}); err != nil {
 		return 0, err
 	}
@@ -669,36 +679,36 @@ func itemToPrompt(it map[string]types.AttributeValue) Prompt {
 		ID:             getInt64(it, "id"),
 		Name:           getStr(it, "name"),
 		Instructions:   getStr(it, "instructions"),
-		LabelName:      getStr(it, "labelName"),
+		LabelName:      getStr(it, attrLabelName),
 		Active:         getInt64(it, "active"),
-		CreatedAt:      getStr(it, "createdAt"),
+		CreatedAt:      getStr(it, attrCreatedAt),
 		ActionArchive:  getInt64(it, "actionArchive"),
 		ActionSpam:     getInt64(it, "actionSpam"),
 		ActionTrash:    getInt64(it, "actionTrash"),
 		ActionMarkRead: getInt64(it, "actionMarkRead"),
 		SortOrder:      getInt64(it, "sortOrder"),
 		StopProcessing: getInt64(it, "stopProcessing"),
-		AccountID:      getNullInt64(it, "accountId"),
+		AccountID:      getNullInt64(it, attrAccountID),
 	}
 }
 
-func promptToItem(table string, p Prompt) map[string]types.AttributeValue {
+func promptToItem(p Prompt) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		"PK":             sv("PROMPT"),
 		"SK":             sv(padID(p.ID)),
 		"id":             nv(p.ID),
 		"name":           sv(p.Name),
 		"instructions":   sv(p.Instructions),
-		"labelName":      sv(p.LabelName),
+		attrLabelName:    sv(p.LabelName),
 		"active":         nv(p.Active),
-		"createdAt":      sv(p.CreatedAt),
+		attrCreatedAt:    sv(p.CreatedAt),
 		"actionArchive":  nv(p.ActionArchive),
 		"actionSpam":     nv(p.ActionSpam),
 		"actionTrash":    nv(p.ActionTrash),
 		"actionMarkRead": nv(p.ActionMarkRead),
 		"sortOrder":      nv(p.SortOrder),
 		"stopProcessing": nv(p.StopProcessing),
-		"accountId":      nullInt64Attr(p.AccountID),
+		attrAccountID:    nullInt64Attr(p.AccountID),
 	}
 }
 
@@ -707,7 +717,7 @@ func (s *Store) listAllPrompts(ctx context.Context) ([]Prompt, error) {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("PROMPT"),
+			exprPK: sv("PROMPT"),
 		},
 	})
 	if err != nil {
@@ -818,7 +828,7 @@ func (s *Store) CreatePrompt(ctx context.Context, arg CreatePromptParams) (int64
 	}
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      promptToItem(s.table, p),
+		Item:      promptToItem(p),
 	})
 	return id, err
 }
@@ -839,7 +849,7 @@ func (s *Store) UpdatePrompt(ctx context.Context, arg UpdatePromptParams) error 
 	p.AccountID = arg.AccountID
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      promptToItem(s.table, p),
+		Item:      promptToItem(p),
 	})
 	return err
 }
@@ -917,23 +927,23 @@ func (s *Store) TogglePrompt(ctx context.Context, id int64) (int64, error) {
 	}
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      promptToItem(s.table, p),
+		Item:      promptToItem(p),
 	})
 	return p.Active, err
 }
 
-func (s *Store) MaxPromptSortOrder(ctx context.Context) (interface{}, error) {
+func (s *Store) MaxPromptSortOrder(ctx context.Context) (any, error) {
 	all, err := s.listAllPrompts(ctx)
 	if err != nil {
 		return int64(-1), err
 	}
-	var max int64 = -1
+	var maxOrder int64 = -1
 	for _, p := range all {
-		if p.SortOrder > max {
-			max = p.SortOrder
+		if p.SortOrder > maxOrder {
+			maxOrder = p.SortOrder
 		}
 	}
-	return max, nil
+	return maxOrder, nil
 }
 
 func (s *Store) CountActivePrompts(ctx context.Context) (int64, error) {
@@ -991,14 +1001,14 @@ func itemToHistory(it map[string]types.AttributeValue) CategorizationHistory {
 	return CategorizationHistory{
 		ID:           getInt64(it, "id"),
 		Timestamp:    getStr(it, "ts"),
-		AccountID:    getInt64(it, "accountId"),
+		AccountID:    getInt64(it, attrAccountID),
 		AccountEmail: getStr(it, "accountEmail"),
-		MessageID:    getStr(it, "messageId"),
+		MessageID:    getStr(it, attrMessageID),
 		Subject:      getStr(it, "subject"),
 		Sender:       getStr(it, "sender"),
 		PromptID:     getNullInt64(it, "promptId"),
 		PromptName:   getNullStr(it, "promptName"),
-		LabelName:    getNullStr(it, "labelName"),
+		LabelName:    getNullStr(it, attrLabelName),
 		Actions:      getStr(it, "actions"),
 		LlmResponse:  getStr(it, "llmResponse"),
 	}
@@ -1017,17 +1027,17 @@ func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
 			"SK":           sv(tsKey(ts, id)),
 			"id":           nv(id),
 			"ts":           sv(ts),
-			"accountId":    nv(arg.AccountID),
+			attrAccountID:  nv(arg.AccountID),
 			"accountEmail": sv(arg.AccountEmail),
-			"messageId":    sv(arg.MessageID),
+			attrMessageID:  sv(arg.MessageID),
 			"subject":      sv(arg.Subject),
 			"sender":       sv(arg.Sender),
 			"promptId":     nullInt64Attr(arg.PromptID),
 			"promptName":   nullStrAttr(arg.PromptName),
-			"labelName":    nullStrAttr(arg.LabelName),
+			attrLabelName:  nullStrAttr(arg.LabelName),
 			"actions":      sv(arg.Actions),
 			"llmResponse":  sv(arg.LlmResponse),
-			"ttl":          nv(ttlDays(90)),
+			attrTTL:        nv(ttlDays(90)),
 		},
 	})
 	return err
@@ -1045,7 +1055,7 @@ func (s *Store) GetHistoryRow(ctx context.Context, id int64) (CategorizationHist
 			TableName:              aws.String(s.table),
 			KeyConditionExpression: aws.String("PK = :pk"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk": sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
 			},
 		})
 		if err != nil {
@@ -1088,7 +1098,7 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 			TableName:              aws.String(s.table),
 			KeyConditionExpression: aws.String("PK = :pk"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk": sv(fmt.Sprintf("HIST#%d", aid)),
+				exprPK: sv(fmt.Sprintf("HIST#%d", aid)),
 			},
 			ScanIndexForward: aws.Bool(false),
 		})
@@ -1148,7 +1158,7 @@ func (s *Store) DeleteHistoryByAccount(ctx context.Context, accountID int64) err
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("HIST#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("HIST#%d", accountID)),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
 	})
@@ -1173,7 +1183,7 @@ func (s *Store) TrimHistory(ctx context.Context, retentionDays int) error {
 			TableName:              aws.String(s.table),
 			KeyConditionExpression: aws.String("PK = :pk AND SK < :cutoff"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":     sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK:    sv(fmt.Sprintf("HIST#%d", acc.ID)),
 				":cutoff": sv(cutoff),
 			},
 			ProjectionExpression: aws.String("PK, SK"),
@@ -1203,7 +1213,7 @@ func (s *Store) GetPromptIDsByMessageID(ctx context.Context, messageID string) (
 			KeyConditionExpression: aws.String("PK = :pk"),
 			FilterExpression:       aws.String("messageId = :mid"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":  sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
 				":mid": sv(messageID),
 			},
 		})
@@ -1254,7 +1264,7 @@ func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, 
 			KeyConditionExpression: aws.String("PK = :pk"),
 			FilterExpression:       aws.String("messageId = :mid"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":  sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
 				":mid": sv(messageID),
 			},
 		})
@@ -1313,9 +1323,9 @@ func (s *Store) MarkProcessed(ctx context.Context, arg MarkProcessedParams) erro
 	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":  sv(fmt.Sprintf("PROC#%d", arg.AccountID)),
-			"SK":  sv(arg.MessageID),
-			"ttl": nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
+			"PK":    sv(fmt.Sprintf("PROC#%d", arg.AccountID)),
+			"SK":    sv(arg.MessageID),
+			attrTTL: nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
 		},
 		ConditionExpression: aws.String("attribute_not_exists(PK)"),
 	})
@@ -1343,10 +1353,7 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 	processed := map[string]bool{}
 	// BatchGetItem in chunks of 100
 	for i := 0; i < len(keys); i += 100 {
-		end := i + 100
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+100, len(keys))
 		out, err := s.ddb.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 			RequestItems: map[string]types.KeysAndAttributes{
 				s.table: {Keys: keys[i:end]},
@@ -1374,7 +1381,7 @@ func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID in
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("PROC#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("PROC#%d", accountID)),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
 	})
@@ -1396,12 +1403,12 @@ func (s *Store) TrimProcessedEmails(ctx context.Context, lookbackHours int) erro
 // BatchInsertProcessingResults persists logs, history, and marks the email processed.
 func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, accountID int64, messageID string) error {
 	for _, l := range logs {
-		if err := s.AddLog(ctx, AddLogParams(l)); err != nil {
+		if err := s.AddLog(ctx, l); err != nil {
 			return err
 		}
 	}
 	for _, h := range history {
-		if err := s.AddHistory(ctx, AddHistoryParams(h)); err != nil {
+		if err := s.AddHistory(ctx, h); err != nil {
 			return err
 		}
 	}
@@ -1429,7 +1436,7 @@ func (s *Store) GetAccountRetention(ctx context.Context, accountID int64) (Accou
 		return AccountRetention{}, err
 	}
 	if out.Item == nil {
-		return AccountRetention{AccountID: accountID}, fmt.Errorf("not found")
+		return AccountRetention{AccountID: accountID}, errors.New("not found")
 	}
 	return AccountRetention{
 		AccountID:  accountID,
@@ -1439,6 +1446,7 @@ func (s *Store) GetAccountRetention(ctx context.Context, accountID int64) (Accou
 
 func (s *Store) HasGlobalRetention(ctx context.Context, accountID int64) (int64, error) {
 	r, err := s.GetAccountRetention(ctx, accountID)
+	//nolint:nilerr // a missing or unreadable retention record means "no global retention"
 	if err != nil || !r.GlobalDays.Valid {
 		return 0, nil
 	}
@@ -1479,7 +1487,7 @@ func (s *Store) GetLabelRetention(ctx context.Context, accountID int64) ([]Label
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("LBL_RET#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("LBL_RET#%d", accountID)),
 		},
 	})
 	if err != nil {
@@ -1490,7 +1498,7 @@ func (s *Store) GetLabelRetention(ctx context.Context, accountID int64) ([]Label
 		ret[i] = LabelRetention{
 			ID:        getInt64(it, "id"),
 			AccountID: accountID,
-			LabelName: getStr(it, "labelName"),
+			LabelName: getStr(it, attrLabelName),
 			Days:      getInt64(it, "days"),
 		}
 	}
@@ -1525,12 +1533,12 @@ func (s *Store) AddLabelRetention(ctx context.Context, arg AddLabelRetentionPara
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":        sv(fmt.Sprintf("LBL_RET#%d", arg.AccountID)),
-			"SK":        sv(padID(id)),
-			"id":        nv(id),
-			"accountId": nv(arg.AccountID),
-			"labelName": sv(arg.LabelName),
-			"days":      nv(arg.Days),
+			"PK":          sv(fmt.Sprintf("LBL_RET#%d", arg.AccountID)),
+			"SK":          sv(padID(id)),
+			"id":          nv(id),
+			attrAccountID: nv(arg.AccountID),
+			attrLabelName: sv(arg.LabelName),
+			"days":        nv(arg.Days),
 		},
 	})
 	return err
@@ -1552,7 +1560,7 @@ func (s *Store) DeleteLabelRetentionByAccount(ctx context.Context, accountID int
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("LBL_RET#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("LBL_RET#%d", accountID)),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
 	})
@@ -1584,7 +1592,7 @@ func (s *Store) GetLabelExemptions(ctx context.Context, accountID int64) ([]Labe
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("LBL_EX#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("LBL_EX#%d", accountID)),
 		},
 	})
 	if err != nil {
@@ -1595,7 +1603,7 @@ func (s *Store) GetLabelExemptions(ctx context.Context, accountID int64) ([]Labe
 		ex[i] = LabelExemption{
 			ID:        getInt64(it, "id"),
 			AccountID: accountID,
-			LabelName: getStr(it, "labelName"),
+			LabelName: getStr(it, attrLabelName),
 		}
 	}
 	sort.Slice(ex, func(i, j int) bool { return ex[i].LabelName < ex[j].LabelName })
@@ -1617,11 +1625,11 @@ func (s *Store) AddLabelExemption(ctx context.Context, arg AddLabelExemptionPara
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":        sv(fmt.Sprintf("LBL_EX#%d", arg.AccountID)),
-			"SK":        sv(padID(id)),
-			"id":        nv(id),
-			"accountId": nv(arg.AccountID),
-			"labelName": sv(arg.LabelName),
+			"PK":          sv(fmt.Sprintf("LBL_EX#%d", arg.AccountID)),
+			"SK":          sv(padID(id)),
+			"id":          nv(id),
+			attrAccountID: nv(arg.AccountID),
+			attrLabelName: sv(arg.LabelName),
 		},
 	})
 	return err
@@ -1643,7 +1651,7 @@ func (s *Store) DeleteLabelExemptionsByAccount(ctx context.Context, accountID in
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv(fmt.Sprintf("LBL_EX#%d", accountID)),
+			exprPK: sv(fmt.Sprintf("LBL_EX#%d", accountID)),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
 	})
@@ -1673,9 +1681,9 @@ func (s *Store) InsertEmailCorrection(ctx context.Context, arg InsertEmailCorrec
 			"PK":               sv("CORRECTION#" + arg.MessageID),
 			"SK":               sv(tsKey(ts, id)),
 			"id":               nv(id),
-			"createdAt":        sv(ts),
-			"accountId":        nv(arg.AccountID),
-			"messageId":        sv(arg.MessageID),
+			attrCreatedAt:      sv(ts),
+			attrAccountID:      nv(arg.AccountID),
+			attrMessageID:      sv(arg.MessageID),
 			"addedPrompts":     sv(arg.AddedPrompts),
 			"removedPrompts":   sv(arg.RemovedPrompts),
 			"currentPromptIds": sv(arg.CurrentPromptIds),
@@ -1690,7 +1698,7 @@ func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID str
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("CORRECTION#" + messageID),
+			exprPK: sv("CORRECTION#" + messageID),
 		},
 		ScanIndexForward: aws.Bool(false),
 		Limit:            aws.Int32(1),
@@ -1704,9 +1712,9 @@ func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID str
 	it := out.Items[0]
 	return EmailCorrection{
 		ID:               getInt64(it, "id"),
-		CreatedAt:        getStr(it, "createdAt"),
-		AccountID:        getInt64(it, "accountId"),
-		MessageID:        getStr(it, "messageId"),
+		CreatedAt:        getStr(it, attrCreatedAt),
+		AccountID:        getInt64(it, attrAccountID),
+		MessageID:        getStr(it, attrMessageID),
 		AddedPrompts:     getStr(it, "addedPrompts"),
 		RemovedPrompts:   getStr(it, "removedPrompts"),
 		CurrentPromptIds: getStr(it, "currentPromptIds"),
@@ -1721,20 +1729,20 @@ func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID str
 func itemToSuggestion(it map[string]types.AttributeValue) PromptSuggestion {
 	return PromptSuggestion{
 		ID:                    getInt64(it, "id"),
-		CreatedAt:             getStr(it, "createdAt"),
+		CreatedAt:             getStr(it, attrCreatedAt),
 		UpdatedAt:             getStr(it, "updatedAt"),
 		PromptID:              getInt64(it, "promptId"),
 		CorrectionID:          getNullInt64(it, "correctionId"),
 		TriggerKind:           getStr(it, "triggerKind"),
-		MessageID:             getStr(it, "messageId"),
+		MessageID:             getStr(it, attrMessageID),
 		EmailSubject:          getStr(it, "emailSubject"),
 		EmailSender:           getStr(it, "emailSender"),
 		EmailBodySnapshot:     getStr(it, "emailBodySnapshot"),
 		OriginalInstructions:  getStr(it, "originalInstructions"),
 		SuggestedInstructions: getStr(it, "suggestedInstructions"),
-		ConversationJson:      getStr(it, "conversationJson"),
+		ConversationJSON:      getStr(it, "conversationJson"),
 		UserComment:           getStr(it, "userComment"),
-		Status:                getStr(it, "status"),
+		Status:                getStr(it, attrStatus),
 	}
 }
 
@@ -1750,20 +1758,20 @@ func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSugg
 			"PK":                    sv("SUGGESTION"),
 			"SK":                    sv(padID(id)),
 			"id":                    nv(id),
-			"createdAt":             sv(ts),
+			attrCreatedAt:           sv(ts),
 			"updatedAt":             sv(ts),
 			"promptId":              nv(arg.PromptID),
 			"correctionId":          nullInt64Attr(arg.CorrectionID),
 			"triggerKind":           sv(arg.TriggerKind),
-			"messageId":             sv(arg.MessageID),
+			attrMessageID:           sv(arg.MessageID),
 			"emailSubject":          sv(arg.EmailSubject),
 			"emailSender":           sv(arg.EmailSender),
 			"emailBodySnapshot":     sv(arg.EmailBodySnapshot),
 			"originalInstructions":  sv(arg.OriginalInstructions),
 			"suggestedInstructions": sv(arg.SuggestedInstructions),
-			"conversationJson":      sv(arg.ConversationJson),
+			"conversationJson":      sv(arg.ConversationJSON),
 			"userComment":           sv(""),
-			"status":                sv(arg.Status),
+			attrStatus:              sv(arg.Status),
 		},
 	})
 	return id, err
@@ -1791,7 +1799,7 @@ func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, 
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("SUGGESTION"),
+			exprPK: sv("SUGGESTION"),
 		},
 		ScanIndexForward: aws.Bool(false),
 	})
@@ -1824,10 +1832,10 @@ func (s *Store) CountPendingPromptSuggestions(ctx context.Context) (int64, error
 		KeyConditionExpression: aws.String("PK = :pk"),
 		FilterExpression:       aws.String("#s = :pending"),
 		ExpressionAttributeNames: map[string]string{
-			"#s": "status",
+			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":      sv("SUGGESTION"),
+			exprPK:     sv("SUGGESTION"),
 			":pending": sv(SuggestionStatusPending),
 		},
 	})
@@ -1846,14 +1854,14 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 		},
 		UpdateExpression: aws.String("SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua"),
 		ExpressionAttributeNames: map[string]string{
-			"#s": "status",
+			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":si": sv(arg.SuggestedInstructions),
-			":cj": sv(arg.ConversationJson),
-			":st": sv(arg.Status),
-			":uc": sv(arg.UserComment),
-			":ua": sv(Now()),
+			":si":         sv(arg.SuggestedInstructions),
+			":cj":         sv(arg.ConversationJSON),
+			exprStatus:    sv(arg.Status),
+			":uc":         sv(arg.UserComment),
+			exprUpdatedAt: sv(Now()),
 		},
 	})
 	return err
@@ -1868,14 +1876,14 @@ func (s *Store) UpdatePromptSuggestion(ctx context.Context, arg UpdatePromptSugg
 		},
 		UpdateExpression: aws.String("SET suggestedInstructions = :si, conversationJson = :cj, userComment = :uc, #s = :st, updatedAt = :ua"),
 		ExpressionAttributeNames: map[string]string{
-			"#s": "status",
+			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":si": sv(arg.SuggestedInstructions),
-			":cj": sv(arg.ConversationJson),
-			":uc": sv(arg.UserComment),
-			":st": sv(SuggestionStatusPending),
-			":ua": sv(Now()),
+			":si":         sv(arg.SuggestedInstructions),
+			":cj":         sv(arg.ConversationJSON),
+			":uc":         sv(arg.UserComment),
+			exprStatus:    sv(SuggestionStatusPending),
+			exprUpdatedAt: sv(Now()),
 		},
 	})
 	return err
@@ -1890,11 +1898,11 @@ func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
 		},
 		UpdateExpression: aws.String("SET #s = :st, updatedAt = :ua"),
 		ExpressionAttributeNames: map[string]string{
-			"#s": "status",
+			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":st": sv(SuggestionStatusApplied),
-			":ua": sv(Now()),
+			exprStatus:    sv(SuggestionStatusApplied),
+			exprUpdatedAt: sv(Now()),
 		},
 	})
 	return err
@@ -1909,11 +1917,11 @@ func (s *Store) DismissPromptSuggestion(ctx context.Context, id int64) error {
 		},
 		UpdateExpression: aws.String("SET #s = :st, updatedAt = :ua"),
 		ExpressionAttributeNames: map[string]string{
-			"#s": "status",
+			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":st": sv(SuggestionStatusDismissed),
-			":ua": sv(Now()),
+			exprStatus:    sv(SuggestionStatusDismissed),
+			exprUpdatedAt: sv(Now()),
 		},
 	})
 	return err
@@ -1946,9 +1954,9 @@ func (s *Store) AddLlmDebug(ctx context.Context, arg AddLlmDebugParams) error {
 			"SK":           sv(padID(id)),
 			"id":           nv(id),
 			"ts":           sv(ts),
-			"accountId":    nv(arg.AccountID),
+			attrAccountID:  nv(arg.AccountID),
 			"accountEmail": sv(arg.AccountEmail),
-			"messageId":    sv(arg.MessageID),
+			attrMessageID:  sv(arg.MessageID),
 			"subject":      sv(arg.Subject),
 			"sender":       sv(arg.Sender),
 			"gmailRaw":     sv(arg.GmailRaw),
@@ -1965,7 +1973,7 @@ func (s *Store) TrimLlmDebug(ctx context.Context) error {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("LLM_DEBUG"),
+			exprPK: sv("LLM_DEBUG"),
 		},
 		ScanIndexForward:     aws.Bool(false),
 		ProjectionExpression: aws.String("PK, SK"),
@@ -1989,7 +1997,7 @@ func (s *Store) GetLatestLlmDebug(ctx context.Context) ([]LlmDebug, error) {
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": sv("LLM_DEBUG"),
+			exprPK: sv("LLM_DEBUG"),
 		},
 		ScanIndexForward: aws.Bool(false),
 		Limit:            aws.Int32(3),
@@ -2002,9 +2010,9 @@ func (s *Store) GetLatestLlmDebug(ctx context.Context) ([]LlmDebug, error) {
 		result[i] = LlmDebug{
 			ID:           getInt64(it, "id"),
 			Timestamp:    getStr(it, "ts"),
-			AccountID:    getInt64(it, "accountId"),
+			AccountID:    getInt64(it, attrAccountID),
 			AccountEmail: getStr(it, "accountEmail"),
-			MessageID:    getStr(it, "messageId"),
+			MessageID:    getStr(it, attrMessageID),
 			Subject:      getStr(it, "subject"),
 			Sender:       getStr(it, "sender"),
 			GmailRaw:     getStr(it, "gmailRaw"),
@@ -2021,7 +2029,7 @@ func (s *Store) DeleteIncompleteLlmDebug(ctx context.Context) error {
 		KeyConditionExpression: aws.String("PK = :pk"),
 		FilterExpression:       aws.String("gmailRaw = :empty OR llmRequest = :empty"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":    sv("LLM_DEBUG"),
+			exprPK:   sv("LLM_DEBUG"),
 			":empty": sv(""),
 		},
 		ProjectionExpression: aws.String("PK, SK"),
@@ -2109,13 +2117,13 @@ type UpdatePromptSortOrderParams struct {
 }
 
 type UpdateAccountCredentialsParams struct {
-	CredentialsJson string
+	CredentialsJSON string
 	ID              int64
 }
 
 type UpsertAccountParams struct {
 	Email           string
-	CredentialsJson string
+	CredentialsJSON string
 }
 
 type MarkProcessedParams struct {
@@ -2124,8 +2132,8 @@ type MarkProcessedParams struct {
 }
 
 type GetLogsRangeParams struct {
-	Timestamp   string
-	Timestamp_2 string
+	Timestamp  string
+	Timestamp2 string
 }
 
 type GetHistoryByAccountParams struct {
@@ -2157,13 +2165,13 @@ type InsertPromptSuggestionParams struct {
 	EmailBodySnapshot     string
 	OriginalInstructions  string
 	SuggestedInstructions string
-	ConversationJson      string
+	ConversationJSON      string
 	Status                string
 }
 
 type FinalizePromptSuggestionParams struct {
 	SuggestedInstructions string
-	ConversationJson      string
+	ConversationJSON      string
 	Status                string
 	UserComment           string
 	ID                    int64
@@ -2171,7 +2179,7 @@ type FinalizePromptSuggestionParams struct {
 
 type UpdatePromptSuggestionParams struct {
 	SuggestedInstructions string
-	ConversationJson      string
+	ConversationJSON      string
 	UserComment           string
 	ID                    int64
 }
