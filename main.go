@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
 	"github.com/sloccy/ollamail-aws/llm"
@@ -27,7 +28,12 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	if cfg.Mode == "scan" {
-		runScan(cfg)
+		// EventBridge invokes this via the Lambda Runtime API; lambda.Start keeps the
+		// process alive between scheduled invocations instead of exiting after one pass.
+		lambda.Start(func(ctx context.Context) error {
+			runScan(cfg)
+			return nil
+		})
 		return
 	}
 	runWeb(cfg)
