@@ -1,0 +1,35 @@
+{{if .}}
+  {{range .}}
+  <div class="card account-card mb-3{{if .Active}} active{{end}}">
+    <div class="card-body">
+      <div class="d-flex align-items-start justify-content-between gap-3">
+        <div>
+          <div class="fw-semibold mb-1">{{.Email}}</div>
+          <div class="font-monospace small text-muted mb-2">Added {{fmtdate .AddedAt}} &middot; Last scanned {{fmtdate .LastScanAt}}</div>
+          {{if .Active}}
+            <span class="badge text-bg-success">&#9679; active</span>
+          {{else}}
+            <span class="badge text-bg-info">paused</span>
+          {{end}}
+        </div>
+        <div class="d-flex gap-2 flex-shrink-0">
+          <button class="btn btn-outline-secondary btn-sm"
+            hx-post="/fragments/accounts/{{.ID}}/toggle"
+            hx-target="#accounts-list"
+            hx-swap="innerHTML">{{if .Active}}Pause{{else}}Resume{{end}}</button>
+          <button class="btn btn-outline-danger btn-sm"
+            hx-delete="/fragments/accounts/{{.ID}}"
+            hx-target="#accounts-list"
+            hx-swap="innerHTML"
+            hx-confirm="Remove this account? Its processed email history will also be cleared.">Remove</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  {{end}}
+{{else}}
+<div class="empty">
+  <div class="empty-icon"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="11" r="6"/><path d="M4 28c0-6.627 5.373-12 12-12s12 5.373 12 12" stroke-linecap="round"/></svg></div>
+  No accounts added yet.
+</div>
+{{end}}

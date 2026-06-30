@@ -1,0 +1,11 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries: "db/queries.sql"
+    schema: "db/schema.sql"
+    gen:
+      go:
+        package: "db"
+        out: "db"
+        emit_result_struct_pointers: false
+        emit_params_struct_pointers: false

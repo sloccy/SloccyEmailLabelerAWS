@@ -1,0 +1,54 @@
+{{define "prompt_card_edit"}}
+<div class="card mb-3" id="prompt-card-{{.Prompt.ID}}" data-id="{{.Prompt.ID}}">
+  <div class="card-body">
+    <div class="d-flex align-items-start gap-3">
+      <div class="drag-handle text-muted">&#9776;</div>
+      <div class="flex-grow-1">
+        <form hx-put="/fragments/prompts/{{.Prompt.ID}}"
+              hx-target="#prompts-list"
+              hx-swap="innerHTML">
+          <input type="hidden" name="active" value="{{.Prompt.Active}}">
+          <div class="form-grid-2">
+            <div>
+              <label class="form-label">Rule name</label>
+              <input type="text" class="form-control form-control-sm" name="name" value="{{.Prompt.Name}}">
+            </div>
+            <div>
+              <label class="form-label">Gmail label</label>
+              <input type="text" class="form-control form-control-sm" name="label_name" value="{{.Prompt.LabelName}}">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Apply to account</label>
+            <select name="account_id" class="form-select form-select-sm">
+              <option value="">All accounts (global)</option>
+              {{range .Accounts}}
+              <option value="{{.ID}}"{{if eq $.Prompt.AccountID .ID}} selected{{end}}>{{.Email}}</option>
+              {{end}}
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Instructions</label>
+            <textarea class="form-control form-control-sm textarea-tall" name="instructions">{{.Prompt.Instructions}}</textarea>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Actions when matched</label>
+            {{template "action_checkboxes" (dict "Prefix" (printf "ea-%d" .Prompt.ID) "ActionArchive" .Prompt.ActionArchive "ActionSpam" .Prompt.ActionSpam "ActionTrash" .Prompt.ActionTrash "ActionMarkRead" .Prompt.ActionMarkRead)}}
+          </div>
+          <div class="d-flex align-items-center gap-2 border-top pt-3 mb-3">
+            <input type="checkbox" class="form-check-input mt-0" name="stop_processing" value="1" id="ea-stop-{{.Prompt.ID}}"{{if .Prompt.StopProcessing}} checked{{end}}>
+            <label class="mb-0" for="ea-stop-{{.Prompt.ID}}">Stop processing further rules if this one matches</label>
+          </div>
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm"
+              hx-get="/fragments/prompts/{{.Prompt.ID}}/view"
+              hx-target="#prompt-card-{{.Prompt.ID}}"
+              hx-swap="outerHTML">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

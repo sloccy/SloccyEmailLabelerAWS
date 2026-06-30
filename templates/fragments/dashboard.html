@@ -1,0 +1,24 @@
+<div class="stats mb-4" data-poller-running="{{.PollerRunning}}">
+  <div class="stat stat-accent-primary">
+    <div class="stat-title">Accounts</div>
+    <div class="stat-value text-primary font-monospace">{{.AccountCount}}</div>
+    <div class="stat-desc">Connected</div>
+  </div>
+  <div class="stat stat-accent-success">
+    <div class="stat-title">Active Prompts</div>
+    <div class="stat-value text-success font-monospace">{{.ActivePrompts}}</div>
+    <div class="stat-desc">Rules running</div>
+  </div>
+  <div class="stat stat-accent-neutral">
+    <div class="stat-title">Poll Interval</div>
+    <div class="stat-value font-monospace">{{.PollInterval}}</div>
+    <div class="stat-desc">Between scans</div>
+  </div>
+  <div class="stat stat-accent-success">
+    <div class="stat-title">Next Scan</div>
+    <div class="stat-value text-success font-monospace">{{.NextScan}}</div>
+    <div class="stat-desc">Scheduled</div>
+  </div>
+</div>
+<h6 class="section-title">Recent Activity</h6>
+{{template "logs_list" .Logs}}

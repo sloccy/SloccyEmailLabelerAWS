@@ -1,0 +1,49 @@
+{{if .}}
+  {{range .}}
+  <tr>
+    <td class="col-time">{{fmtdateStacked .Timestamp}}</td>
+    <td class="col-account d-none d-md-table-cell" title="{{.AccountEmail}}">{{.AccountEmail}}</td>
+    <td class="col-subject">{{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}</td>
+    <td class="col-sender text-muted" title="{{.Sender}}">{{if .Sender}}{{.Sender}}{{else}}&mdash;{{end}}</td>
+    <td class="col-rule" title="{{.PromptName}}">
+      <div class="d-flex flex-column align-items-start gap-1">
+        {{if .PromptName}}<span>{{.PromptName}}</span>{{end}}
+        {{if .LabelName}}
+          <span class="badge border border-primary text-primary font-monospace">{{.LabelName}}</span>
+        {{else}}
+          <span class="badge text-bg-secondary">no match</span>
+        {{end}}
+      </div>
+    </td>
+    <td class="col-actions">
+      <div class="d-flex flex-column align-items-start gap-1">
+        {{if .ExtraActions}}
+          {{range .ExtraActions}}<span class="badge text-bg-info">{{.}}</span>{{end}}
+        {{else}}
+          <span class="badge text-bg-secondary">no match</span>
+        {{end}}
+        {{if .HasLlmResponse}}
+        <details hx-get="/fragments/history/{{.ID}}/llm-response" hx-trigger="toggle once" hx-target="find .llm-content" hx-swap="outerHTML">
+          <summary class="text-muted" style="cursor:pointer;font-size:.75rem;list-style:none;">LLM</summary>
+          <span class="llm-content"></span>
+        </details>
+        {{end}}
+      </div>
+    </td>
+    <td class="col-edit">
+      <button class="btn btn-outline-secondary btn-sm"
+        hx-get="/fragments/history/{{.ID}}/recategorize"
+        hx-target="#recategorize-modal-body"
+        hx-swap="innerHTML"
+        hx-on::after-request="new bootstrap.Modal(document.getElementById('recategorize-modal')).show()">
+        ✏ Recategorize
+      </button>
+    </td>
+  </tr>
+  {{end}}
+{{else}}
+<tr><td colspan="7"><div class="text-center text-muted py-5">
+  <div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  No matching history found.
+</div></td></tr>
+{{end}}

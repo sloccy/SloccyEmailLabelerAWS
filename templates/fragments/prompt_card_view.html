@@ -1,0 +1,47 @@
+{{define "prompt_card_view"}}
+<div class="card mb-3" id="prompt-card-{{.ID}}" data-id="{{.ID}}">
+  <div class="card-body">
+    <div class="d-flex align-items-start justify-content-between gap-3">
+      <div class="drag-handle" title="Drag to reorder">&#9776;</div>
+      <div class="flex-grow-1">
+        <div class="fw-semibold mb-1">{{.Name}}</div>
+        <div class="font-monospace small text-muted mb-2">Created {{fmtdate .CreatedAt}}</div>
+        <div class="mb-2">
+          <span class="badge border border-primary text-primary font-monospace">&#9654; {{.LabelName}}</span>
+          {{if .Active}}
+            <span class="badge text-bg-success ms-1">&#9679; active</span>
+          {{else}}
+            <span class="badge text-bg-info ms-1">paused</span>
+          {{end}}
+          {{if .AccountEmail}}
+            <span class="badge border border-primary text-primary ms-1">{{.AccountEmail}}</span>
+          {{else}}
+            <span class="badge border border-info text-info ms-1">global</span>
+          {{end}}
+          {{if .ActionArchive}}<span class="badge border text-secondary ms-1">archive</span>{{end}}
+          {{if .ActionSpam}}<span class="badge text-bg-danger ms-1">spam</span>{{end}}
+          {{if .ActionTrash}}<span class="badge border text-secondary ms-1">&#128465; trash</span>{{end}}
+          {{if .ActionMarkRead}}<span class="badge border text-secondary ms-1">mark read</span>{{end}}
+          {{if .StopProcessing}}<span class="badge text-bg-danger ms-1">&#9940; stop</span>{{end}}
+        </div>
+        <div class="small text-muted border-top pt-2 mt-2" style="line-height:1.625">{{.Instructions}}</div>
+      </div>
+      <div class="d-flex gap-2 flex-shrink-0 align-self-start">
+        <button class="btn btn-outline-secondary btn-sm"
+          hx-post="/fragments/prompts/{{.ID}}/toggle"
+          hx-target="#prompt-card-{{.ID}}"
+          hx-swap="outerHTML">{{if .Active}}Pause{{else}}Resume{{end}}</button>
+        <button class="btn btn-outline-secondary btn-sm"
+          hx-get="/fragments/prompts/{{.ID}}/edit"
+          hx-target="#prompt-card-{{.ID}}"
+          hx-swap="outerHTML">Edit</button>
+        <button class="btn btn-outline-danger btn-sm"
+          hx-delete="/fragments/prompts/{{.ID}}"
+          hx-target="#prompts-list"
+          hx-swap="innerHTML"
+          hx-confirm="Delete this rule?">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

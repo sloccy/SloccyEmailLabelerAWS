@@ -1,0 +1,99 @@
+<div class="card p-4" id="suggestion-detail-{{.ID}}">
+  <div class="d-flex align-items-center justify-content-between mb-3 gap-2 flex-wrap">
+    <div>
+      <h6 class="mb-1 fw-bold">{{.PromptName}}</h6>
+      <div class="d-flex gap-2">
+        {{if eq .TriggerKind "false_negative"}}
+          <span class="badge text-bg-warning">missed it (false negative)</span>
+        {{else}}
+          <span class="badge text-bg-danger">wrong match (false positive)</span>
+        {{end}}
+        {{if eq .Status "generating"}}
+          <span class="badge text-bg-warning">
+            <span class="spinner-border spinner-border-sm me-1" style="width:.65em;height:.65em" role="status" aria-hidden="true"></span>Generating&hellip;
+          </span>
+        {{else if eq .Status "pending"}}
+          <span class="badge text-bg-primary">pending</span>
+        {{else if eq .Status "applied"}}
+          <span class="badge text-bg-success">applied</span>
+        {{else if eq .Status "failed"}}
+          <span class="badge text-bg-danger">failed</span>
+        {{else}}
+          <span class="badge text-bg-secondary">dismissed</span>
+        {{end}}
+      </div>
+    </div>
+    <button type="button" class="btn btn-outline-secondary btn-sm"
+      onclick="document.getElementById('suggestion-detail-container').innerHTML=''">
+      &larr; Back to list
+    </button>
+  </div>
+
+  <details class="mb-3">
+    <summary class="small text-muted" style="cursor:pointer">Email: {{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</summary>
+    <pre class="mt-2 p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;max-height:12rem;overflow-y:auto">{{.EmailBodySnapshot}}</pre>
+  </details>
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-6">
+      <div class="form-label small fw-semibold text-muted text-uppercase">Current Instructions</div>
+      <pre class="p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.OriginalInstructions}}</pre>
+    </div>
+    <div class="col-md-6">
+      <div class="form-label small fw-semibold text-success text-uppercase">Suggested Instructions</div>
+      {{if eq .Status "generating"}}
+      <div class="p-2 border rounded bg-body-secondary d-flex align-items-center gap-2 text-muted small" style="min-height:5rem">
+        <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+        Waiting for AI&hellip;
+      </div>
+      {{else if eq .Status "failed"}}
+      <div class="p-2 border border-danger rounded bg-body-secondary font-monospace small text-danger" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.UserComment}}</div>
+      {{else}}
+      <pre class="p-2 border border-success rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.SuggestedInstructions}}</pre>
+      {{end}}
+    </div>
+  </div>
+
+  {{if eq .Status "generating"}}
+  <div class="d-flex gap-2 flex-wrap">
+    <button type="button" class="btn btn-outline-secondary btn-sm"
+      hx-post="/fragments/prompt-suggestions/{{.ID}}/dismiss"
+      hx-target="#suggestion-row-{{.ID}}"
+      hx-swap="delete"
+      hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
+      Dismiss
+    </button>
+  </div>
+  {{else if or (eq .Status "pending") (eq .Status "failed")}}
+  <form hx-post="/fragments/prompt-suggestions/{{.ID}}/regenerate"
+    hx-target="#suggestion-detail-{{.ID}}"
+    hx-swap="outerHTML">
+    <div class="mb-3">
+      <label class="form-label small">Comment for AI (optional)</label>
+      <textarea name="user_comment" class="form-control form-control-sm" rows="2"
+        placeholder="{{if eq .Status "pending"}}e.g. The suggestion is too broad — narrow it to only X{{else}}e.g. Add context about what went wrong or what to try differently{{end}}">{{if eq .Status "pending"}}{{.UserComment}}{{end}}</textarea>
+    </div>
+    <div class="d-flex gap-2 flex-wrap">
+      <button type="submit" class="btn btn-outline-primary btn-sm" hx-disabled-elt="this">{{if eq .Status "pending"}}Regenerate with AI{{else}}Retry with AI{{end}}</button>
+      {{if eq .Status "pending"}}
+      <button type="button" class="btn btn-success btn-sm"
+        hx-post="/fragments/prompt-suggestions/{{.ID}}/apply"
+        hx-target="#suggestion-row-{{.ID}}"
+        hx-swap="delete"
+        hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
+        Apply to Prompt
+      </button>
+      {{end}}
+      <button type="button" class="btn btn-outline-secondary btn-sm"
+        hx-post="/fragments/prompt-suggestions/{{.ID}}/dismiss"
+        hx-target="#suggestion-row-{{.ID}}"
+        hx-swap="delete"
+        hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
+        Dismiss
+      </button>
+    </div>
+  </form>
+  {{else}}
+  <div class="text-muted small">This suggestion has been {{.Status}}.</div>
+  {{end}}
+</div>

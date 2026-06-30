@@ -1,0 +1,49 @@
+{{if .}}
+<div class="d-flex flex-column gap-3" id="suggestions-list">
+  {{range .}}
+  <div class="card p-3 suggestion-card" id="suggestion-row-{{.ID}}">
+    <div class="d-flex align-items-start justify-content-between gap-2 flex-wrap">
+      <div class="flex-grow-1" style="min-width:0">
+        <div class="d-flex align-items-center gap-2 flex-wrap mb-1">
+          <span class="fw-semibold">{{.PromptName}}</span>
+          {{if eq .TriggerKind "false_negative"}}
+            <span class="badge text-bg-warning">missed it</span>
+          {{else}}
+            <span class="badge text-bg-danger">wrong match</span>
+          {{end}}
+          {{if eq .Status "generating"}}
+            <span class="badge text-bg-warning">
+              <span class="spinner-border spinner-border-sm me-1" style="width:.65em;height:.65em" role="status" aria-hidden="true"></span>Generating&hellip;
+            </span>
+          {{else if eq .Status "pending"}}
+            <span class="badge text-bg-primary">pending</span>
+          {{else if eq .Status "failed"}}
+            <span class="badge text-bg-danger">failed</span>
+          {{else}}
+            <span class="badge text-bg-secondary">dismissed</span>
+          {{end}}
+        </div>
+        <div class="small text-muted text-truncate mb-2">{{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</div>
+        {{if or (eq .Status "pending") (eq .Status "failed")}}
+        <div class="d-flex gap-2 flex-wrap">
+          <button class="btn btn-outline-secondary btn-sm"
+            hx-get="/fragments/prompt-suggestions/{{.ID}}"
+            hx-target="#suggestion-detail-container"
+            hx-swap="innerHTML"
+            hx-on::after-request="document.getElementById('suggestion-detail-container').scrollIntoView({behavior:'smooth'})">
+            Review &amp; Edit
+          </button>
+        </div>
+        {{end}}
+      </div>
+      <div class="small text-muted text-nowrap">{{fmtdate .CreatedAt}}</div>
+    </div>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<div class="text-center text-muted py-5">
+  <div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  No prompt suggestions yet. Recategorize emails from the History tab to generate AI improvement suggestions.
+</div>
+{{end}}

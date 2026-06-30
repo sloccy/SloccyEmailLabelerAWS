@@ -1,0 +1,23 @@
+{{define "logs_list"}}
+{{if .}}
+<ul class="timeline">
+  {{range .}}
+  <li>
+    <div class="timeline-middle">
+      <span class="tag-dot badge {{if eq .Level "ERROR"}}text-bg-danger{{else if eq .Level "INFO"}}text-bg-primary{{else}}text-bg-secondary{{end}}"></span>
+    </div>
+    <div class="timeline-end font-monospace">
+      <span class="opacity-50 me-2">{{fmtdate .Timestamp}}</span>
+      <span class="fw-semibold me-2 {{if eq .Level "ERROR"}}text-danger{{else if eq .Level "INFO"}}text-primary{{else}}opacity-25{{end}}">{{.Level}}</span>
+      <span class="text-break">{{.Message}}</span>
+    </div>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<div class="empty">
+  <div class="empty-icon"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 8h20M6 14h20M6 20h14" stroke-linecap="round"/></svg></div>
+  No logs yet.
+</div>
+{{end}}
+{{end}}
