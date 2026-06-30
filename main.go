@@ -12,96 +12,67 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sloccy/ollamail/db"
-	"github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
-	"github.com/sloccy/ollamail/poller"
-	"github.com/sloccy/ollamail/processor"
+	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 func main() {
 	cfg := loadConfig()
 
-	// Logging
 	level := slog.LevelInfo
 	if cfg.DebugLogging {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	// Database
+	if cfg.Mode == "scan" {
+		runScan(cfg)
+		return
+	}
+	runWeb(cfg)
+}
+
+func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 	dbPath := filepath.Join(cfg.DataDir, "labeler.db")
 	store, err := db.Open(dbPath)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
-	defer func() { _ = store.Close() }()
-
 	if err := store.Migrate(); err != nil {
-		log.Fatalf("migrate db: %v", err) //nolint:gocritic // OS reclaims file handle on Fatalf
+		log.Fatalf("migrate db: %v", err)
 	}
-
-	// Seed default poll_interval setting
 	if err := store.SeedSetting("poll_interval", strconv.Itoa(cfg.PollInterval)); err != nil {
 		log.Fatalf("seed settings: %v", err)
 	}
-
-	// Secret key for HMAC session signing
 	secretKey, err := store.GetOrCreateSecretKey()
 	if err != nil {
 		log.Fatalf("secret key: %v", err)
 	}
-
-	// LLM client
-	ollamaClient := llm.NewClient(cfg.OllamaHost, cfg.OllamaModel, cfg.OllamaNumCtx, time.Duration(cfg.OllamaTimeout)*time.Second)
-
-	// Pull model in background
-	go func() {
-		if err := ollamaClient.EnsureModelPulled(store); err != nil {
-			slog.Warn("model pull check failed", "err", err)
-		}
-	}()
-
-	// Gmail auth
+	llmClient := llm.NewClient("", cfg.BedrockModel, 0, time.Duration(0))
 	gmailAuth := gmail.NewAuth(cfg.CredentialsFile)
+	return store, llmClient, gmailAuth, secretKey
+}
 
-	// Graceful shutdown context — created early so goroutines can observe it.
+func runWeb(cfg Config) {
+	store, llmClient, gmailAuth, secretKey := buildDeps(cfg)
+	defer func() { _ = store.Close() }()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Seed the Troubleshooting debug table with the 3 most recent processed
-	// emails when the table is empty. Delayed 10s to allow Gmail auth to be
-	// ready before fetching.
-	go func() {
-		select {
-		case <-time.After(10 * time.Second):
-		case <-ctx.Done():
-			return
-		}
-		if err := processor.BackfillLlmDebug(ctx, store, ollamaClient, gmailAuth,
-			processor.ProcessConfig{BodyTruncation: cfg.EmailBodyTrunc}); err != nil {
-			slog.Warn("llm debug backfill failed", "err", err)
-		}
-	}()
+	// No in-process poller in Lambda web mode — EventBridge triggers the scan function.
+	srv := newServer(ctx, store, llmClient, nil, gmailAuth, &cfg, secretKey)
 
-	// Poller
-	p := poller.New(store, ollamaClient, gmailAuth, &poller.Config{
-		LookbackHours:  cfg.GmailLookbackHours,
-		MaxResults:     int64(cfg.GmailMaxResults),
-		BodyTruncation: cfg.EmailBodyTrunc,
-		LogRetention:   cfg.LogRetentionDays,
-		DebugLogging:   cfg.DebugLogging,
-	})
-	p.Start()
-
-	// HTTP server
-	srv := newServer(ctx, store, ollamaClient, p, gmailAuth, &cfg, secretKey)
+	port := os.Getenv("AWS_LWA_PORT")
+	if port == "" {
+		port = "5000"
+	}
 	httpSrv := &http.Server{
-		Addr:              ":5000",
+		Addr:              ":" + port,
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
 	go func() {
 		slog.Info("listening", "addr", httpSrv.Addr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -114,5 +85,4 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
-	p.Stop()
 }

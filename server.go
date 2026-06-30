@@ -24,10 +24,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sloccy/ollamail/db"
-	"github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
-	"github.com/sloccy/ollamail/poller"
+	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
+	"github.com/sloccy/ollamail-aws/poller"
 )
 
 //go:embed static
@@ -261,7 +261,10 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	accounts, _ := s.store.ListAccountsSafe(ctx)
 	activePrompts, _ := s.store.CountActivePrompts(ctx)
 	logs, _ := s.store.GetLogs(ctx, 100)
-	status := s.poller.GetStatus()
+	var status poller.Status
+	if s.poller != nil {
+		status = s.poller.GetStatus()
+	}
 	pollIntervalSetting, _ := s.store.GetSetting(ctx, "poll_interval")
 	pollSecs, _ := strconv.Atoi(pollIntervalSetting)
 
@@ -569,8 +572,7 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	pi, _ := strconv.Atoi(pollInterval)
 	data := map[string]any{
 		tmplKeyPollInterval: pi,
-		"OllamaModel":       s.cfg.OllamaModel,
-		"OllamaHost":        s.cfg.OllamaHost,
+		"BedrockModel":      s.cfg.BedrockModel,
 	}
 	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "")
 }
@@ -584,12 +586,13 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		n = s.cfg.MinPollInterval
 	}
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: "poll_interval", Value: strconv.Itoa(n)})
-	s.poller.UpdateInterval(n)
+	if s.poller != nil {
+		s.poller.UpdateInterval(n)
+	}
 
 	data := map[string]any{
 		tmplKeyPollInterval: n,
-		"OllamaModel":       s.cfg.OllamaModel,
-		"OllamaHost":        s.cfg.OllamaHost,
+		"BedrockModel":      s.cfg.BedrockModel,
 	}
 	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
 }
@@ -963,7 +966,7 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleScan(w http.ResponseWriter, _ *http.Request) {
 	s.store.Log("INFO", "Manual scan triggered")
-	if s.poller.RunNow() {
+	if s.poller != nil && s.poller.RunNow() {
 		setHxTrigger(w, map[string]any{
 			triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: "success"},
 			"refreshDashboard": "",

@@ -1,0 +1,82 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+)
+
+// StoreLogger is the logging dependency injected into ClassifyEmailBatch.
+// *db.Store and *db.FakeStore both satisfy this via their Log method.
+type StoreLogger interface {
+	Log(level, message string)
+}
+
+// ClientIface is the LLM client contract used by processor and poller.
+// *Client satisfies this; *FakeClient satisfies it for tests.
+type ClientIface interface {
+	Model() string
+	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt) (ClassifyResult, error)
+	BuildClassifyRequestJSON(email Email, prompts []Prompt) string
+	StreamGeneratePromptInstruction(ctx context.Context, description string) <-chan StreamChunk
+	ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error)
+}
+
+// FakeClient is a test double for ClientIface. It returns a canned JSON
+// response or a canned error, without making any network calls.
+type FakeClient struct {
+	response string
+	callErr  error
+	model    string
+}
+
+// NewFakeClient returns a FakeClient that parses response as a JSON classify result.
+func NewFakeClient(response string) *FakeClient {
+	return &FakeClient{response: response, model: "fake-model"}
+}
+
+// NewFakeErrorClient returns a FakeClient whose ClassifyEmailBatch always errors.
+func NewFakeErrorClient() *FakeClient {
+	return &FakeClient{callErr: &Error{Msg: "fake LLM error"}, model: "fake-model"}
+}
+
+func (c *FakeClient) Model() string { return c.model }
+
+func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt) (ClassifyResult, error) {
+	if c.callErr != nil {
+		return ClassifyResult{}, c.callErr
+	}
+	res := ClassifyResult{
+		RawResponse: c.response,
+		Results:     make(map[int64]bool),
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(c.response), &parsed); err != nil {
+		return res, &Error{Msg: "fake parse error: " + err.Error()}
+	}
+	for k, v := range parsed {
+		var idx int
+		if _, err := fmt.Sscanf(k, "%d", &idx); err != nil {
+			continue
+		}
+		idx-- // 1-based → 0-based
+		if idx >= 0 && idx < len(prompts) {
+			b, _ := v.(bool)
+			res.Results[prompts[idx].ID] = b
+		}
+	}
+	return res, nil
+}
+
+func (c *FakeClient) BuildClassifyRequestJSON(_ Email, _ []Prompt) string { return "{}" }
+
+func (c *FakeClient) StreamGeneratePromptInstruction(ctx context.Context, _ string) <-chan StreamChunk {
+	ch := make(chan StreamChunk, 1)
+	ch <- StreamChunk{Text: "fake instruction"}
+	close(ch)
+	return ch
+}
+
+func (c *FakeClient) ImprovePromptInstructions(_ context.Context, _ ImproveRequest) (string, []ChatMessage, error) {
+	return "fake improved", nil, nil
+}

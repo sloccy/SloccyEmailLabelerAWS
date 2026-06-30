@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sloccy/ollamail/db"
+	"github.com/sloccy/ollamail-aws/db"
 )
 
 func TestBuildAccountMap(t *testing.T) {

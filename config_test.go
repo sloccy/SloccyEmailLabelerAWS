@@ -57,12 +57,10 @@ func TestGetEnvInt(t *testing.T) {
 }
 
 func TestLoadConfig_Defaults(t *testing.T) {
-	// Clear all config env vars so we get pure defaults.
 	keys := []string{
-		"OLLAMA_HOST", "OLLAMA_MODEL", "OLLAMA_TIMEOUT", "OLLAMA_NUM_CTX",
-		"GMAIL_MAX_RESULTS", "GMAIL_LOOKBACK_HOURS", "EMAIL_BODY_TRUNCATION",
+		"BEDROCK_MODEL", "GMAIL_MAX_RESULTS", "GMAIL_LOOKBACK_HOURS", "EMAIL_BODY_TRUNCATION",
 		"LOG_RETENTION_DAYS", "POLL_INTERVAL", "MIN_POLL_INTERVAL",
-		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "DATA_DIR",
+		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "DATA_DIR", "MODE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
@@ -70,14 +68,8 @@ func TestLoadConfig_Defaults(t *testing.T) {
 
 	cfg := loadConfig()
 
-	if cfg.OllamaHost != "http://localhost:11434" {
-		t.Errorf("OllamaHost = %q", cfg.OllamaHost)
-	}
-	if cfg.OllamaTimeout != 600 {
-		t.Errorf("OllamaTimeout = %d", cfg.OllamaTimeout)
-	}
-	if cfg.OllamaNumCtx != 4096 {
-		t.Errorf("OllamaNumCtx = %d", cfg.OllamaNumCtx)
+	if cfg.BedrockModel != "us.amazon.nova-micro-v1:0" {
+		t.Errorf("BedrockModel = %q", cfg.BedrockModel)
 	}
 	if cfg.GmailMaxResults != 50 {
 		t.Errorf("GmailMaxResults = %d", cfg.GmailMaxResults)
@@ -94,30 +86,30 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.CredentialsFile != "/credentials/credentials.json" {
 		t.Errorf("CredentialsFile = %q", cfg.CredentialsFile)
 	}
-	if cfg.DataDir != "/data" {
-		t.Errorf("DataDir = %q", cfg.DataDir)
+	if cfg.Mode != "web" {
+		t.Errorf("Mode = %q", cfg.Mode)
 	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
-	t.Setenv("OLLAMA_HOST", "http://ollama:11434")
-	t.Setenv("OLLAMA_TIMEOUT", "120")
+	t.Setenv("BEDROCK_MODEL", "us.amazon.nova-lite-v1:0")
 	t.Setenv("DEBUG_LOGGING", "1")
 	t.Setenv("DATA_DIR", "/tmp/data")
+	t.Setenv("MODE", "scan")
 
 	cfg := loadConfig()
 
-	if cfg.OllamaHost != "http://ollama:11434" {
-		t.Errorf("OllamaHost = %q", cfg.OllamaHost)
-	}
-	if cfg.OllamaTimeout != 120 {
-		t.Errorf("OllamaTimeout = %d", cfg.OllamaTimeout)
+	if cfg.BedrockModel != "us.amazon.nova-lite-v1:0" {
+		t.Errorf("BedrockModel = %q", cfg.BedrockModel)
 	}
 	if !cfg.DebugLogging {
 		t.Error("DebugLogging should be true when DEBUG_LOGGING=1")
 	}
 	if cfg.DataDir != "/tmp/data" {
 		t.Errorf("DataDir = %q", cfg.DataDir)
+	}
+	if cfg.Mode != "scan" {
+		t.Errorf("Mode = %q", cfg.Mode)
 	}
 }
 

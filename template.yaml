@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: SloccyEmailLabelerAWS — Gmail labeler on Lambda + DynamoDB + Bedrock Nova Micro
+
+Parameters:
+  BedrockModel:
+    Type: String
+    Default: us.amazon.nova-micro-v1:0
+  GmailLookbackHours:
+    Type: Number
+    Default: 24
+  GmailMaxResults:
+    Type: Number
+    Default: 50
+  EmailBodyTruncation:
+    Type: Number
+    Default: 3000
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  HistoryMaxLimit:
+    Type: Number
+    Default: 500
+  # ARN of the SSM SecureString parameter holding the Google OAuth credentials JSON.
+  # Create with: aws ssm put-parameter --name /ollamail/credentials --type SecureString --value "$(cat credentials.json)"
+  CredentialsSsmArn:
+    Type: String
+    Description: ARN of the SSM parameter /ollamail/credentials
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        DDB_TABLE: !Ref OlamailTable
+        BEDROCK_MODEL: !Ref BedrockModel
+        GMAIL_LOOKBACK_HOURS: !Ref GmailLookbackHours
+        GMAIL_MAX_RESULTS: !Ref GmailMaxResults
+        EMAIL_BODY_TRUNCATION: !Ref EmailBodyTruncation
+        LOG_RETENTION_DAYS: !Ref LogRetentionDays
+        HISTORY_MAX_LIMIT: !Ref HistoryMaxLimit
+        # CREDENTIALS_JSON is injected from SSM at runtime via Parameters section below
+
+Resources:
+
+  # ----------------------------------------------------------------
+  # DynamoDB table (single-table design, on-demand, TTL enabled)
+  # ----------------------------------------------------------------
+  OlamailTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TableName: ollamail
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ----------------------------------------------------------------
+  # Shared IAM role for both functions
+  # ----------------------------------------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OlamailPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource: !GetAtt OlamailTable.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-micro-v1:0
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-micro-v1:0
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Ref CredentialsSsmArn
+
+  # ----------------------------------------------------------------
+  # Container image (shared by both functions via ECR)
+  # ----------------------------------------------------------------
+  OlamailImageRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ollamail
+
+  # ----------------------------------------------------------------
+  # Web function — serves the management UI via Function URL
+  # ----------------------------------------------------------------
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile
+    Properties:
+      PackageType: Image
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      FunctionUrlConfig:
+        AuthType: AWS_IAM   # change to NONE to allow public access (add your own auth)
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          MODE: web
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
+          PORT: "8080"
+      Parameters:
+        - Name: /ollamail/credentials
+          WithDecryption: true
+          # SAM injects this as CREDENTIALS_JSON env var via the SSM parameter store
+      # Note: SAM currently requires explicit Parameters block for SSM injection at runtime.
+      # If your SAM version doesn't support inline Parameters, set CREDENTIALS_JSON manually.
+
+  # ----------------------------------------------------------------
+  # Scan function — invoked by EventBridge on a schedule
+  # ----------------------------------------------------------------
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile
+    Properties:
+      PackageType: Image
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          MODE: scan
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(5 minutes)
+            State: ENABLED
+      Parameters:
+        - Name: /ollamail/credentials
+          WithDecryption: true
+
+Outputs:
+  WebFunctionUrl:
+    Description: Management UI URL (requires AWS IAM auth by default)
+    Value: !GetAtt WebFunctionUrl.FunctionUrl
+  DynamoDBTableName:
+    Value: !Ref OlamailTable

@@ -1,20 +1,19 @@
-FROM golang:1.26-alpine AS build
+# Build stage
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN find static -type f \( -name '*.js' -o -name '*.css' \) -exec gzip -k -9 {} \;
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /ollamail .
 
-FROM alpine:3.23
+# Lambda runtime image (provided.al2023 = Amazon Linux 2023 + Lambda Runtime Interface)
+FROM public.ecr.aws/lambda/provided:al2023
 
-RUN apk add --no-cache tzdata && adduser -D -u 1000 -s /sbin/nologin appuser
+# Lambda Web Adapter — enables the web function to receive HTTP via Function URL.
+# Only the web function sets AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap.
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 /lambda-adapter /opt/extensions/lambda-adapter
 
-COPY --from=build /ollamail /ollamail
+COPY --from=build /ollamail /var/task/bootstrap
 
-USER appuser
-
-EXPOSE 5000
-
-CMD ["/ollamail"]
+CMD ["/var/task/bootstrap"]

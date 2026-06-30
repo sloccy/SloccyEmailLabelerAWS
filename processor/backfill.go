@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"slices"
 
-	"github.com/sloccy/ollamail/db"
-	gmailpkg "github.com/sloccy/ollamail/gmail"
-	"github.com/sloccy/ollamail/llm"
+	"github.com/sloccy/ollamail-aws/db"
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 // BackfillLlmDebug seeds the llm_debug table with the 3 most recent processed
