@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -2254,9 +2255,12 @@ func isConditionFailed(err error, target **types.ConditionalCheckFailedException
 	if err == nil {
 		return false
 	}
-	if e, ok := err.(*types.ConditionalCheckFailedException); ok {
+	// errors.As unwraps the smithy OperationError that the SDK wraps the
+	// ConditionalCheckFailedException in; a plain type assertion would miss it.
+	var ccf *types.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
 		if target != nil {
-			*target = e
+			*target = ccf
 		}
 		return true
 	}
