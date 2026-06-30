@@ -30,7 +30,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: provided.al2023
+    # PackageType: Image functions must not set Runtime/Handler.
     Architectures: [arm64]
     Environment:
       Variables:
@@ -41,7 +41,8 @@ Globals:
         EMAIL_BODY_TRUNCATION: !Ref EmailBodyTruncation
         LOG_RETENTION_DAYS: !Ref LogRetentionDays
         HISTORY_MAX_LIMIT: !Ref HistoryMaxLimit
-        # CREDENTIALS_JSON is injected from SSM at runtime via Parameters section below
+        # Name of the SSM SecureString the app reads at runtime for Google OAuth creds.
+        CREDENTIALS_SSM_PARAM: /ollamail/credentials
 
 Resources:
 
@@ -116,14 +117,6 @@ Resources:
                 Resource: !Ref CredentialsSsmArn
 
   # ----------------------------------------------------------------
-  # Container image (shared by both functions via ECR)
-  # ----------------------------------------------------------------
-  OlamailImageRepo:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: ollamail
-
-  # ----------------------------------------------------------------
   # Web function — serves the management UI via Function URL
   # ----------------------------------------------------------------
   WebFunction:
@@ -144,12 +137,6 @@ Resources:
           MODE: web
           AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
           PORT: "8080"
-      Parameters:
-        - Name: /ollamail/credentials
-          WithDecryption: true
-          # SAM injects this as CREDENTIALS_JSON env var via the SSM parameter store
-      # Note: SAM currently requires explicit Parameters block for SSM injection at runtime.
-      # If your SAM version doesn't support inline Parameters, set CREDENTIALS_JSON manually.
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
@@ -163,7 +150,7 @@ Resources:
       PackageType: Image
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
-      Timeout: 300
+      Timeout: 120
       ReservedConcurrentExecutions: 1
       Environment:
         Variables:
@@ -172,11 +159,8 @@ Resources:
         Schedule:
           Type: ScheduleV2
           Properties:
-            ScheduleExpression: rate(5 minutes)
+            ScheduleExpression: rate(1 minute)
             State: ENABLED
-      Parameters:
-        - Name: /ollamail/credentials
-          WithDecryption: true
 
 Outputs:
   WebFunctionUrl:

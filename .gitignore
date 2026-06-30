@@ -1,6 +1,9 @@
 # Go
 ollamail
 
+# SAM build artifacts
+.aws-sam/
+
 # Node (vendor deps only)
 node_modules/
 

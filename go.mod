@@ -5,8 +5,10 @@ go 1.25.10
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.26
+	github.com/aws/aws-sdk-go-v2/service/bedrock v1.64.1
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.54.1
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.59.1
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.69.4
 	golang.org/x/oauth2 v0.36.0
 )
 
@@ -18,7 +20,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.29 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.29 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.30 // indirect
-	github.com/aws/aws-sdk-go-v2/service/bedrock v1.64.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.12 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.29 // indirect
