@@ -36,6 +36,8 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v7 of the action supports golangci-lint v2 (our .golangci.yml is version "2").
+        # Pin to a v2 build compiled with Go >= our go.mod toolchain.
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.12.2
