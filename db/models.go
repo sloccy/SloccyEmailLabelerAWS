@@ -7,7 +7,7 @@ import (
 type Account struct {
 	ID              int64
 	Email           string
-	CredentialsJson string
+	CredentialsJSON string
 	AddedAt         string
 	LastScanAt      sql.NullString
 	Active          int64
@@ -113,7 +113,7 @@ type PromptSuggestion struct {
 	EmailBodySnapshot     string
 	OriginalInstructions  string
 	SuggestedInstructions string
-	ConversationJson      string
+	ConversationJSON      string
 	UserComment           string
 	Status                string
 }

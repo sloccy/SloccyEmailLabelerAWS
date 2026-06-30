@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -169,11 +170,11 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
-func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string, string) {
+func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string) {
 	body := buildBody(email, prompts)
 	numPredict := int32(32)
-	if n := int32(len(prompts) * 10); n > numPredict {
-		numPredict = n
+	if n := len(prompts) * 10; n > 32 {
+		numPredict = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
 	}
 	msgs := []types.Message{
 		{
@@ -186,7 +187,7 @@ func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Pro
 		Temperature: aws.Float32(0),
 	}
 	model := c.resolveModel(ctx, SettingClassifyModel)
-	return msgs, inf, body, model
+	return msgs, inf, model
 }
 
 // BuildClassifyRequestJSON returns the serialised Bedrock Converse payload (for Troubleshooting UI).
@@ -194,7 +195,7 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 	if len(prompts) == 0 {
 		return ""
 	}
-	msgs, inf, _, model := c.classifyPayload(context.Background(), email, prompts)
+	msgs, inf, model := c.classifyPayload(context.Background(), email, prompts)
 	payload := map[string]any{
 		"modelId":         model,
 		"messages":        msgs,
@@ -212,9 +213,12 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		return ClassifyResult{}, nil
 	}
 
-	msgs, inf, _, model := c.classifyPayload(ctx, email, prompts)
+	msgs, inf, model := c.classifyPayload(ctx, email, prompts)
 
-	reqJSON, _ := json.Marshal(map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf})
+	reqJSON, marshalErr := json.Marshal(map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf})
+	if marshalErr != nil {
+		reqJSON = []byte("{}")
+	}
 	res := ClassifyResult{RequestJSON: string(reqJSON)}
 
 	subject := email.Subject
@@ -314,11 +318,10 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 	}
 
 	stream := out.GetStream()
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	for event := range stream.Events() {
-		switch e := event.(type) {
-		case *types.ConverseStreamOutputMemberContentBlockDelta:
+		if e, ok := event.(*types.ConverseStreamOutputMemberContentBlockDelta); ok {
 			if d, ok := e.Value.Delta.(*types.ContentBlockDeltaMemberText); ok && d.Value != "" {
 				select {
 				case ch <- StreamChunk{Text: d.Value}:
@@ -381,8 +384,8 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	}
 
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId: aws.String(model),
-		System:  []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: improveSystemPrompt}},
+		ModelId:  aws.String(model),
+		System:   []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: improveSystemPrompt}},
 		Messages: msgs,
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens:   aws.Int32(16384),

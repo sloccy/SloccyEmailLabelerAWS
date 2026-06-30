@@ -925,9 +925,9 @@ func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int6
 	if err != nil {
 		return data // graceful: credentials unavailable
 	}
-	svc, err := gmail.NewService(ctx, account.CredentialsJson, oauthCfg, func(newCreds string) {
+	svc, err := gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-			CredentialsJson: newCreds, ID: account.ID,
+			CredentialsJSON: newCreds, ID: account.ID,
 		})
 	})
 	if err != nil {
@@ -1019,7 +1019,7 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = s.store.UpsertAccount(ctx, db.UpsertAccountParams{Email: emailAddr, CredentialsJson: credJSON})
+	_, err = s.store.UpsertAccount(ctx, db.UpsertAccountParams{Email: emailAddr, CredentialsJSON: credJSON})
 	if err != nil {
 		slog.Error("upsert account", "err", err)
 	}
@@ -1129,7 +1129,7 @@ func (s *server) handleExportConfig(w http.ResponseWriter, r *http.Request) {
 	// Strip credentials from export
 	safeAccounts := make([]db.Account, len(accounts))
 	for i, a := range accounts {
-		a.CredentialsJson = ""
+		a.CredentialsJSON = ""
 		safeAccounts[i] = a
 	}
 
@@ -1213,7 +1213,7 @@ func (s *server) handleDownloadLogs(w http.ResponseWriter, r *http.Request) {
 		// Convert datetime-local (2006-01-02T15:04) to DB format
 		start = strings.Replace(start, "T", " ", 1) + ":00"
 		end = strings.Replace(end, "T", " ", 1) + ":00"
-		logs, _ = s.store.GetLogsRange(ctx, db.GetLogsRangeParams{Timestamp: start, Timestamp_2: end})
+		logs, _ = s.store.GetLogsRange(ctx, db.GetLogsRangeParams{Timestamp: start, Timestamp2: end})
 	} else {
 		logs, _ = s.store.GetLogs(ctx, 10000)
 	}
@@ -1401,9 +1401,9 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	if gmailErr == nil && row.AccountID != 0 {
 		oauthCfg, cfgErr := s.auth.ConfigFromFile()
 		if cfgErr == nil {
-			svc, _ = gmail.NewService(ctx, account.CredentialsJson, oauthCfg, func(newCreds string) {
+			svc, _ = gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 				_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-					CredentialsJson: newCreds, ID: account.ID,
+					CredentialsJSON: newCreds, ID: account.ID,
 				})
 			})
 		}
@@ -1571,7 +1571,7 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 					EmailBodySnapshot:     msg.Body,
 					OriginalInstructions:  p.Instructions,
 					SuggestedInstructions: "",
-					ConversationJson:      "[]",
+					ConversationJSON:      "[]",
 					Status:                db.SuggestionStatusGenerating,
 				})
 				if insertErr != nil {
@@ -1632,7 +1632,7 @@ func (s *server) runImproveSuggestions(
 			if err := s.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
 				ID:                    sid,
 				SuggestedInstructions: "",
-				ConversationJson:      "[]",
+				ConversationJSON:      "[]",
 				Status:                db.SuggestionStatusFailed,
 				UserComment:           llmErr.Error(),
 			}); err != nil {
@@ -1646,7 +1646,7 @@ func (s *server) runImproveSuggestions(
 		if err := s.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
 			ID:                    sid,
 			SuggestedInstructions: suggested,
-			ConversationJson:      string(convJSON),
+			ConversationJSON:      string(convJSON),
 			Status:                db.SuggestionStatusPending,
 			UserComment:           "",
 		}); err != nil {
@@ -1766,8 +1766,8 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 	}
 
 	var conv []llm.ChatMessage
-	if sg.ConversationJson != "" && sg.ConversationJson != "[]" {
-		_ = json.Unmarshal([]byte(sg.ConversationJson), &conv)
+	if sg.ConversationJSON != "" && sg.ConversationJSON != "[]" {
+		_ = json.Unmarshal([]byte(sg.ConversationJSON), &conv)
 	}
 
 	suggested, newConv, llmErr := s.ollama.ImprovePromptInstructions(ctx, llm.ImproveRequest{
@@ -1789,7 +1789,7 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 	convJSON, _ := json.Marshal(newConv) //nolint:errchkjson // []ChatMessage cannot fail
 	_ = s.store.UpdatePromptSuggestion(ctx, db.UpdatePromptSuggestionParams{
 		SuggestedInstructions: suggested,
-		ConversationJson:      string(convJSON),
+		ConversationJSON:      string(convJSON),
 		UserComment:           userComment,
 		ID:                    id,
 	})
@@ -1864,9 +1864,9 @@ func (s *server) ensureLabelForAccounts(ctx context.Context, labelName string, a
 		if accountID.Valid && accountID.Int64 != account.ID {
 			continue
 		}
-		svc, err := gmail.NewService(ctx, account.CredentialsJson, oauthCfg, func(newCreds string) {
+		svc, err := gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 			_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-				CredentialsJson: newCreds, ID: account.ID,
+				CredentialsJSON: newCreds, ID: account.ID,
 			})
 		})
 		if err != nil {

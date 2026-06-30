@@ -2,7 +2,7 @@ package llm
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"testing"
 
 	"github.com/sloccy/ollamail-aws/db"
@@ -97,4 +97,4 @@ func (m *multiSettings) GetSetting(_ context.Context, key string) (string, error
 	return "", errNotFound
 }
 
-var errNotFound = fmt.Errorf("not found")
+var errNotFound = errors.New("not found")

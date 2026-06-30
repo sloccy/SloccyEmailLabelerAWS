@@ -147,7 +147,7 @@ func TestMarshalGmailDebug(t *testing.T) {
 // ============================================================
 
 func newTestAccount() db.Account {
-	return db.Account{ID: 1, Email: "test@example.com", CredentialsJson: `{}`, Active: 1}
+	return db.Account{ID: 1, Email: "test@example.com", CredentialsJSON: `{}`, Active: 1}
 }
 
 func TestProcessEmail_MatchedPrompt(t *testing.T) {

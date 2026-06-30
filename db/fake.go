@@ -43,8 +43,8 @@ func (s *FakeStore) nextID(entity string) int64 {
 	return s.counters[entity]
 }
 
-func (s *FakeStore) Close() error   { return nil }
-func (s *FakeStore) Migrate() error { return nil }
+func (s *FakeStore) Close() error    { return nil }
+func (s *FakeStore) Migrate() error  { return nil }
 func (s *FakeStore) Log(_, _ string) {}
 
 func (s *FakeStore) GetSetting(_ context.Context, key string) (string, error) {
@@ -57,9 +57,9 @@ func (s *FakeStore) GetSetting(_ context.Context, key string) (string, error) {
 	return v, nil
 }
 
-func (s *FakeStore) TrimLogs(_ context.Context, _ int) error          { return nil }
+func (s *FakeStore) TrimLogs(_ context.Context, _ int) error            { return nil }
 func (s *FakeStore) TrimProcessedEmails(_ context.Context, _ int) error { return nil }
-func (s *FakeStore) TrimHistory(_ context.Context, _ int) error        { return nil }
+func (s *FakeStore) TrimHistory(_ context.Context, _ int) error         { return nil }
 
 func (s *FakeStore) ListAccounts(_ context.Context) ([]Account, error) {
 	s.mu.Lock()
@@ -81,8 +81,8 @@ func (s *FakeStore) UpsertAccount(_ context.Context, arg UpsertAccountParams) (i
 	defer s.mu.Unlock()
 	if id, ok := s.emailToID[arg.Email]; ok {
 		acc := s.accounts[id]
-		if arg.CredentialsJson != "" {
-			acc.CredentialsJson = arg.CredentialsJson
+		if arg.CredentialsJSON != "" {
+			acc.CredentialsJSON = arg.CredentialsJSON
 		}
 		return id, nil
 	}
@@ -91,7 +91,7 @@ func (s *FakeStore) UpsertAccount(_ context.Context, arg UpsertAccountParams) (i
 	s.accounts[id] = &Account{
 		ID:              id,
 		Email:           arg.Email,
-		CredentialsJson: arg.CredentialsJson,
+		CredentialsJSON: arg.CredentialsJSON,
 		AddedAt:         Now(),
 		Active:          1,
 	}
@@ -130,7 +130,7 @@ func (s *FakeStore) UpdateAccountCredentials(_ context.Context, arg UpdateAccoun
 	if !ok {
 		return fmt.Errorf("account %d not found", arg.ID)
 	}
-	acc.CredentialsJson = arg.CredentialsJson
+	acc.CredentialsJSON = arg.CredentialsJSON
 	return nil
 }
 
@@ -264,9 +264,6 @@ func (s *FakeStore) GetAccountRetention(_ context.Context, accountID int64) (Acc
 func (s *FakeStore) SetGlobalRetention(_ context.Context, arg SetGlobalRetentionParams) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.retention[arg.AccountID] = AccountRetention{
-		AccountID:  arg.AccountID,
-		GlobalDays: arg.GlobalDays,
-	}
+	s.retention[arg.AccountID] = AccountRetention(arg)
 	return nil
 }
