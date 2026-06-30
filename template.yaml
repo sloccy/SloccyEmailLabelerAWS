@@ -27,6 +27,17 @@ Parameters:
   CredentialsSsmArn:
     Type: String
     Description: ARN of the SSM parameter /ollamail/credentials
+  # Cloudflare Access (Zero Trust) protection for the Web UI. When CfAccessAud is set,
+  # the Function URL becomes public (AuthType NONE) and the app enforces the Access JWT.
+  # Leave both empty to keep the Function URL locked to AWS_IAM.
+  CfAccessTeamDomain:
+    Type: String
+    Default: ""
+    Description: e.g. https://yourteam.cloudflareaccess.com
+  CfAccessAud:
+    Type: String
+    Default: ""
+    Description: Cloudflare Access application Audience (AUD) tag
 
 Globals:
   Function:
@@ -44,6 +55,11 @@ Globals:
         HISTORY_MAX_LIMIT: !Ref HistoryMaxLimit
         # Name of the SSM SecureString the app reads at runtime for Google OAuth creds.
         CREDENTIALS_SSM_PARAM: /ollamail/credentials
+
+Conditions:
+  # When an Access AUD is supplied, expose the Web UI Function URL publicly so
+  # Cloudflare Access can sit in front; the app then enforces the Access JWT.
+  CfAccessEnabled: !Not [!Equals [!Ref CfAccessAud, ""]]
 
 Resources:
 
@@ -131,7 +147,9 @@ Resources:
       MemorySize: 256
       Timeout: 30
       FunctionUrlConfig:
-        AuthType: AWS_IAM   # change to NONE to allow public access (add your own auth)
+        # Public only when Cloudflare Access is configured (app enforces the Access JWT);
+        # otherwise locked to AWS_IAM.
+        AuthType: !If [CfAccessEnabled, NONE, AWS_IAM]
         InvokeMode: BUFFERED
       Environment:
         Variables:
@@ -139,6 +157,8 @@ Resources:
           AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
           # App listens on AWS_LWA_PORT; the adapter forwards Function URL requests here.
           AWS_LWA_PORT: "8080"
+          CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
+          CF_ACCESS_AUD: !Ref CfAccessAud
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
