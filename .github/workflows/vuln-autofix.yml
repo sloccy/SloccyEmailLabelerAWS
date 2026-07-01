@@ -1,0 +1,17 @@
+name: Go vuln auto-fix
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  vuln-autofix:
+    uses: sloccy/shared-ci/.github/workflows/vuln-autofix.yml@main
+    # Optional: pass a PAT to skip the close/reopen CI-trigger workaround.
+    # secrets:
+    #   pr_token: ${{ secrets.WORKFLOW_TOKEN }}
