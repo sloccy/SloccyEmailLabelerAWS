@@ -86,7 +86,7 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 			neededLabels = append(neededLabels, p.LabelName)
 		}
 	}
-	labelCache, err := gmailpkg.BuildLabelCache(ctx, svc, neededLabels)
+	labelCache, err := gmailpkg.BuildLabelCacheFor(ctx, svc, account.ID, neededLabels)
 	if err != nil {
 		return wrapper, fmt.Errorf("build label cache: %w", err)
 	}

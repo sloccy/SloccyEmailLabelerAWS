@@ -31,6 +31,9 @@ type Settings interface {
 const (
 	SettingClassifyModel = "classify_model"
 	SettingImproveModel  = "improve_model"
+	// SettingScanInterval holds the user-selected scan cadence in minutes. The web UI
+	// writes it and rewrites the EventBridge Scheduler schedule to match.
+	SettingScanInterval = "scan_interval_minutes"
 )
 
 // ModelOption is one entry in the model-selection dropdown.

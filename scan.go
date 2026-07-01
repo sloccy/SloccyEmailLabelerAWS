@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/sloccy/ollamail-aws/db"
@@ -12,21 +13,36 @@ import (
 	"github.com/sloccy/ollamail-aws/retention"
 )
 
-// runScan performs one full email-labeling pass and returns.
-// In Lambda, this is invoked by EventBridge on a schedule.
-func runScan(cfg Config) {
-	store, llmClient, gmailAuth, _ := buildDeps(cfg)
-	defer func() { _ = store.Close() }()
+// trimInterval bounds how often the DynamoDB retention trims run. The scan process stays
+// warm across EventBridge invocations, so an in-process timestamp keeps the once-a-minute
+// scan from issuing the (relatively expensive) trim queries every pass. DynamoDB TTL handles
+// expiry between trims.
+const trimInterval = time.Hour
 
-	scanOnce(context.Background(), store, llmClient, gmailAuth, &cfg)
-}
+var (
+	trimMu   sync.Mutex
+	lastTrim time.Time
+)
 
-// scanOnce runs one full email-labeling pass against already-built deps.
-// Shared by the scheduled ScanFunction (runScan) and the web UI "Scan Now" button.
-func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmailAuth *gmail.Auth, cfg *Config) {
+// maybeTrim runs the retention trims at most once per trimInterval.
+func maybeTrim(ctx context.Context, store *db.Store, cfg *Config) {
+	trimMu.Lock()
+	if !lastTrim.IsZero() && time.Since(lastTrim) < trimInterval {
+		trimMu.Unlock()
+		return
+	}
+	lastTrim = time.Now()
+	trimMu.Unlock()
+
 	_ = store.TrimLogs(ctx, cfg.LogRetentionDays)
 	_ = store.TrimProcessedEmails(ctx, cfg.GmailLookbackHours)
 	_ = store.TrimHistory(ctx, cfg.LogRetentionDays)
+}
+
+// scanOnce runs one full email-labeling pass against already-built deps.
+// Shared by the scheduled ScanFunction and the web UI "Scan Now" button.
+func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmailAuth *gmail.Auth, cfg *Config) {
+	maybeTrim(ctx, store, cfg)
 
 	accounts, err := store.ListAccounts(ctx)
 	if err != nil {
