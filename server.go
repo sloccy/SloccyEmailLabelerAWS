@@ -1025,12 +1025,47 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = s.store.UpsertAccount(ctx, db.UpsertAccountParams{Email: emailAddr, CredentialsJSON: credJSON})
+	accountID, err := s.store.UpsertAccount(ctx, db.UpsertAccountParams{Email: emailAddr, CredentialsJSON: credJSON})
 	if err != nil {
 		slog.Error("upsert account", "err", err)
+	} else {
+		// Register the Gmail push subscription so this account gets real-time
+		// notifications immediately (not just after the next scheduled renewal).
+		s.startWatch(ctx, accountID, credJSON)
 	}
 
 	s.handleAccounts(w, r)
+}
+
+// startWatch registers a Gmail push subscription for a freshly authorized account.
+// No-op when Pub/Sub isn't configured (e.g. local dev). Failures are logged, not fatal —
+// the scheduled scan renews watches and still catches mail as a fallback.
+func (s *server) startWatch(ctx context.Context, accountID int64, credJSON string) {
+	if s.cfg.PubSubTopic == "" {
+		return
+	}
+	oauthCfg, err := s.auth.ConfigFromFile()
+	if err != nil {
+		slog.Error("watch: load oauth config", "err", err)
+		return
+	}
+	svc, err := gmail.NewService(ctx, credJSON, oauthCfg, func(newCreds string) {
+		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
+			CredentialsJSON: newCreds, ID: accountID,
+		})
+	})
+	if err != nil {
+		slog.Error("watch: gmail service", "err", err)
+		return
+	}
+	res, err := svc.Watch(ctx, s.cfg.PubSubTopic)
+	if err != nil {
+		slog.Error("watch: register", "err", err)
+		return
+	}
+	_ = s.store.UpdateAccountWatch(ctx, db.UpdateAccountWatchParams{
+		ID: accountID, HistoryID: res.HistoryID, Expiration: res.Expiration,
+	})
 }
 
 // ============================================================

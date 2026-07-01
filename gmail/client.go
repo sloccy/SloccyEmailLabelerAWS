@@ -129,6 +129,32 @@ type ServiceWrapper struct {
 	Svc *Client
 }
 
+// WatchResult is the response from users.watch.
+type WatchResult struct {
+	HistoryID  string // Gmail's uint64 history id (JSON string)
+	Expiration int64  // epoch millis when the watch lapses (~7 days out)
+}
+
+// Watch registers/renews a Gmail push subscription for INBOX changes, delivered to
+// the given Cloud Pub/Sub topic (projects/<proj>/topics/<name>). Gmail expires the
+// watch after ~7 days, so callers renew it on a schedule.
+func (c *Client) Watch(ctx context.Context, topicName string) (WatchResult, error) {
+	req := map[string]any{
+		"topicName":           topicName,
+		"labelIds":            []string{LabelInbox},
+		"labelFilterBehavior": "INCLUDE",
+	}
+	var res struct {
+		HistoryID  string `json:"historyId"`
+		Expiration string `json:"expiration"`
+	}
+	if err := c.post(ctx, "/watch", req, &res); err != nil {
+		return WatchResult{}, err
+	}
+	exp, _ := strconv.ParseInt(res.Expiration, 10, 64)
+	return WatchResult{HistoryID: res.HistoryID, Expiration: exp}, nil
+}
+
 // --- local JSON types (only fields we use) ---
 
 type apiLabel struct {

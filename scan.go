@@ -74,6 +74,19 @@ func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmail
 			continue
 		}
 		if wrapper != nil {
+			// Renew the Gmail push subscription (Gmail expires watch() after ~7 days)
+			// while we already hold an authenticated client for this account.
+			if cfg.PubSubTopic != "" {
+				if res, werr := wrapper.Svc.Watch(ctx, cfg.PubSubTopic); werr != nil {
+					slog.Error("renew watch", "email", account.Email, "err", werr)
+				} else {
+					_ = store.UpdateAccountWatch(ctx, db.UpdateAccountWatchParams{
+						ID:         account.ID,
+						HistoryID:  res.HistoryID,
+						Expiration: res.Expiration,
+					})
+				}
+			}
 			retention.Cleanup(ctx, store, wrapper.Svc, account.ID)
 		}
 		slog.Info("scan complete", "email", account.Email, "elapsed", time.Since(start))

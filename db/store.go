@@ -425,6 +425,12 @@ func accountItem(a Account) map[string]types.AttributeValue {
 	} else {
 		item["lastScan"] = &types.AttributeValueMemberNULL{Value: true}
 	}
+	if a.WatchHistoryID != "" {
+		item["watchHist"] = sv(a.WatchHistoryID)
+	}
+	if a.WatchExpiration != 0 {
+		item["watchExp"] = nv(a.WatchExpiration)
+	}
 	return item
 }
 
@@ -436,6 +442,8 @@ func itemToAccount(it map[string]types.AttributeValue) Account {
 		AddedAt:         getStr(it, "addedAt"),
 		LastScanAt:      getNullStr(it, "lastScan"),
 		Active:          getInt64(it, "active"),
+		WatchHistoryID:  getStr(it, "watchHist"),
+		WatchExpiration: getInt64(it, "watchExp"),
 	}
 }
 
@@ -598,6 +606,22 @@ func (s *Store) UpdateLastScan(ctx context.Context, id int64) error {
 		UpdateExpression: aws.String("SET lastScan = :ts"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":ts": sv(Now()),
+		},
+	})
+	return err
+}
+
+func (s *Store) UpdateAccountWatch(ctx context.Context, arg UpdateAccountWatchParams) error {
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv("ACCOUNT"),
+			"SK": sv(padID(arg.ID)),
+		},
+		UpdateExpression: aws.String("SET watchHist = :h, watchExp = :e"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":h": sv(arg.HistoryID),
+			":e": nv(arg.Expiration),
 		},
 	})
 	return err
@@ -2119,6 +2143,12 @@ type UpdatePromptSortOrderParams struct {
 type UpdateAccountCredentialsParams struct {
 	CredentialsJSON string
 	ID              int64
+}
+
+type UpdateAccountWatchParams struct {
+	ID         int64
+	HistoryID  string
+	Expiration int64
 }
 
 type UpsertAccountParams struct {
