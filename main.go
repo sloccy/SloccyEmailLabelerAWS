@@ -76,17 +76,13 @@ func runWeb(cfg Config) {
 	// No in-process poller in Lambda web mode — EventBridge triggers the scan function.
 	srv := newServer(ctx, store, llmClient, nil, gmailAuth, &cfg, secretKey)
 
-	// Enforce Cloudflare Access (Google SSO) when configured; otherwise pass-through
-	// and rely on the AWS_IAM Function URL.
-	handler := newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv)
-
 	port := os.Getenv("AWS_LWA_PORT")
 	if port == "" {
 		port = "5000"
 	}
 	httpSrv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           handler,
+		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

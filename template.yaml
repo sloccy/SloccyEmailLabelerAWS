@@ -27,17 +27,6 @@ Parameters:
   CredentialsSsmArn:
     Type: String
     Description: ARN of the SSM parameter /ollamail/credentials
-  # Cloudflare Access (Zero Trust) protection for the Web UI. When CfAccessAud is set,
-  # the Function URL becomes public (AuthType NONE) and the app enforces the Access JWT.
-  # Leave both empty to keep the Function URL locked to AWS_IAM.
-  CfAccessTeamDomain:
-    Type: String
-    Default: ""
-    Description: e.g. https://yourteam.cloudflareaccess.com
-  CfAccessAud:
-    Type: String
-    Default: ""
-    Description: Cloudflare Access application Audience (AUD) tag
 
 Globals:
   Function:
@@ -142,11 +131,9 @@ Resources:
       MemorySize: 256
       Timeout: 30
       FunctionUrlConfig:
-        # Public URL. SAM auto-adds the anonymous invoke permission (AuthType statically NONE).
-        # Access is enforced by the app: it requires a valid Cloudflare Access JWT
-        # (Cf-Access-Jwt-Assertion) when CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD are set, so the
-        # raw URL 403s and only Cloudflare-authenticated (Google SSO) requests get through.
-        AuthType: NONE
+        # Locked to AWS_IAM: only requests signed with your AWS credentials can reach it.
+        # Browse it locally with a SigV4 signing proxy (see README). Nothing is public.
+        AuthType: AWS_IAM
         InvokeMode: BUFFERED
       Environment:
         Variables:
@@ -154,8 +141,6 @@ Resources:
           AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
           # App listens on AWS_LWA_PORT; the adapter forwards Function URL requests here.
           AWS_LWA_PORT: "8080"
-          CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
-          CF_ACCESS_AUD: !Ref CfAccessAud
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
@@ -186,7 +171,7 @@ Resources:
 
 Outputs:
   WebFunctionUrl:
-    Description: Public Web UI Function URL (blocked by account-level public-URL restriction)
+    Description: Web UI Function URL (AWS_IAM — browse via a local SigV4 proxy)
     Value: !GetAtt WebFunctionUrl.FunctionUrl
   DynamoDBTableName:
     Value: !Ref OlamailTable
