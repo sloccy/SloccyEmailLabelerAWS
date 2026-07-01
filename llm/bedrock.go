@@ -429,34 +429,60 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 // Model listing (control-plane)
 // ============================================================
 
-// ListAvailableModels returns Bedrock models that support the Converse API and
-// streaming. It unions foundation model IDs with system-defined inference
-// profile IDs, deduplicating by ID, and returns them sorted by label.
+// modelModality records whether a foundation model takes text in and emits text out.
+type modelModality struct{ textIn, textOut bool }
+
+// regionPrefixes are the cross-region inference-profile prefixes stripped to recover the
+// underlying foundation-model id (e.g. "us.anthropic.claude-..." -> "anthropic.claude-...").
+var regionPrefixes = []string{"us-gov.", "global.", "apac.", "us.", "eu."}
+
+func baseModelID(id string) string {
+	for _, p := range regionPrefixes {
+		if strings.HasPrefix(id, p) {
+			return id[len(p):]
+		}
+	}
+	return id
+}
+
+// ListAvailableModels returns Bedrock models suitable for text classification: text-in,
+// text-out, streaming, on-demand foundation models, unioned with the system-defined
+// inference profiles whose underlying model is likewise text-in/text-out. Image, embedding,
+// and other non-text models (e.g. stability.*, *embed*) are excluded. Sorted cheapest input
+// cost first, unpriced last.
 func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error) {
 	seen := make(map[string]bool)
 	var opts []ModelOption
 
-	// Foundation models: filter to text-in/text-out, streaming, on-demand.
-	fmOut, err := c.bc.ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{
-		ByOutputModality: bedrocktypes.ModelModalityText,
-	})
+	// One unfiltered catalog call: drives the foundation-model list AND supplies the
+	// modality of the models that back each inference profile.
+	fmOut, err := c.bc.ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{})
 	if err != nil {
 		return nil, fmt.Errorf("list foundation models: %w", err)
 	}
+	type summary struct {
+		id       string
+		modality modelModality
+	}
+	var summaries []summary
 	for _, m := range fmOut.ModelSummaries {
 		id := aws.ToString(m.ModelId)
-		if id == "" || seen[id] {
+		if id == "" {
 			continue
 		}
-		// Must support text input.
-		if !slices.Contains(m.InputModalities, bedrocktypes.ModelModalityText) {
+		mod := modelModality{
+			textIn:  slices.Contains(m.InputModalities, bedrocktypes.ModelModalityText),
+			textOut: slices.Contains(m.OutputModalities, bedrocktypes.ModelModalityText),
+		}
+		summaries = append(summaries, summary{id: id, modality: mod})
+
+		// Foundation-model dropdown entry: text-in/out, streaming, on-demand.
+		if seen[id] || !mod.textIn || !mod.textOut {
 			continue
 		}
-		// Must support streaming (needed for StreamGeneratePromptInstruction).
 		if m.ResponseStreamingSupported == nil || !*m.ResponseStreamingSupported {
 			continue
 		}
-		// Must be available on-demand (not fine-tune-only).
 		if !slices.Contains(m.InferenceTypesSupported, bedrocktypes.InferenceTypeOnDemand) {
 			continue
 		}
@@ -466,6 +492,18 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		}
 		seen[id] = true
 		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id)})
+	}
+
+	// modalityOf resolves a profile's underlying model modality. Foundation ids sometimes
+	// carry a context suffix (e.g. "...-v1:0:8k") not present on the profile id, so match by
+	// exact id or prefix. Unknown models are kept (conservative) rather than hidden.
+	modalityOf := func(base string) (modelModality, bool) {
+		for _, s := range summaries {
+			if s.id == base || strings.HasPrefix(s.id, base) {
+				return s.modality, true
+			}
+		}
+		return modelModality{}, false
 	}
 
 	// System-defined inference profiles (cross-region; e.g. us.amazon.nova-micro-v1:0).
@@ -480,6 +518,10 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 	for _, p := range ipOut.InferenceProfileSummaries {
 		id := aws.ToString(p.InferenceProfileId)
 		if id == "" || seen[id] {
+			continue
+		}
+		// Drop image/embedding/other non-text profiles by checking the backing model.
+		if mod, known := modalityOf(baseModelID(id)); known && (!mod.textIn || !mod.textOut) {
 			continue
 		}
 		label := aws.ToString(p.InferenceProfileName)
