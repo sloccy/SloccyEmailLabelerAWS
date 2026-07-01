@@ -38,8 +38,9 @@ const (
 
 // ModelOption is one entry in the model-selection dropdown.
 type ModelOption struct {
-	ID    string // value sent to Bedrock (modelId or inferenceProfileId)
-	Label string // human-readable display name
+	ID             string  // value sent to Bedrock (modelId or inferenceProfileId)
+	Label          string  // human-readable display name
+	InputCostPer1M float64 // on-demand input price per 1M tokens; CostUnknown if unpriced
 }
 
 // Client wraps the Bedrock runtime client with per-call model resolution.
@@ -63,6 +64,12 @@ func NewClient(settings Settings, defaultModel string) *Client {
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	if err != nil {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
+	}
+	// Hard-require a US region for all LLM traffic (data residency). The cross-region
+	// inference profiles we use (us.*) only fan out within the US, and the IAM policy
+	// denies non-US regions — this guarantees the client never even attempts one.
+	if !strings.HasPrefix(cfg.Region, "us-") {
+		cfg.Region = "us-east-1"
 	}
 	return &Client{
 		br:           bedrockruntime.NewFromConfig(cfg),
@@ -458,7 +465,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
-		opts = append(opts, ModelOption{ID: id, Label: label})
+		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id)})
 	}
 
 	// System-defined inference profiles (cross-region; e.g. us.amazon.nova-micro-v1:0).
@@ -480,10 +487,22 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
-		opts = append(opts, ModelOption{ID: id, Label: label})
+		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id)})
 	}
 
-	sort.Slice(opts, func(i, j int) bool { return opts[i].Label < opts[j].Label })
+	// Sort cheapest input cost first; unpriced (CostUnknown) sinks to the bottom,
+	// tie-broken by label for a stable order.
+	sort.Slice(opts, func(i, j int) bool {
+		ci, cj := opts[i].InputCostPer1M, opts[j].InputCostPer1M
+		iUnknown, jUnknown := ci < 0, cj < 0
+		if iUnknown != jUnknown {
+			return !iUnknown // known prices before unknown
+		}
+		if !iUnknown && ci != cj {
+			return ci < cj
+		}
+		return opts[i].Label < opts[j].Label
+	})
 	return opts, nil
 }
 

@@ -118,6 +118,40 @@ In the Bedrock console (**Model access**), request/enable access to the classifi
 
 ---
 
+### 3b. (Optional) Enable Gmail push — real-time labeling
+
+By default the app labels mail on a scheduled catch-up scan. To process mail **the moment it arrives** (faster, and far less wasted work), wire up Gmail push via Cloud Pub/Sub. In the **same GCP project** as your OAuth client:
+
+1. **Create a topic** (e.g. `gmail-push`):
+   ```bash
+   gcloud pubsub topics create gmail-push
+   ```
+2. **Let Gmail publish to it** — grant the Gmail system service account Publisher:
+   ```bash
+   gcloud pubsub topics add-iam-policy-binding gmail-push \
+     --member=serviceAccount:gmail-api-push@system.gserviceaccount.com \
+     --role=roles/pubsub.publisher
+   ```
+3. **Deploy first** (see step 4) to get the **PushFunctionUrl** stack output — that public URL is the push endpoint.
+4. **Create a push subscription with OIDC auth** so the endpoint can verify the caller. Use (or create) a dedicated service account `SA_EMAIL`:
+   ```bash
+   gcloud pubsub subscriptions create gmail-push-sub \
+     --topic=gmail-push \
+     --push-endpoint=<PushFunctionUrl> \
+     --push-auth-service-account=<SA_EMAIL> \
+     --push-auth-token-audience=<PushFunctionUrl>
+   ```
+5. **Set the stack parameters** so the app registers watches and authenticates pushes. Add to `samconfig.toml` `parameter_overrides` (or pass on the CLI) and redeploy:
+   ```
+   PubSubTopic=projects/<PROJECT_ID>/topics/gmail-push
+   PushOidcAudience=<PushFunctionUrl>
+   PushOidcServiceAccount=<SA_EMAIL>
+   ```
+
+Once set, each account registers a Gmail `watch()` on OAuth connect (and the daily scan renews it, since Gmail expires watches after ~7 days). Leave the three parameters empty to stay polling-only. **Publishing the OAuth consent screen (step 1 above) is required** — in Testing mode tokens die weekly and push stops.
+
+---
+
 ### 4. Deploy
 
 Deploys happen automatically via GitHub Actions (`.github/workflows/deploy.yml`) on push to `main`, using OIDC role assumption (no stored keys). To deploy manually:
@@ -171,16 +205,19 @@ Configuration is set via Lambda environment variables (see `template.yaml`).
 | `LOG_RETENTION_DAYS` | `30` | Days to keep processing log/history entries |
 | `HISTORY_MAX_LIMIT` | `500` | Maximum rows returned in history/log queries |
 | `CREDENTIALS_SSM_PARAM` | `/ollamail/credentials` | SSM SecureString holding the Google OAuth client JSON |
-| `MODE` | `web` | `web` (UI server) or `scan` (EventBridge-triggered pass) |
+| `MODE` | `web` | `web` (UI server), `scan` (EventBridge catch-up pass), or `push` (Pub/Sub webhook) |
+| `PUBSUB_TOPIC` | _(empty)_ | `projects/<proj>/topics/<name>`; enables Gmail `watch()` registration/renewal |
+| `PUSH_OIDC_AUDIENCE` | _(empty)_ | Expected OIDC audience on the Pub/Sub push token (the PushFunction URL) |
+| `PUSH_OIDC_SA_EMAIL` | _(empty)_ | Service-account email the push token must be issued by |
 | `DEBUG_LOGGING` | `0` | Set to `1` for verbose logging |
 
-Scan cadence is **not** an environment variable — it is the `ScheduleExpression` on the `ScanFunction` in `template.yaml`.
+Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-verified). The scheduled scan is now a **daily safety net** that also renews Gmail watches; its cadence is the `ScheduleExpression` on the `ScanSchedule` in `template.yaml` (rewritable from Settings).
 
 ---
 
 ## How It Works
 
-1. **EventBridge** invokes the ScanFunction every minute (or you click **Scan Now** in the UI). Both call the same `scanOnce` pass.
+1. **Gmail push** (when configured): a new message triggers a Pub/Sub notification to the PushFunction, which processes just that account immediately. **EventBridge** also invokes the ScanFunction daily as a catch-up + `watch()` renewal (or you click **Scan Now**). All paths share the same per-account processing.
 2. For each active Gmail account, it fetches recent emails (bounded by `GMAIL_MAX_RESULTS` and `GMAIL_LOOKBACK_HOURS`).
 3. Each email body is truncated to `EMAIL_BODY_TRUNCATION` characters and all active rules are sent to **Bedrock in a single call**, which returns a structured per-rule true/false decision.
 4. For each matched rule, the configured action is applied via the Gmail API (label, archive, trash, spam, mark as read). Labels are created automatically if missing.

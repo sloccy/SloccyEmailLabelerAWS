@@ -11,6 +11,10 @@ type Account struct {
 	AddedAt         string
 	LastScanAt      sql.NullString
 	Active          int64
+	// Gmail push (users.watch) state. WatchExpiration is epoch millis; the watch is
+	// renewed on the scheduled scan before it lapses (Gmail expires it after ~7 days).
+	WatchHistoryID  string
+	WatchExpiration int64
 }
 
 type AccountRetention struct {

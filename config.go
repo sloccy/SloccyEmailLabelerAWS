@@ -15,7 +15,12 @@ type Config struct {
 	DebugLogging       bool
 	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
 	DataDir            string // unused in Lambda; retained for Open() compat
-	Mode               string // "web" or "scan"
+	Mode               string // "web", "scan", or "push"
+
+	// Gmail push (users.watch → Pub/Sub → PushFunction webhook).
+	PubSubTopic        string // projects/<proj>/topics/<name>; empty disables watch registration
+	PushAudience       string // expected OIDC audience on the Pub/Sub push JWT
+	PushServiceAccount string // expected service-account email in the push JWT
 
 	// Scan schedule (web mode rewrites the EventBridge Scheduler schedule at runtime).
 	ScanIntervalMinutes int    // baseline/default cadence when no setting is stored
@@ -37,7 +42,11 @@ func loadConfig() Config {
 		DataDir:            getEnv("DATA_DIR", "/tmp"),
 		Mode:               getEnv("MODE", "web"),
 
-		ScanIntervalMinutes: getEnvInt("SCAN_INTERVAL_MINUTES", 1),
+		PubSubTopic:        getEnv("PUBSUB_TOPIC", ""),
+		PushAudience:       getEnv("PUSH_OIDC_AUDIENCE", ""),
+		PushServiceAccount: getEnv("PUSH_OIDC_SA_EMAIL", ""),
+
+		ScanIntervalMinutes: getEnvInt("SCAN_INTERVAL_MINUTES", 1440),
 		ScanScheduleName:    getEnv("SCAN_SCHEDULE_NAME", ""),
 		ScanFunctionArn:     getEnv("SCAN_FUNCTION_ARN", ""),
 		SchedulerRoleArn:    getEnv("SCHEDULER_ROLE_ARN", ""),

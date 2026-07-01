@@ -27,6 +27,24 @@ Parameters:
   CredentialsSsmArn:
     Type: String
     Description: ARN of the SSM parameter /ollamail/credentials
+  # Gmail push (users.watch → Pub/Sub → PushFunction). Leave PubSubTopic empty to
+  # keep polling-only behaviour; set all three to enable real-time push.
+  PubSubTopic:
+    Type: String
+    Default: ""
+    Description: Cloud Pub/Sub topic for Gmail push, e.g. projects/<proj>/topics/gmail-push
+  PushOidcAudience:
+    Type: String
+    Default: ""
+    Description: Expected OIDC audience on the Pub/Sub push token (e.g. the PushFunction URL)
+  PushOidcServiceAccount:
+    Type: String
+    Default: ""
+    Description: Service-account email configured on the Pub/Sub push subscription
+  BudgetAlertEmail:
+    Type: String
+    Default: slocum.brendan@gmail.com
+    Description: Email for the monthly billing-budget alerts
 
 Globals:
   Function:
@@ -44,6 +62,11 @@ Globals:
         HISTORY_MAX_LIMIT: !Ref HistoryMaxLimit
         # Name of the SSM SecureString the app reads at runtime for Google OAuth creds.
         CREDENTIALS_SSM_PARAM: /ollamail/credentials
+        # Gmail push wiring (empty = disabled). Web/scan use the topic to register/renew
+        # watch(); push uses the audience + SA email to authenticate incoming notifications.
+        PUBSUB_TOPIC: !Ref PubSubTopic
+        PUSH_OIDC_AUDIENCE: !Ref PushOidcAudience
+        PUSH_OIDC_SA_EMAIL: !Ref PushOidcServiceAccount
 
 Resources:
 
@@ -111,6 +134,11 @@ Resources:
                   # in-country, and excludes non-US regions.
                   - arn:aws:bedrock:us-*::foundation-model/*
                   - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+                # Belt-and-suspenders: deny any InvokeModel targeting a non-US region,
+                # regardless of which model/profile ARN is selected.
+                Condition:
+                  StringLike:
+                    aws:RequestedRegion: us-*
               - Effect: Allow
                 Action:
                   - bedrock:ListFoundationModels
@@ -186,10 +214,35 @@ Resources:
           MODE: scan
 
   # ----------------------------------------------------------------
+  # Push function — public Function URL that receives Gmail Pub/Sub push
+  # notifications. AuthType NONE because Pub/Sub can't sign SigV4; the app
+  # instead validates the Google-signed OIDC token on every request.
+  # ----------------------------------------------------------------
+  PushFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile
+    Properties:
+      PackageType: Image
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 256
+      Timeout: 120
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          MODE: push
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
+          AWS_LWA_PORT: "8080"
+
+  # ----------------------------------------------------------------
   # EventBridge Scheduler schedule that triggers the scan.
   # Defined explicitly (not via the function's Events property) so it has a stable name the
-  # Web UI can rewrite at runtime via scheduler:UpdateSchedule. rate(1 minute) is the baseline;
-  # the Web app re-applies the user's stored interval on startup after each deploy.
+  # Web UI can rewrite at runtime via scheduler:UpdateSchedule. Real-time labeling is handled
+  # by Gmail push; this scheduled pass is a daily safety net (catch-up scan + watch() renewal).
+  # The Web app re-applies the user's stored interval on startup after each deploy.
   # ----------------------------------------------------------------
   ScanSchedule:
     Type: AWS::Scheduler::Schedule
@@ -197,7 +250,7 @@ Resources:
       Name: ollamail-scan
       FlexibleTimeWindow:
         Mode: "OFF"
-      ScheduleExpression: rate(1 minute)
+      ScheduleExpression: rate(1 day)
       State: ENABLED
       Target:
         Arn: !GetAtt ScanFunction.Arn
@@ -223,9 +276,103 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ollamail-scan-fn
 
+  # ----------------------------------------------------------------
+  # $5/month hard cap. AWS Budgets only alerts by default, so a Budgets Action
+  # attaches an explicit Bedrock-deny policy to the Lambda role at $5 actual spend,
+  # halting all LLM (the app's only real cost) until the next month or a manual
+  # detach. DynamoDB/Lambda spend at this scale is negligible. Cost data can lag a
+  # few hours, so the cap is "within a few hours of $5," not instantaneous.
+  # ----------------------------------------------------------------
+  BedrockDenyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Deny-all Bedrock invocation; parked until the budget action attaches it.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+
+  BudgetActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AttachBedrockDeny
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                Resource: !GetAtt LambdaRole.Arn
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: ollamail-monthly-5usd
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: 5
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+
+  # At $5 actual spend, attach the Bedrock-deny policy to the Lambda role automatically.
+  StopBedrockAtCap:
+    Type: AWS::Budgets::BudgetsAction
+    DependsOn: MonthlyBudget
+    Properties:
+      BudgetName: ollamail-monthly-5usd
+      NotificationType: ACTUAL
+      ActionType: APPLY_IAM_POLICY
+      ApprovalModel: AUTOMATIC
+      ActionThreshold:
+        Type: ABSOLUTE_VALUE
+        Value: 5
+      Definition:
+        IamActionDefinition:
+          PolicyArn: !Ref BedrockDenyPolicy
+          Roles:
+            - !Ref LambdaRole
+      ExecutionRoleArn: !GetAtt BudgetActionRole.Arn
+      Subscribers:
+        - Type: EMAIL
+          Address: !Ref BudgetAlertEmail
+
 Outputs:
   WebFunctionUrl:
     Description: Web UI Function URL (AWS_IAM — browse via a local SigV4 proxy)
     Value: !GetAtt WebFunctionUrl.FunctionUrl
+  PushFunctionUrl:
+    Description: Public push webhook URL — set as the Pub/Sub push endpoint + OIDC audience
+    Value: !GetAtt PushFunctionUrl.FunctionUrl
   DynamoDBTableName:
     Value: !Ref OlamailTable

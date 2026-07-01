@@ -27,7 +27,8 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	if cfg.Mode == "scan" {
+	switch cfg.Mode {
+	case "scan":
 		// EventBridge invokes this via the Lambda Runtime API; lambda.Start keeps the
 		// process alive between scheduled invocations. Build deps once here (not per
 		// invocation) so warm invokes skip the redundant client/config/seed work.
@@ -36,9 +37,11 @@ func main() {
 			scanOnce(ctx, store, llmClient, gmailAuth, &cfg)
 			return nil
 		})
-		return
+	case "push":
+		runPush(cfg)
+	default:
+		runWeb(cfg)
 	}
-	runWeb(cfg)
 }
 
 func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
