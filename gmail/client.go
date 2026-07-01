@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -363,6 +364,86 @@ func EnsureLabel(ctx context.Context, svc *Client, name string) error {
 		}
 	}
 	return svc.post(ctx, "/labels", map[string]string{"name": name}, nil)
+}
+
+// ErrHistoryTooOld is returned by ListHistoryAddedMessageIDs when the supplied
+// startHistoryId has aged out of Gmail's history window (HTTP 404). Callers should
+// fall back to a full lookback scan and reset their stored history id.
+var ErrHistoryTooOld = errors.New("gmail: startHistoryId too old")
+
+type apiHistoryMessageAdded struct {
+	Message apiMessageRef `json:"message"`
+}
+
+type apiHistoryRecord struct {
+	MessagesAdded []apiHistoryMessageAdded `json:"messagesAdded"`
+}
+
+type apiHistoryResponse struct {
+	History       []apiHistoryRecord `json:"history"`
+	NextPageToken string             `json:"nextPageToken"`
+	HistoryID     string             `json:"historyId"`
+}
+
+// ListHistoryAddedMessageIDs returns the IDs of messages *added to the inbox* since
+// startHistoryID, plus Gmail's latest history id (the next start point). It filters to
+// messageAdded events on INBOX, so label/read changes the app makes itself are ignored —
+// that's what keeps push notifications from retriggering on our own modifications.
+// Returns ErrHistoryTooOld if startHistoryID has expired.
+func ListHistoryAddedMessageIDs(ctx context.Context, svc *Client, startHistoryID string) ([]string, string, error) {
+	var ids []string
+	seen := map[string]bool{}
+	latest := startHistoryID
+	pageToken := ""
+	for {
+		params := url.Values{
+			"startHistoryId": {startHistoryID},
+			"historyTypes":   {"messageAdded"},
+			"labelId":        {LabelInbox},
+		}
+		if pageToken != "" {
+			params.Set("pageToken", pageToken)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, gmailBase+"/history?"+params.Encode(), nil)
+		if err != nil {
+			return nil, latest, err
+		}
+		resp, err := svc.http.Do(req)
+		if err != nil {
+			return nil, latest, err
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return nil, latest, ErrHistoryTooOld
+		}
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, latest, fmt.Errorf("gmail API /history: %s", body)
+		}
+		var res apiHistoryResponse
+		derr := json.NewDecoder(resp.Body).Decode(&res)
+		_ = resp.Body.Close()
+		if derr != nil {
+			return nil, latest, derr
+		}
+		for _, h := range res.History {
+			for _, ma := range h.MessagesAdded {
+				if id := ma.Message.ID; id != "" && !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
+			}
+		}
+		if res.HistoryID != "" {
+			latest = res.HistoryID
+		}
+		pageToken = res.NextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+	return ids, latest, nil
 }
 
 // ListRecentMessageIDs returns message IDs from the inbox for the last lookbackHours hours.
