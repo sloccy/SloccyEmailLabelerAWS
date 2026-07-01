@@ -120,6 +120,17 @@ Resources:
                 Action:
                   - ssm:GetParameter
                 Resource: !Ref CredentialsSsmArn
+              # Web UI rewrites the scan schedule when the user changes the interval.
+              - Effect: Allow
+                Action:
+                  - scheduler:GetSchedule
+                  - scheduler:UpdateSchedule
+                Resource: !Sub arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/ollamail-scan
+              # UpdateSchedule re-supplies the target RoleArn, which requires PassRole.
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SchedulerInvokeRole.Arn
 
   # ----------------------------------------------------------------
   # Web function — serves the management UI via Function URL
@@ -145,6 +156,10 @@ Resources:
           AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
           # App listens on AWS_LWA_PORT; the adapter forwards Function URL requests here.
           AWS_LWA_PORT: "8080"
+          # Scan-schedule rewriting: name to update + ARNs re-supplied on every UpdateSchedule.
+          SCAN_SCHEDULE_NAME: ollamail-scan
+          SCAN_FUNCTION_ARN: !GetAtt ScanFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
@@ -156,6 +171,9 @@ Resources:
       Dockerfile: Dockerfile
     Properties:
       PackageType: Image
+      # Fixed name so SchedulerInvokeRole can grant invoke via a constructed ARN instead of
+      # !GetAtt — that breaks the LambdaRole→SchedulerInvokeRole→ScanFunction→LambdaRole cycle.
+      FunctionName: ollamail-scan-fn
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
       Timeout: 120
@@ -166,12 +184,44 @@ Resources:
       Environment:
         Variables:
           MODE: scan
-      Events:
-        Schedule:
-          Type: ScheduleV2
-          Properties:
-            ScheduleExpression: rate(1 minute)
-            State: ENABLED
+
+  # ----------------------------------------------------------------
+  # EventBridge Scheduler schedule that triggers the scan.
+  # Defined explicitly (not via the function's Events property) so it has a stable name the
+  # Web UI can rewrite at runtime via scheduler:UpdateSchedule. rate(1 minute) is the baseline;
+  # the Web app re-applies the user's stored interval on startup after each deploy.
+  # ----------------------------------------------------------------
+  ScanSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: ollamail-scan
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Target:
+        Arn: !GetAtt ScanFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+
+  # Role EventBridge Scheduler assumes to invoke the ScanFunction.
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeScanFunction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ollamail-scan-fn
 
 Outputs:
   WebFunctionUrl:

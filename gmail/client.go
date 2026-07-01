@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -266,6 +267,62 @@ func BuildLabelCache(ctx context.Context, svc *Client, needed []string) (map[str
 		cache[name] = created.ID
 	}
 	return cache, nil
+}
+
+// LabelCacheTTL bounds how long a cached per-account label map is reused.
+const LabelCacheTTL = 10 * time.Minute
+
+type labelCacheEntry struct {
+	labels    map[string]string
+	fetchedAt time.Time
+}
+
+var (
+	labelCacheMu    sync.Mutex
+	labelCacheStore = map[int64]labelCacheEntry{}
+)
+
+// BuildLabelCacheFor is a caching wrapper over BuildLabelCache keyed by account ID. The scan
+// process stays warm across EventBridge invocations and Gmail labels change rarely, so within
+// LabelCacheTTL this reuses the map and skips the ListLabels round-trip — as long as every
+// needed label is already present. A missing needed label (or an expired entry) forces a
+// rebuild, which also creates the label. Labels are per-account, hence the account-ID key.
+func BuildLabelCacheFor(ctx context.Context, svc *Client, accountID int64, needed []string) (map[string]string, error) {
+	labelCacheMu.Lock()
+	entry, ok := labelCacheStore[accountID]
+	if ok && time.Since(entry.fetchedAt) < LabelCacheTTL && hasAll(entry.labels, needed) {
+		out := cloneLabels(entry.labels)
+		labelCacheMu.Unlock()
+		return out, nil
+	}
+	labelCacheMu.Unlock()
+
+	labels, err := BuildLabelCache(ctx, svc, needed)
+	if err != nil {
+		return nil, err
+	}
+	labelCacheMu.Lock()
+	labelCacheStore[accountID] = labelCacheEntry{labels: cloneLabels(labels), fetchedAt: time.Now()}
+	labelCacheMu.Unlock()
+	return labels, nil
+}
+
+func hasAll(m map[string]string, needed []string) bool {
+	for _, n := range needed {
+		if n == "" {
+			continue
+		}
+		if _, ok := m[n]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneLabels(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	maps.Copy(out, m)
+	return out
 }
 
 // EnsureLabel creates a label if it doesn't exist. Safe to call concurrently.

@@ -16,6 +16,12 @@ type Config struct {
 	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
 	DataDir            string // unused in Lambda; retained for Open() compat
 	Mode               string // "web" or "scan"
+
+	// Scan schedule (web mode rewrites the EventBridge Scheduler schedule at runtime).
+	ScanIntervalMinutes int    // baseline/default cadence when no setting is stored
+	ScanScheduleName    string // AWS::Scheduler::Schedule name to update (empty = disabled, e.g. local dev)
+	ScanFunctionArn     string // ScanFunction ARN — re-supplied on every UpdateSchedule (full replace)
+	SchedulerRoleArn    string // role EventBridge Scheduler assumes to invoke the target
 }
 
 func loadConfig() Config {
@@ -30,6 +36,11 @@ func loadConfig() Config {
 		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),
 		DataDir:            getEnv("DATA_DIR", "/tmp"),
 		Mode:               getEnv("MODE", "web"),
+
+		ScanIntervalMinutes: getEnvInt("SCAN_INTERVAL_MINUTES", 1),
+		ScanScheduleName:    getEnv("SCAN_SCHEDULE_NAME", ""),
+		ScanFunctionArn:     getEnv("SCAN_FUNCTION_ARN", ""),
+		SchedulerRoleArn:    getEnv("SCHEDULER_ROLE_ARN", ""),
 	}
 }
 

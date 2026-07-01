@@ -7,6 +7,9 @@ ollamail
 # Node (vendor deps only)
 node_modules/
 
+# Frontend third-party deps are loaded from jsDelivr (see templates/index.html), not vendored
+static/vendor/
+
 # Data
 *.db
 

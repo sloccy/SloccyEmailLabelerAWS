@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -28,9 +29,11 @@ func main() {
 
 	if cfg.Mode == "scan" {
 		// EventBridge invokes this via the Lambda Runtime API; lambda.Start keeps the
-		// process alive between scheduled invocations instead of exiting after one pass.
+		// process alive between scheduled invocations. Build deps once here (not per
+		// invocation) so warm invokes skip the redundant client/config/seed work.
+		store, llmClient, gmailAuth, _ := buildDeps(cfg)
 		lambda.Start(func(ctx context.Context) error {
-			runScan(cfg)
+			scanOnce(ctx, store, llmClient, gmailAuth, &cfg)
 			return nil
 		})
 		return
@@ -69,9 +72,25 @@ func runWeb(cfg Config) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	sched, err := newScanScheduler(ctx, cfg)
+	if err != nil {
+		slog.Error("init scan scheduler", "err", err)
+	}
+	// A fresh `sam deploy` resets the schedule to the template baseline; re-apply the stored
+	// interval so the user's choice survives deploys.
+	if sched != nil {
+		if v, gerr := store.GetSetting(ctx, llm.SettingScanInterval); gerr == nil {
+			if n, cerr := strconv.Atoi(v); cerr == nil && n >= 1 {
+				if uerr := sched.UpdateInterval(ctx, n); uerr != nil {
+					slog.Error("resync scan schedule", "err", uerr)
+				}
+			}
+		}
+	}
+
 	// Scheduled scanning is handled by the ScanFunction (EventBridge); the web UI's
 	// "Scan Now" runs an on-demand pass in-process via scanOnce.
-	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey)
+	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey, sched)
 
 	port := os.Getenv("AWS_LWA_PORT")
 	if port == "" {

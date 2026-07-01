@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OllaMail</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link href="/static/vendor/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/vendor/bootstrap.bundle.min.js" defer></script>
-  <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.8/dist/htmx.min.js" integrity="sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz" crossorigin="anonymous" defer></script>
 </head>
 <body>
 <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>
@@ -35,7 +35,7 @@
     <div class="sidebar-footer mt-auto pt-3 border-top">
       <div class="d-inline-flex align-items-center gap-1 font-monospace small text-muted">
         <span class="status-dot active" id="pollerDot"></span>
-        <span id="pollerLabel">auto-scan · 1 min</span>
+        <span id="pollerLabel">auto-scan · {{.ScanCadence}}</span>
       </div>
     </div>
   </aside>
@@ -50,7 +50,7 @@
       </div>
       <div id="dashboard-content"
         hx-get="/fragments/dashboard"
-        hx-trigger="load, every 30s [document.getElementById('page-dashboard').classList.contains('active') &amp;&amp; document.visibilityState === 'visible'], refreshDashboard from:body"
+        hx-trigger="load, every 120s [document.getElementById('page-dashboard').classList.contains('active') &amp;&amp; document.visibilityState === 'visible'], refreshDashboard from:body"
         hx-swap="innerHTML">
         <div class="d-flex flex-column gap-3 p-2">
           <div class="d-flex gap-3">
@@ -342,7 +342,7 @@
       </div>
       <div id="suggestions-list-container"
         hx-get="/fragments/prompt-suggestions"
-        hx-trigger="intersect once, every 15s, refreshSuggestions from:window"
+        hx-trigger="intersect once, every 60s, refreshSuggestions from:window"
         hx-swap="innerHTML">
         <div class="d-flex flex-column gap-3">
           <div class="skeleton rounded-3" style="height:4rem"></div>

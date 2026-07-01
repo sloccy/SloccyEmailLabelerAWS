@@ -30,6 +30,8 @@ github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.6 h1:Bs2O
 github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.6/go.mod h1:OTctu4cW8t7/TRlTKPLT6akzyOkfceMWhtEHqtYDIQQ=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.29 h1:DRebniUGZ2MqiiIVmQJ04vIXr918hubdHMnarSLEWyU=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.29/go.mod h1:LfRkPCD8YHDM2E5eTkos2UpwYeZnBcVarTa8L59bJHA=
+github.com/aws/aws-sdk-go-v2/service/scheduler v1.18.8 h1:sFu/Es4KoV6kwaUTblMiQX3Ug4NiHHt1tLtzQyTQKBQ=
+github.com/aws/aws-sdk-go-v2/service/scheduler v1.18.8/go.mod h1:Z6XrFAHEJAyZCbSY6naL6cylzYJunhoazrtk7qHpfdA=
 github.com/aws/aws-sdk-go-v2/service/signin v1.2.1 h1:BeJmkm5YOZs6lGRGcNoIuLSoTTtGLLCEqlSiRKYodfM=
 github.com/aws/aws-sdk-go-v2/service/signin v1.2.1/go.mod h1:LxYujSTLPRlp2vTtcUO/+1ilrew8ytt6SvQyOgejzFQ=
 github.com/aws/aws-sdk-go-v2/service/ssm v1.69.4 h1:IL0XMyJNBb2upB7uXQFGpFA59vxU7DulkbTZzT/plFU=
