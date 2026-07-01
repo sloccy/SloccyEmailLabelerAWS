@@ -1,5 +1,5 @@
 # Build stage — builds natively on the CI runner (amd64), no cross-compile/QEMU.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
