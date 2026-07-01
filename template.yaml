@@ -147,9 +147,10 @@ Resources:
       MemorySize: 256
       Timeout: 30
       FunctionUrlConfig:
-        # Public only when Cloudflare Access is configured (app enforces the Access JWT);
-        # otherwise locked to AWS_IAM.
-        AuthType: !If [CfAccessEnabled, NONE, AWS_IAM]
+        # Always AWS_IAM. This account blocks public (NONE) Function URLs, so when Cloudflare
+        # Access is configured we front the URL with CloudFront + Origin Access Control, which
+        # SigV4-signs requests to this IAM URL. The app still enforces the Cloudflare Access JWT.
+        AuthType: AWS_IAM
         InvokeMode: BUFFERED
       Environment:
         Variables:
@@ -160,18 +161,57 @@ Resources:
           CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
           CF_ACCESS_AUD: !Ref CfAccessAud
 
-  # Allow anonymous invocation of the Web Function URL when it is public (AuthType NONE).
-  # SAM only auto-creates this when AuthType is statically NONE; our AuthType is an !If,
-  # so we add it explicitly. Access is still gated: the app rejects any request without a
-  # valid Cloudflare Access JWT, and Cloudflare sits in front.
-  WebFunctionUrlPublicPermission:
+  # ----------------------------------------------------------------
+  # CloudFront in front of the IAM Function URL (created only when Cloudflare Access is
+  # configured). Origin Access Control SigV4-signs each request to the Function URL, which
+  # is why the URL can stay AWS_IAM (public URLs are blocked on this account). Point your
+  # Cloudflare proxied CNAME at this distribution's domain; Cloudflare Access does Google
+  # SSO and injects the Cf-Access-Jwt-Assertion header, which the app verifies.
+  # ----------------------------------------------------------------
+  WebOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: CfAccessEnabled
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-web-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: CfAccessEnabled
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: OllaMail Web UI (OAC-signed to IAM Function URL; app enforces Cloudflare Access JWT)
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: WebFunctionUrlOrigin
+            DomainName: !Select [2, !Split ["/", !GetAtt WebFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt WebOAC.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: WebFunctionUrlOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          # CachingDisabled + AllViewerExceptHostHeader (managed policies): don't cache
+          # dynamic content, forward all viewer headers (incl. Cf-Access-Jwt-Assertion)
+          # except Host (Host must stay the origin's for OAC signing).
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+  WebFunctionCloudFrontPermission:
     Type: AWS::Lambda::Permission
     Condition: CfAccessEnabled
     Properties:
       FunctionName: !Ref WebFunction
       Action: lambda:InvokeFunctionUrl
-      Principal: "*"
-      FunctionUrlAuthType: NONE
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution.Id}"
+      FunctionUrlAuthType: AWS_IAM
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
@@ -202,7 +242,11 @@ Resources:
 
 Outputs:
   WebFunctionUrl:
-    Description: Management UI URL (requires AWS IAM auth by default)
+    Description: Raw Function URL (AWS_IAM — not browsable directly)
     Value: !GetAtt WebFunctionUrl.FunctionUrl
+  WebDistributionDomain:
+    Condition: CfAccessEnabled
+    Description: Point your Cloudflare proxied CNAME (mailclass) at this CloudFront domain
+    Value: !GetAtt WebDistribution.DomainName
   DynamoDBTableName:
     Value: !Ref OlamailTable
