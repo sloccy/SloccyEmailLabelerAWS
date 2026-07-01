@@ -22,6 +22,10 @@ type Config struct {
 	PushAudience       string // expected OIDC audience on the Pub/Sub push JWT
 	PushServiceAccount string // expected service-account email in the push JWT
 
+	// Cloudflare Access (Zero Trust) protection for the Web UI, fronted by CloudFront.
+	CfAccessTeamDomain string // e.g. https://yourteam.cloudflareaccess.com; enables Access JWT verification
+	CfAccessAud        string // Cloudflare Access application Audience (AUD) tag
+
 	// Scan schedule (web mode rewrites the EventBridge Scheduler schedule at runtime).
 	ScanIntervalMinutes int    // baseline/default cadence when no setting is stored
 	ScanScheduleName    string // AWS::Scheduler::Schedule name to update (empty = disabled, e.g. local dev)
@@ -45,6 +49,9 @@ func loadConfig() Config {
 		PubSubTopic:        getEnv("PUBSUB_TOPIC", ""),
 		PushAudience:       getEnv("PUSH_OIDC_AUDIENCE", ""),
 		PushServiceAccount: getEnv("PUSH_OIDC_SA_EMAIL", ""),
+
+		CfAccessTeamDomain: getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
+		CfAccessAud:        getEnv("CF_ACCESS_AUD", ""),
 
 		ScanIntervalMinutes: getEnvInt("SCAN_INTERVAL_MINUTES", 1440),
 		ScanScheduleName:    getEnv("SCAN_SCHEDULE_NAME", ""),

@@ -94,6 +94,7 @@ func runWeb(cfg Config) {
 	// Scheduled scanning is handled by the ScanFunction (EventBridge); the web UI's
 	// "Scan Now" runs an on-demand pass in-process via scanOnce.
 	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey, sched)
+	handler := newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv)
 
 	port := os.Getenv("AWS_LWA_PORT")
 	if port == "" {
@@ -101,7 +102,7 @@ func runWeb(cfg Config) {
 	}
 	httpSrv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           srv,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
