@@ -142,10 +142,10 @@ Resources:
       MemorySize: 256
       Timeout: 30
       FunctionUrlConfig:
-        # Public URL (for debugging the account-level public-URL block). SAM auto-adds the
-        # anonymous invoke permission because AuthType is statically NONE. NOTE: this account
-        # currently rejects public Function URL invocations at the AWS auth layer, so the
-        # deploy succeeds but requests return AWS 403 until that restriction is resolved.
+        # Public URL. SAM auto-adds the anonymous invoke permission (AuthType statically NONE).
+        # Access is enforced by the app: it requires a valid Cloudflare Access JWT
+        # (Cf-Access-Jwt-Assertion) when CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD are set, so the
+        # raw URL 403s and only Cloudflare-authenticated (Google SSO) requests get through.
         AuthType: NONE
         InvokeMode: BUFFERED
       Environment:
