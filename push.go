@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -110,14 +111,14 @@ func (h *pushHandler) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Ack quickly, then process. Missed acks are safe: dedup prevents reprocessing.
-	if err := h.process(ctx, notif.EmailAddress); err != nil {
+	if err := h.process(ctx, notif.EmailAddress, notif.HistoryID); err != nil {
 		slog.Error("push process", "email", notif.EmailAddress, "err", err)
 		h.store.Log("ERROR", "Push processing failed for "+notif.EmailAddress+": "+err.Error())
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *pushHandler) process(ctx context.Context, email string) error {
+func (h *pushHandler) process(ctx context.Context, email string, historyID uint64) error {
 	id, err := h.store.GetAccountByEmail(ctx, email)
 	if err != nil {
 		return fmt.Errorf("lookup account: %w", err)
@@ -140,8 +141,20 @@ func (h *pushHandler) process(ctx context.Context, email string) error {
 		DebugLogging:   h.cfg.DebugLogging,
 	}
 	start := time.Now()
-	if _, err := processor.ProcessAccount(ctx, h.store, h.llm, h.auth, account, prompts, procCfg); err != nil {
-		return err
+	// History-driven: only new inbox messages since the stored history id are processed,
+	// so our own label/read changes don't retrigger. Advance the stored id afterwards.
+	newHist, perr := processor.ProcessAccountHistory(ctx, h.store, h.llm, h.auth, account, prompts, procCfg)
+	if perr != nil {
+		return perr
+	}
+	if newHist == "" {
+		// Fell back to a full scan (no/expired baseline) — reseed from the notification id.
+		newHist = strconv.FormatUint(historyID, 10)
+	}
+	if newHist != account.WatchHistoryID {
+		_ = h.store.UpdateAccountWatch(ctx, db.UpdateAccountWatchParams{
+			ID: account.ID, HistoryID: newHist, Expiration: account.WatchExpiration,
+		})
 	}
 	slog.Info("push processed", "email", email, "elapsed", time.Since(start))
 	return nil

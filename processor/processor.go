@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -67,15 +68,62 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 		return wrapper, fmt.Errorf("list messages: %w", err)
 	}
 
+	return wrapper, processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, messageIDs, cfg)
+}
+
+// ProcessAccountHistory processes only the messages *added to the inbox* since the
+// account's stored Gmail history id (WatchHistoryID), returning the new history id to
+// persist. This is the push path: by acting on messageAdded events only, it ignores the
+// label/read changes the app makes itself — so a push no longer retriggers on our own
+// modifications. Falls back to a full lookback scan (returning "") when there is no stored
+// history id yet or it has expired; the caller then reseeds from the notification's id.
+func ProcessAccountHistory(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (string, error) {
+	svc, prompts, err := setupAccountContext(ctx, store, gmailAuth, account, allPrompts)
+	if err != nil {
+		return "", err
+	}
+	if len(prompts) == 0 {
+		return account.WatchHistoryID, nil
+	}
+
+	// No baseline yet, or history aged out: full lookback, no reliable new id.
+	fullScan := func() (string, error) {
+		messageIDs, lerr := gmailpkg.ListRecentMessageIDs(ctx, svc, cfg.LookbackHours, cfg.MaxResults)
+		if lerr != nil {
+			return "", fmt.Errorf("list messages: %w", lerr)
+		}
+		return "", processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, messageIDs, cfg)
+	}
+	if account.WatchHistoryID == "" {
+		return fullScan()
+	}
+
+	ids, latest, herr := gmailpkg.ListHistoryAddedMessageIDs(ctx, svc, account.WatchHistoryID)
+	if errors.Is(herr, gmailpkg.ErrHistoryTooOld) {
+		return fullScan()
+	}
+	if herr != nil {
+		return account.WatchHistoryID, fmt.Errorf("history list: %w", herr)
+	}
+	if err := processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, ids, cfg); err != nil {
+		return account.WatchHistoryID, err
+	}
+	return latest, nil
+}
+
+// processMessageIDs dedupes the given message IDs against already-processed ones and, for
+// any new messages, classifies them and applies label actions. Shared by the lookback scan
+// (ProcessAccount) and the push history path (ProcessAccountHistory).
+func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, account db.Account, svc *gmailpkg.Client, prompts []db.Prompt, messageIDs []string, cfg ProcessConfig) error {
 	// Filter out already-processed
 	unprocessed, err := store.FilterUnprocessed(ctx, account.ID, messageIDs)
 	if err != nil {
-		return wrapper, fmt.Errorf("filter unprocessed: %w", err)
+		return fmt.Errorf("filter unprocessed: %w", err)
 	}
 	if len(unprocessed) == 0 {
 		store.Log("INFO", fmt.Sprintf("[%s] No new emails to process.", account.Email))
 		_ = store.UpdateLastScan(ctx, account.ID)
-		return wrapper, nil
+		return nil
 	}
 	store.Log("INFO", fmt.Sprintf("[%s] Processing %d new email(s) against %d rule(s).", account.Email, len(unprocessed), len(prompts)))
 
@@ -88,7 +136,7 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 	}
 	labelCache, err := gmailpkg.BuildLabelCacheFor(ctx, svc, account.ID, neededLabels)
 	if err != nil {
-		return wrapper, fmt.Errorf("build label cache: %w", err)
+		return fmt.Errorf("build label cache: %w", err)
 	}
 
 	// Fetch and classify messages
@@ -127,7 +175,7 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 	// Update last scan timestamp
 	_ = store.UpdateLastScan(ctx, account.ID)
 
-	return wrapper, nil
+	return nil
 }
 
 func processEmail(
