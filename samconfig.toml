@@ -19,6 +19,4 @@ fail_on_empty_changeset = false
 # Access JWT. (Empty values are not allowed here — omit the params to stay AWS_IAM.)
 parameter_overrides = [
     "CredentialsSsmArn=arn:aws:ssm:us-east-1:508768431323:parameter/ollamail/credentials",
-    "CfAccessTeamDomain=https://sloccy.cloudflareaccess.com",
-    "CfAccessAud=786e8401f074568d37458301bac91efce8d0e66611d202eb89be2f39fb4a4420",
 ]
