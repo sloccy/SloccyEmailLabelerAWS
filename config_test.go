@@ -59,7 +59,7 @@ func TestGetEnvInt(t *testing.T) {
 func TestLoadConfig_Defaults(t *testing.T) {
 	keys := []string{
 		"BEDROCK_MODEL", "GMAIL_MAX_RESULTS", "GMAIL_LOOKBACK_HOURS", "EMAIL_BODY_TRUNCATION",
-		"LOG_RETENTION_DAYS", "POLL_INTERVAL", "MIN_POLL_INTERVAL",
+		"LOG_RETENTION_DAYS",
 		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "DATA_DIR", "MODE",
 	}
 	for _, k := range keys {
@@ -73,12 +73,6 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	}
 	if cfg.GmailMaxResults != 50 {
 		t.Errorf("GmailMaxResults = %d", cfg.GmailMaxResults)
-	}
-	if cfg.PollInterval != 300 {
-		t.Errorf("PollInterval = %d", cfg.PollInterval)
-	}
-	if cfg.MinPollInterval != 30 {
-		t.Errorf("MinPollInterval = %d", cfg.MinPollInterval)
 	}
 	if cfg.DebugLogging {
 		t.Error("DebugLogging should default to false")

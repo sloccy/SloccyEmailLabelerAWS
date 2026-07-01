@@ -5,6 +5,9 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/gmail"
+	"github.com/sloccy/ollamail-aws/llm"
 	"github.com/sloccy/ollamail-aws/processor"
 	"github.com/sloccy/ollamail-aws/retention"
 )
@@ -15,8 +18,12 @@ func runScan(cfg Config) {
 	store, llmClient, gmailAuth, _ := buildDeps(cfg)
 	defer func() { _ = store.Close() }()
 
-	ctx := context.Background()
+	scanOnce(context.Background(), store, llmClient, gmailAuth, &cfg)
+}
 
+// scanOnce runs one full email-labeling pass against already-built deps.
+// Shared by the scheduled ScanFunction (runScan) and the web UI "Scan Now" button.
+func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmailAuth *gmail.Auth, cfg *Config) {
 	_ = store.TrimLogs(ctx, cfg.LogRetentionDays)
 	_ = store.TrimProcessedEmails(ctx, cfg.GmailLookbackHours)
 	_ = store.TrimHistory(ctx, cfg.LogRetentionDays)

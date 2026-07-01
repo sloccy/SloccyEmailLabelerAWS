@@ -11,8 +11,6 @@ type Config struct {
 	GmailLookbackHours int
 	EmailBodyTrunc     int
 	LogRetentionDays   int
-	PollInterval       int // informational only; EventBridge controls cadence
-	MinPollInterval    int
 	HistoryMaxLimit    int
 	DebugLogging       bool
 	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
@@ -27,8 +25,6 @@ func loadConfig() Config {
 		GmailLookbackHours: getEnvInt("GMAIL_LOOKBACK_HOURS", 24),
 		EmailBodyTrunc:     getEnvInt("EMAIL_BODY_TRUNCATION", 3000),
 		LogRetentionDays:   getEnvInt("LOG_RETENTION_DAYS", 30),
-		PollInterval:       getEnvInt("POLL_INTERVAL", 300),
-		MinPollInterval:    getEnvInt("MIN_POLL_INTERVAL", 30),
 		HistoryMaxLimit:    getEnvInt("HISTORY_MAX_LIMIT", 500),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
 		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),

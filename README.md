@@ -1,15 +1,17 @@
 <div align="center">
-  <img src="app/static/logo.webp" alt="OllaMail logo" width="120" />
-  <h1>OllaMail</h1>
-  <p><strong>Local LLM email labeling for Gmail — fully self-hosted, no data leaves your machine.</strong></p>
-  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker" />
-  <img src="https://img.shields.io/badge/Ollama-powered-black?logo=llama&logoColor=white" alt="Ollama" />
-  <img src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white" alt="Go" />
+  <img src="static/logo.webp" alt="OllaMail logo" width="120" />
+  <h1>OllaMail (AWS)</h1>
+  <p><strong>Serverless Gmail email labeling — rules in plain English, classified by Amazon Bedrock.</strong></p>
+  <img src="https://img.shields.io/badge/AWS-Lambda-FF9900?logo=awslambda&logoColor=white" alt="AWS Lambda" />
+  <img src="https://img.shields.io/badge/Amazon-Bedrock-232F3E?logo=amazon&logoColor=white" alt="Bedrock" />
+  <img src="https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white" alt="Go" />
 </div>
 
 ---
 
-OllaMail connects to your Gmail accounts via OAuth, fetches recent emails on a schedule, and runs each email through rules you define in plain English. A local LLM (via [Ollama](https://ollama.com)) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, and more. No email content ever leaves your machine.
+OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a schedule, and runs each email through rules you define in plain English. An LLM on **Amazon Bedrock** (Nova Micro by default) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, marking as spam, or marking as read.
+
+> **Migrated from local Ollama:** this app began as a self-hosted Ollama + SQLite + Docker project. It now runs entirely on AWS — Lambda for compute, DynamoDB for storage, and Bedrock for inference. The name is retained for continuity.
 
 ## Features
 
@@ -19,243 +21,195 @@ OllaMail connects to your Gmail accounts via OAuth, fetches recent emails on a s
 - **Drag-and-drop rule ordering** — control the order in which rules are evaluated
 - **Per-account or global rules** — scope a rule to a specific account or apply it across all accounts
 - **AI prompt builder** — describe what you want to catch in plain English; the LLM writes the classifier instruction for you (streaming output)
-- **Batch classification** — all rules for an email are evaluated in a single LLM call for efficiency
+- **Batch classification** — all rules for an email are evaluated in a single Bedrock call for efficiency
 - **Multiple accounts** — add as many Gmail accounts as you like via OAuth
-- **Fully local** — all LLM inference runs on-device via Ollama; no email content is sent to any API
 - **Web UI** — manage accounts, rules, retention, settings, and logs from a browser
 - **Auto-label creation** — labels are created in Gmail automatically if they don't exist
 - **Email retention management** — set per-label or global retention rules that auto-trash old emails; add label exemptions to protect important labels
-- **Categorization history** — searchable and filterable log of every labeling decision
+- **Categorization history** — searchable and filterable log of every labeling decision, with recategorization
 - **Log export** — download processing logs as CSV
 - **Config import/export** — full backup and restore of accounts, rules, settings, and retention as JSON
 - **Deduplication** — each email is evaluated once per account and never reprocessed
-- **Configurable polling** — set the interval in the UI; adjust lookback window and batch size via env vars
-- **Raspberry Pi friendly** — works on Pi 4 (4 GB+); Docker handles auto-start on boot
 
 ---
 
-## Quick Start (Docker)
+## Architecture
 
-### Prerequisites
+```
+                Function URL (AWS_IAM)          EventBridge Scheduler
+                        │                          rate(1 minute)
+                        ▼                                 │
+                ┌───────────────┐               ┌─────────▼─────────┐
+                │  WebFunction  │               │   ScanFunction    │
+                │  (MODE=web)   │               │   (MODE=scan)     │
+                │  HTMX web UI  │               │  scanOnce() pass  │
+                └───────┬───────┘               └─────────┬─────────┘
+                        │                                 │
+             ┌──────────┴───────────┬─────────────────────┤
+             ▼                      ▼                     ▼
+      ┌─────────────┐       ┌───────────────┐     ┌──────────────┐
+      │  DynamoDB   │       │    Bedrock    │     │  Gmail API   │
+      │  `ollamail` │       │  Nova Micro   │     │  (OAuth 2.0) │
+      └─────────────┘       └───────────────┘     └──────────────┘
+                                    ▲
+                        SSM SecureString /ollamail/credentials
+                          (Google OAuth client JSON)
+```
 
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- A Google Cloud project (free tier is fine)
-- A machine with at least 4 GB RAM
+- **Two image-based Lambdas**, both built from the same `Dockerfile` (`x86_64`):
+  - **WebFunction** — serves the management UI, exposed via a **Lambda Function URL** locked to `AuthType: AWS_IAM` (nothing is public; browse it via a local SigV4 proxy).
+  - **ScanFunction** — triggered by **EventBridge on a fixed `rate(1 minute)` schedule**. Runs one labeling pass (`scanOnce`) per invocation. Overlapping runs are safe — processed emails are deduped in DynamoDB.
+- **DynamoDB** single-table `ollamail` (on-demand, TTL enabled) — accounts, rules, history, logs, retention, suggestions, OAuth tokens.
+- **Amazon Bedrock** — classification and the prompt builder (`us.amazon.nova-micro-v1:0` by default; selectable in Settings).
+- **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
+
+> **Scan cadence is fixed in the template** (`template.yaml`, `rate(1 minute)`). There is no user-configurable poll interval — to change cadence, edit the `ScheduleExpression` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
+
+---
+
+## Prerequisites
+
+- An AWS account with Bedrock model access enabled for the chosen model (see step 3).
+- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and AWS credentials configured.
+- Docker (SAM builds the Lambda container images locally).
+- A Google Cloud project (free tier is fine).
 
 ---
 
 ### 1. Google Cloud Setup
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create a new project.
-2. Enable the **Gmail API** and **Google People API** for the project.
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create a project.
+2. Enable the **Gmail API** and **Google People API**.
 3. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-4. Choose **Web application** as the application type.
-5. Under **Authorized redirect URIs**, add:
-   ```
-   http://localhost
-   ```
-6. Click **Create**, then download the JSON file.
-7. Save it as `credentials/credentials.json` in your project directory.
-8. Go to **APIs & Services → OAuth consent screen** and add your Gmail address(es) as **Test users**.
+4. Choose **Web application**.
+5. Under **Authorized redirect URIs**, add: `http://localhost`
+6. Click **Create** and download the JSON file — this is your OAuth **client** credentials.
 
-   > **Important:** Without adding your address as a test user, the OAuth flow will fail with an access denied error.
+#### Publish the consent screen (stops the 7-day token revocation)
 
----
+This app requests the **restricted** `gmail.modify` scope. While the OAuth consent screen is in **Testing** mode, Google **expires refresh tokens after 7 days**, so accounts silently stop working roughly weekly. To fix this:
 
-### 2. Create the directory structure
+1. **APIs & Services → OAuth consent screen**.
+2. **Publishing status → Publish app** (move from *Testing* to *In production*).
+3. Because the app is unverified with a restricted scope, consent will show an **"unverified app"** warning. For your own account, click **Advanced → Go to \<app name\> (unsafe)** and continue. Published apps do **not** apply the 7-day test-mode refresh-token expiry.
+4. After publishing, **re-run the OAuth flow once** in the web UI (Accounts → add account) to mint a fresh, non-expiring refresh token.
 
-```
-ollamail/
-├── docker-compose.yml
-├── credentials/
-│   └── credentials.json    ← paste your downloaded OAuth JSON here
-└── data/                   ← SQLite database (auto-created on first run)
-```
+> Full Google verification (CASA security assessment) is only required to remove the warning entirely or to serve more than 100 external users — **not needed for personal use**.
 
 ---
 
-### 3. Create `docker-compose.yml`
-
-```yaml
-services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollamail-ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      - OLLAMA_NUM_PARALLEL=2
-      # Set to your poll interval (or just above). OLLAMA_KEEP_ALIVE counts
-      # from when the last LLM query finishes, and the poller uses wall-clock
-      # scheduling, so the model is always still warm when the next tick fires.
-      - OLLAMA_KEEP_ALIVE=60s
-    restart: unless-stopped
-    networks:
-      - internal
-    # Uncomment to enable NVIDIA GPU support:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-
-  app:
-    image: ghcr.io/sloccy/ollamail:latest
-    container_name: ollamail-app
-    ports:
-      - "5001:5000"
-    volumes:
-      - ./data:/data
-      - ./credentials:/credentials
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_MODEL=qwen3.5:4b-q4_K_M
-      - DATA_DIR=/data
-      - CREDENTIALS_FILE=/credentials/credentials.json
-      # Optional overrides — see Configuration Reference below
-      # - GMAIL_LOOKBACK_HOURS=24
-      # - GMAIL_MAX_RESULTS=50
-      # - POLL_INTERVAL=300
-    depends_on:
-      - ollama
-    restart: unless-stopped
-    networks:
-      - internal
-
-volumes:
-  ollama_data:
-
-networks:
-  internal:
-```
-
----
-
-### 4. Start the app
+### 2. Store the OAuth credentials in SSM
 
 ```bash
-docker compose up -d
+aws ssm put-parameter \
+  --name /ollamail/credentials \
+  --type SecureString \
+  --value "$(cat credentials.json)" \
+  --region us-east-1
 ```
 
-On first start the app will automatically pull the configured Ollama model. This can take a few minutes depending on your connection speed. Watch progress with:
+The parameter ARN is referenced by `samconfig.toml` (`CredentialsSsmArn`). The Lambda reads it at runtime via `CREDENTIALS_SSM_PARAM`.
+
+---
+
+### 3. Enable Bedrock model access
+
+In the Bedrock console (**Model access**), request/enable access to the classification model — by default **Amazon Nova Micro** (`us.amazon.nova-micro-v1:0`) in `us-east-1`. The Lambda role grants `bedrock:InvokeModel*` and the list APIs used to populate the Settings model picker.
+
+---
+
+### 4. Deploy
+
+Deploys happen automatically via GitHub Actions (`.github/workflows/deploy.yml`) on push to `main`, using OIDC role assumption (no stored keys). To deploy manually:
 
 ```bash
-docker compose logs -f app
+sam build
+sam deploy   # uses samconfig.toml: stack `ollamail`, region us-east-1
 ```
+
+Outputs include the **WebFunctionUrl** (the AWS_IAM-protected Function URL) and the DynamoDB table name.
 
 ---
 
 ### 5. Open the web interface
 
-Navigate to **http://localhost:5001**.
+The Function URL is locked to `AWS_IAM`, so it can only be reached with SigV4-signed requests. Use the bundled signing proxy:
+
+```bash
+# Ensure your AWS CLI credentials are available, then:
+go run ./tools/sigv4proxy
+# open http://localhost:8080
+```
+
+Flags let you override `-target` (Function URL), `-region`, and `-listen`.
 
 | Page | Description |
 |---|---|
-| **Dashboard** | Poller status, processing stats, and recent activity |
-| **Accounts** | Add Gmail accounts via OAuth |
-| **Prompts** | Define labeling rules in plain English |
-| **Builder** | AI prompt builder — describe what to catch and let the LLM write the classifier |
-| **History** | Searchable log of every labeling decision |
-| **Settings** | Set poll interval and other runtime options |
-| **Logs** | View per-account processing history; CSV export |
-| **Retention** | Configure per-label and global email retention rules |
-
----
-
-## Development Setup
-
-To run without Docker:
-
-```bash
-# Clone the repo
-git clone https://github.com/sloccy/OllaMail.git
-cd OllaMail
-
-# Build frontend vendor assets (Bootstrap, htmx) and minify app.js / style.css
-npm install && npm run build
-
-# Build the binary (templates and static files are embedded at compile time)
-go build -o ollamail .
-
-# Set required environment variables
-export OLLAMA_HOST=http://localhost:11434
-export DATA_DIR=./data
-export CREDENTIALS_FILE=./credentials/credentials.json
-
-# Run the app
-./ollamail
-```
-
-You'll also need [Ollama](https://ollama.com) running locally and the model pulled:
-
-```bash
-ollama pull qwen3.5:4b-q4_K_M
-```
+| **Dashboard** | Account/rule counts, scan cadence, recent activity, **Scan Now** |
+| **Accounts** | Add Gmail accounts via OAuth; enable/disable/delete |
+| **Prompts** | Define labeling rules in plain English; drag to reorder |
+| **Builder** | AI prompt builder — describe what to catch, let Bedrock write the classifier |
+| **History** | Searchable log of every labeling decision; recategorize |
+| **Settings** | Choose Bedrock models; backup/restore config |
+| **Logs** | Per-account processing history; CSV export |
+| **Retention** | Per-label and global email retention rules; label exemptions |
+| **Troubleshooting** | Test rules against sample emails and inspect raw LLM responses |
 
 ---
 
 ## Configuration Reference
 
-All settings are controlled via environment variables.
+Configuration is set via Lambda environment variables (see `template.yaml`).
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLLAMA_HOST` | `http://localhost:11434` | URL of the Ollama instance |
-| `OLLAMA_MODEL` | `qwen3.5:4b-q4_K_M` | Model to use for classification |
-| `OLLAMA_TIMEOUT` | `600` | Seconds to wait for Ollama to respond or pull a model |
-| `OLLAMA_NUM_CTX` | `4096` | LLM context window size in tokens |
+| `BEDROCK_MODEL` | `us.amazon.nova-micro-v1:0` | Default Bedrock model (Settings can override per-function) |
+| `DDB_TABLE` | `ollamail` | DynamoDB table name |
 | `GMAIL_MAX_RESULTS` | `50` | Emails fetched per inbox scan (only unprocessed ones are classified) |
 | `GMAIL_LOOKBACK_HOURS` | `24` | How far back to look for emails on each scan |
 | `EMAIL_BODY_TRUNCATION` | `3000` | Max characters of email body sent to the LLM |
-| `LOG_RETENTION_DAYS` | `30` | Days to keep processing log entries |
-| `POLL_INTERVAL` | `300` | Default poll interval in seconds (also configurable in the UI) |
-| `MIN_POLL_INTERVAL` | `30` | Minimum allowed poll interval in seconds |
+| `LOG_RETENTION_DAYS` | `30` | Days to keep processing log/history entries |
 | `HISTORY_MAX_LIMIT` | `500` | Maximum rows returned in history/log queries |
-| `DEBUG_LOGGING` | `0` | Set to `1` to enable verbose debug logging |
-| `DATA_DIR` | `/data` | Directory where the SQLite database is stored |
-| `CREDENTIALS_FILE` | `/credentials/credentials.json` | Path to the Google OAuth client credentials JSON |
+| `CREDENTIALS_SSM_PARAM` | `/ollamail/credentials` | SSM SecureString holding the Google OAuth client JSON |
+| `MODE` | `web` | `web` (UI server) or `scan` (EventBridge-triggered pass) |
+| `DEBUG_LOGGING` | `0` | Set to `1` for verbose logging |
+
+Scan cadence is **not** an environment variable — it is the `ScheduleExpression` on the `ScanFunction` in `template.yaml`.
 
 ---
 
 ## How It Works
 
-```
-┌─────────────┐     OAuth      ┌─────────────┐
-│   Gmail API │ ◄────────────► │  OllaMail   │
-└─────────────┘                │     (Go)    │
-                               └──────┬──────┘
-                                      │ email body + all rules
-                               ┌──────▼──────┐
-                               │   Ollama    │
-                               │  (local LLM)│
-                               └──────┬──────┘
-                                      │ per-rule YES/NO (single call)
-                               ┌──────▼──────┐
-                               │ Apply label │
-                               │ / action    │
-                               │ via Gmail   │
-                               │ API         │
-                               └─────────────┘
-```
-
-1. The poller wakes up on a wall-clock schedule (every N seconds, configurable in the UI). The timer resets at the start of each tick, not after the scan finishes, so the cadence stays stable regardless of scan duration.
-2. For each active Gmail account, it fetches recent emails (limited by `GMAIL_MAX_RESULTS` and `GMAIL_LOOKBACK_HOURS`).
-3. Each email body is truncated to `EMAIL_BODY_TRUNCATION` characters and all active rules are sent to the LLM **in a single call**, which returns a structured per-rule true/false decision.
-4. For each matched rule, the configured action is applied via the Gmail API (label, archive, trash, spam, mark as read). Labels are created in Gmail automatically if they don't exist.
+1. **EventBridge** invokes the ScanFunction every minute (or you click **Scan Now** in the UI). Both call the same `scanOnce` pass.
+2. For each active Gmail account, it fetches recent emails (bounded by `GMAIL_MAX_RESULTS` and `GMAIL_LOOKBACK_HOURS`).
+3. Each email body is truncated to `EMAIL_BODY_TRUNCATION` characters and all active rules are sent to **Bedrock in a single call**, which returns a structured per-rule true/false decision.
+4. For each matched rule, the configured action is applied via the Gmail API (label, archive, trash, spam, mark as read). Labels are created automatically if missing.
 5. If a matched rule has **stop processing** enabled, no further rules are evaluated for that email.
-6. Processed email IDs are stored in SQLite so each email is evaluated only once per account.
+6. Processed message IDs are stored in DynamoDB (TTL-bounded) so each email is evaluated only once per account.
+7. OAuth access tokens are refreshed automatically; refreshed tokens are written back to DynamoDB.
 
 ---
 
-## Raspberry Pi / Low-Power Notes
+## Development Setup
 
-- Tested on Raspberry Pi 4 (4 GB RAM) with 64-bit OS.
-- Inference time is 5–20 seconds per email per prompt rule depending on email length and the model used.
-- Smaller quantized models are significantly faster on CPU-only hardware.
-- `restart: unless-stopped` in Docker Compose handles automatic startup after reboots.
-- The `ollama_data` named volume persists pulled models across container restarts.
+```bash
+git clone https://github.com/sloccy/OllaMail.git
+cd OllaMail
+
+# Frontend vendor assets (Bootstrap, htmx) are committed and embedded at compile time.
+go build ./...
+go vet ./...
+go test ./...
+```
+
+To run the web server locally against AWS (DynamoDB + Bedrock + SSM), export AWS credentials and:
+
+```bash
+export MODE=web
+export DDB_TABLE=ollamail
+export CREDENTIALS_SSM_PARAM=/ollamail/credentials
+go run .        # serves on :5000 (or $AWS_LWA_PORT)
+```
 
 ---
 
@@ -263,10 +217,13 @@ All settings are controlled via environment variables.
 
 | Component | Technology |
 |---|---|
-| Backend | Go 1.26 |
-| HTTP server | net/http (stdlib) |
+| Compute | AWS Lambda (container images, `x86_64`) + Lambda Web Adapter |
+| Scheduling | EventBridge Scheduler (`rate(1 minute)`) |
+| Backend | Go 1.25, net/http (stdlib) |
 | UI | Bootstrap 5.3 (dark mode) + HTMX 2.0 |
-| Database | SQLite via modernc.org/sqlite + sqlc |
-| LLM runtime | Ollama |
+| Database | DynamoDB (single-table, on-demand, TTL) |
+| LLM runtime | Amazon Bedrock (Nova Micro) |
 | Gmail integration | Google OAuth 2.0 + Gmail REST API |
-| Deployment | Docker / Docker Compose |
+| Secrets | SSM Parameter Store (SecureString) |
+| Deployment | AWS SAM + GitHub Actions (OIDC) |
+</content>
