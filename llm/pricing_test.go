@@ -21,3 +21,18 @@ func TestInputCostPer1M(t *testing.T) {
 		}
 	}
 }
+
+func TestBaseModelID(t *testing.T) {
+	cases := map[string]string{
+		"us.anthropic.claude-opus-4-8":      "anthropic.claude-opus-4-8",
+		"global.amazon.nova-2-lite-v1:0":    "amazon.nova-2-lite-v1:0",
+		"us.stability.stable-image-inpaint": "stability.stable-image-inpaint",
+		"amazon.nova-micro-v1:0":            "amazon.nova-micro-v1:0", // no prefix
+		"apac.anthropic.claude-3-haiku":     "anthropic.claude-3-haiku",
+	}
+	for in, want := range cases {
+		if got := baseModelID(in); got != want {
+			t.Errorf("baseModelID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
