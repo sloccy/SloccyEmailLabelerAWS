@@ -108,7 +108,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: OlamailPolicy
+        - PolicyName: OllamailPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
