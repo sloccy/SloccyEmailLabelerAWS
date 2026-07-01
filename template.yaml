@@ -232,6 +232,12 @@ Resources:
         Enabled: true
         Comment: OllaMail Web UI (OAC-signed to IAM Function URL; app enforces Cloudflare Access JWT)
         PriceClass: PriceClass_100
+        Aliases:
+          - mailclass.sloccy.com
+        ViewerCertificate:
+          AcmCertificateArn: arn:aws:acm:us-east-1:508768431323:certificate/9fd06b13-fdd3-4682-b832-46ed432d7529
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
         Origins:
           - Id: WebFunctionUrlOrigin
             DomainName: !Select [2, !Split ["/", !GetAtt WebFunctionUrl.FunctionUrl]]
