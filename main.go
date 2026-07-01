@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -48,9 +47,6 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 	if err := store.Migrate(); err != nil {
 		log.Fatalf("migrate db: %v", err)
 	}
-	if err := store.SeedSetting("poll_interval", strconv.Itoa(cfg.PollInterval)); err != nil {
-		log.Fatalf("seed settings: %v", err)
-	}
 	if err := store.SeedSetting(llm.SettingClassifyModel, cfg.BedrockModel); err != nil {
 		log.Fatalf("seed classify_model: %v", err)
 	}
@@ -73,8 +69,9 @@ func runWeb(cfg Config) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// No in-process poller in Lambda web mode — EventBridge triggers the scan function.
-	srv := newServer(ctx, store, llmClient, nil, gmailAuth, &cfg, secretKey)
+	// Scheduled scanning is handled by the ScanFunction (EventBridge); the web UI's
+	// "Scan Now" runs an on-demand pass in-process via scanOnce.
+	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey)
 
 	port := os.Getenv("AWS_LWA_PORT")
 	if port == "" {

@@ -294,16 +294,6 @@ function handleConfigImport(input) {
     });
 }
 
-// ---- Dashboard poller status ----
-document.body.addEventListener('htmx:afterSwap', function(e) {
-  if (e.detail.target.id !== 'dashboard-content') return;
-  const el = e.detail.target.querySelector('[data-poller-running]');
-  if (!el) return;
-  const running = JSON.parse(el.dataset.pollerRunning);
-  document.getElementById('pollerDot').classList.toggle('active', running);
-  document.getElementById('pollerLabel').textContent = running ? 'running' : 'stopped';
-});
-
 // ---- Hx-Trigger event handlers ----
 document.body.addEventListener('showToast', function(e) {
   const { message, type } = e.detail || {};

@@ -23,3 +23,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Google OAuth client secrets (never commit)
+client_secret*.json
+credentials.json

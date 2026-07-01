@@ -27,7 +27,6 @@ import (
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
 	"github.com/sloccy/ollamail-aws/llm"
-	"github.com/sloccy/ollamail-aws/poller"
 )
 
 //go:embed static
@@ -39,7 +38,6 @@ const (
 	triggerShowToast              = "showToast"
 	triggerRefreshSuggestionBadge = "refreshSuggestionBadge"
 	toastKeyMessage               = "message"
-	tmplKeyPollInterval           = "PollInterval"
 	jsonKeyType                   = "type"
 	encodingGzip                  = "gzip"
 	headerAcceptEncoding          = "Accept-Encoding"
@@ -50,7 +48,6 @@ type server struct {
 	ctx       context.Context
 	store     *db.Store
 	ollama    *llm.Client
-	poller    *poller.Poller
 	cfg       *Config
 	auth      *gmail.Auth
 	secretKey []byte
@@ -67,12 +64,11 @@ type server struct {
 	modelsFetchedAt time.Time
 }
 
-func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, p *poller.Poller, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
+func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
 	s := &server{
 		ctx:        ctx,
 		store:      store,
 		ollama:     ollamaClient,
-		poller:     p,
 		cfg:        cfg,
 		auth:       auth,
 		secretKey:  secretKey,
@@ -266,27 +262,11 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	accounts, _ := s.store.ListAccountsSafe(ctx)
 	activePrompts, _ := s.store.CountActivePrompts(ctx)
 	logs, _ := s.store.GetLogs(ctx, 100)
-	var status poller.Status
-	if s.poller != nil {
-		status = s.poller.GetStatus()
-	}
-	pollIntervalSetting, _ := s.store.GetSetting(ctx, "poll_interval")
-	pollSecs, _ := strconv.Atoi(pollIntervalSetting)
-
-	nextScan := "--"
-	if status.NextRun != "" {
-		if t, err := time.Parse("2006-01-02 15:04:05", status.NextRun); err == nil {
-			nextScan = t.Format("15:04:05")
-		}
-	}
 
 	data := map[string]any{
-		"PollerRunning":     status.Running,
-		"AccountCount":      len(accounts),
-		"ActivePrompts":     activePrompts,
-		tmplKeyPollInterval: fmtinterval(pollSecs),
-		"NextScan":          nextScan,
-		"Logs":              logs,
+		"AccountCount":  len(accounts),
+		"ActivePrompts": activePrompts,
+		"Logs":          logs,
 	}
 	s.fragmentResponse(w, "templates/fragments/dashboard.html", data, "")
 }
@@ -590,19 +570,16 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	return models
 }
 
-func settingsTemplateData(pi int, classifyModel, improveModel string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
-		tmplKeyPollInterval: pi,
-		"ClassifyModel":     classifyModel,
-		"ImproveModel":      improveModel,
-		"Models":            models,
+		"ClassifyModel": classifyModel,
+		"ImproveModel":  improveModel,
+		"Models":        models,
 	}
 }
 
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	pollInterval, _ := s.store.GetSetting(ctx, "poll_interval")
-	pi, _ := strconv.Atoi(pollInterval)
 	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
 	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
 	if classifyModel == "" {
@@ -613,23 +590,12 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(pi, classifyModel, improveModel, models), "")
+		settingsTemplateData(classifyModel, improveModel, models), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
-
-	// Poll interval
-	pi := r.FormValue("poll_interval")
-	n, err := strconv.Atoi(pi)
-	if err != nil || n < s.cfg.MinPollInterval {
-		n = s.cfg.MinPollInterval
-	}
-	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: "poll_interval", Value: strconv.Itoa(n)})
-	if s.poller != nil {
-		s.poller.UpdateInterval(n)
-	}
 
 	// Model selections — validate against available models to ignore garbage input
 	models := s.cachedModels(ctx)
@@ -661,7 +627,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(n, classifyModel, improveModel, models), "Settings saved")
+		settingsTemplateData(classifyModel, improveModel, models), "Settings saved")
 }
 
 // ============================================================
@@ -1031,18 +997,13 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 // Scan
 // ============================================================
 
-func (s *server) handleScan(w http.ResponseWriter, _ *http.Request) {
+func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 	s.store.Log("INFO", "Manual scan triggered")
-	if s.poller != nil && s.poller.RunNow() {
-		setHxTrigger(w, map[string]any{
-			triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: "success"},
-			"refreshDashboard": "",
-		})
-	} else {
-		setHxTrigger(w, map[string]any{
-			triggerShowToast: map[string]any{toastKeyMessage: "A scan is already running", jsonKeyType: "warning"},
-		})
-	}
+	scanOnce(r.Context(), s.store, s.ollama, s.auth, s.cfg)
+	setHxTrigger(w, map[string]any{
+		triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: "success"},
+		"refreshDashboard": "",
+	})
 	w.WriteHeader(http.StatusOK)
 }
 
