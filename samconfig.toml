@@ -18,4 +18,8 @@ parameter_overrides = [
     "PubSubTopic=projects/gmail-auto-labeler-487804/topics/gmail-push",
     "PushOidcAudience=ollamail-gmail-push",
     "PushOidcServiceAccount=gmail-push-invoker@gmail-auto-labeler-487804.iam.gserviceaccount.com",
+    # Cloudflare Access in front of the Web UI (CloudFront + OAC fronting the AWS_IAM
+    # Function URL). See README for the Cloudflare-side CNAME + Access app setup.
+    "CfAccessTeamDomain=https://sloccy.cloudflareaccess.com",
+    "CfAccessAud=786e8401f074568d37458301bac91efce8d0e66611d202eb89be2f39fb4a4420",
 ]
