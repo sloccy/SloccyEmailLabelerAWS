@@ -7,33 +7,39 @@ func TestBedrockPriceBaseID(t *testing.T) {
 		usageType string
 		base      string
 		direction string
+		tier      string
 		ok        bool
 	}{
-		{"USE1-qwen.qwen3-next-80b-a3b-instruct-mantle-input-tokens-flex", "qwen.qwen3-next-80b-a3b-instruct", "input", true},
-		{"USE1-nvidia.nemotron-super-3-120b-mantle-output-tokens-flex", "nvidia.nemotron-super-3-120b", "output", true},
-		{"EU-qwen.qwen3-coder-480b-a35b-instruct-mantle-input-tokens-flex", "qwen.qwen3-coder-480b-a35b-instruct", "input", true},
-		{"USE1-mistral.voxtral-small-24b-2507-mantle-input-tokens-standard", "mistral.voxtral-small-24b-2507", "input", true},
-		{"USE1-xai.grok-4.3-mantle-cache-read-tokens-flex", "", "", false}, // not input/output
-		{"USE1-Claude2.0-input-tokens", "", "", false},                     // legacy, no "-mantle-"
-		{"USE1-NovaLite-input-tokens-custom-model", "", "", false},
+		{"USE1-qwen.qwen3-next-80b-a3b-instruct-mantle-input-tokens-flex", "qwen.qwen3-next-80b-a3b-instruct", "input", "flex", true},
+		{"USE1-nvidia.nemotron-super-3-120b-mantle-output-tokens-flex", "nvidia.nemotron-super-3-120b", "output", "flex", true},
+		{"EU-qwen.qwen3-coder-480b-a35b-instruct-mantle-input-tokens-flex", "qwen.qwen3-coder-480b-a35b-instruct", "input", "flex", true},
+		{"USE1-mistral.voxtral-small-24b-2507-mantle-input-tokens-standard", "mistral.voxtral-small-24b-2507", "input", "standard", true},
+		{"USE1-xai.grok-4.3-mantle-cache-read-tokens-flex", "", "", "", false}, // not input/output
+		{"USE1-Claude2.0-input-tokens", "claude2.0", "input", "", true},        // legacy, no "-mantle-", no tier suffix
+		{"USE1-NovaLite-input-tokens-priority", "novalite", "input", "priority", true},
+		{"USE1-NovaLite-input-tokens-custom-model", "", "", "", false}, // legacy variant SKU, not a plain price
 	}
 	for _, c := range cases {
-		base, direction, ok := bedrockPriceBaseID(c.usageType)
-		if base != c.base || direction != c.direction || ok != c.ok {
-			t.Errorf("bedrockPriceBaseID(%q) = (%q, %q, %v), want (%q, %q, %v)",
-				c.usageType, base, direction, ok, c.base, c.direction, c.ok)
+		base, direction, tier, ok := bedrockPriceBaseID(c.usageType)
+		if base != c.base || direction != c.direction || tier != c.tier || ok != c.ok {
+			t.Errorf("bedrockPriceBaseID(%q) = (%q, %q, %q, %v), want (%q, %q, %q, %v)",
+				c.usageType, base, direction, tier, ok, c.base, c.direction, c.tier, c.ok)
 		}
 	}
 }
 
 func TestPricingCatalogLookups(t *testing.T) {
+	// Catalog keys are normalized (see normalizeKey/candidateKeys) — this mirrors what
+	// fetchPricingCatalog actually stores, regardless of which of the two Price List
+	// naming conventions (dotted "mantle" id vs legacy PascalCase) supplied the price.
 	cat := &pricingCatalog{
 		inputPricePer1M: map[string]float64{
-			"qwen.qwen3-next-80b-a3b-instruct": 0.07,
-			"nvidia.nemotron-super-3-120b":     0.15,
+			normalizeKey("qwen.qwen3-next-80b-a3b-instruct"): 0.07,
+			normalizeKey("nvidia.nemotron-super-3-120b"):     0.15,
+			normalizeKey("NovaLite"):                         0.06, // legacy-style key: no dot to strip
 		},
 		flexCapable: map[string]bool{
-			"qwen.qwen3-next-80b-a3b-instruct": true,
+			normalizeKey("qwen.qwen3-next-80b-a3b-instruct"): true,
 		},
 	}
 
@@ -41,9 +47,15 @@ func TestPricingCatalogLookups(t *testing.T) {
 	if got := cat.inputCostPer1M("qwen.qwen3-next-80b-a3b-instruct"); got != 0.07 {
 		t.Errorf("inputCostPer1M exact match = %v, want 0.07", got)
 	}
-	// Bedrock id carries a version suffix the price-list id doesn't — prefix match.
+	// Bedrock id carries a version suffix the price-list id doesn't — stripped as noise,
+	// so this is still an exact match once normalized.
 	if got := cat.inputCostPer1M("qwen.qwen3-next-80b-a3b-instruct-v1:0"); got != 0.07 {
 		t.Errorf("inputCostPer1M version-suffix match = %v, want 0.07", got)
+	}
+	// Bedrock's dotted id carries a vendor prefix ("amazon.") the legacy price-list
+	// name doesn't — resolved via the vendor-stripped candidate key.
+	if got := cat.inputCostPer1M("amazon.nova-lite-v1:0"); got != 0.06 {
+		t.Errorf("inputCostPer1M legacy vendor-prefix match = %v, want 0.06", got)
 	}
 	// No match at all.
 	if got := cat.inputCostPer1M("some.unknown-model-v9:0"); got != CostUnknown {
@@ -58,19 +70,21 @@ func TestPricingCatalogLookups(t *testing.T) {
 	}
 }
 
-func TestPricingIDsMatch(t *testing.T) {
+func TestKeysMatch(t *testing.T) {
 	cases := []struct {
 		a, b string
 		want bool
 	}{
-		{"qwen.qwen3-next-80b-a3b-instruct", "qwen.qwen3-next-80b-a3b-instruct-v1:0", true},
-		{"qwen.qwen3-next-80b-a3b-instruct-v1:0", "qwen.qwen3-next-80b-a3b-instruct", true},
-		{"nova", "nova-premier", false}, // too short to safely prefix-match
-		{"amazon.nova-pro-v1:0", "amazon.nova-premier-v1:0", false},
+		{normalizeKey("qwen.qwen3-next-80b-a3b-instruct"), normalizeKey("qwen.qwen3-next-80b-a3b-instruct-v1:0"), true},
+		{normalizeKey("qwen.qwen3-next-80b-a3b-instruct-v1:0"), normalizeKey("qwen.qwen3-next-80b-a3b-instruct"), true},
+		{normalizeKey("nova"), normalizeKey("nova-premier"), false},                          // too short to safely prefix-match
+		{normalizeKey("llama3-1-70b"), normalizeKey("llama3-2-70b"), false},                  // same family, different model
+		{normalizeKey("MistralLarge"), normalizeKey("mistral-large-3-675b-instruct"), false}, // prefix swallows into a version number — must not match
+		{normalizeKey("llama3-1-70b"), normalizeKey("llama3-1-70b-instruct"), true},          // legit suffix drift
 	}
 	for _, c := range cases {
-		if got := pricingIDsMatch(c.a, c.b); got != c.want {
-			t.Errorf("pricingIDsMatch(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		if got := keysMatch(c.a, c.b); got != c.want {
+			t.Errorf("keysMatch(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 		}
 	}
 }
