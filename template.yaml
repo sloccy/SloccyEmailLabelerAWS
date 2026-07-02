@@ -222,6 +222,31 @@ Resources:
           CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
           CF_ACCESS_AUD: !Ref CfAccessAud
 
+  # SAM auto-generates these two public-invoke permissions only when
+  # FunctionUrlConfig.AuthType is the literal string "NONE". WebFunction's AuthType
+  # is an !If intrinsic, which the SAM transform can't statically evaluate as NONE,
+  # so it skips both and the AuthType:NONE URL 403s (AccessDeniedException) for
+  # everyone — including CloudFront. Add them explicitly (matching what SAM emits
+  # for PushFunction's literal AuthType: NONE), gated on the same condition as the
+  # NONE branch above.
+  WebFunctionUrlPublicPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CfAccessEnabled
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  WebFunctionURLInvokeAllowPublicAccess:
+    Type: AWS::Lambda::Permission
+    Condition: CfAccessEnabled
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
   # ----------------------------------------------------------------
   # CloudFront in front of the public (AuthType NONE) Function URL, created only when
   # Cloudflare Access is configured. No Origin Access Control: OAC's SigV4 signer omits
