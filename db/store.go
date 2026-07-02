@@ -26,8 +26,8 @@ type Store struct {
 	table string
 }
 
-// Open constructs a Store. The path argument is unused (retained for signature compatibility).
-func Open(_ string) (*Store, error) {
+// Open constructs a Store.
+func Open() (*Store, error) {
 	table := os.Getenv("DDB_TABLE")
 	if table == "" {
 		table = "ollamail"

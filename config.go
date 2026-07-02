@@ -14,7 +14,6 @@ type Config struct {
 	HistoryMaxLimit    int
 	DebugLogging       bool
 	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
-	DataDir            string // unused in Lambda; retained for Open() compat
 	Mode               string // "web", "scan", or "push"
 
 	// Gmail push (users.watch → Pub/Sub → PushFunction webhook).
@@ -43,7 +42,6 @@ func loadConfig() Config {
 		HistoryMaxLimit:    getEnvInt("HISTORY_MAX_LIMIT", 500),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
 		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),
-		DataDir:            getEnv("DATA_DIR", "/tmp"),
 		Mode:               getEnv("MODE", "web"),
 
 		PubSubTopic:        getEnv("PUBSUB_TOPIC", ""),

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -45,8 +44,7 @@ func main() {
 }
 
 func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
-	dbPath := filepath.Join(cfg.DataDir, "labeler.db")
-	store, err := db.Open(dbPath)
+	store, err := db.Open()
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
