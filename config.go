@@ -25,11 +25,10 @@ type Config struct {
 	CfAccessTeamDomain string // e.g. https://yourteam.cloudflareaccess.com; enables Access JWT verification
 	CfAccessAud        string // Cloudflare Access application Audience (AUD) tag
 
-	// Scan schedule (web mode rewrites the EventBridge Scheduler schedule at runtime).
-	ScanIntervalMinutes int    // baseline/default cadence when no setting is stored
-	ScanScheduleName    string // AWS::Scheduler::Schedule name to update (empty = disabled, e.g. local dev)
-	ScanFunctionArn     string // ScanFunction ARN — re-supplied on every UpdateSchedule (full replace)
-	SchedulerRoleArn    string // role EventBridge Scheduler assumes to invoke the target
+	// ClassifyConcurrency caps how many emails are classified against Bedrock in parallel per
+	// account. Flex-tier requests can queue for minutes, so classification no longer waits on
+	// each prior call to finish; see processor.ProcessConfig.
+	ClassifyConcurrency int
 }
 
 func loadConfig() Config {
@@ -51,10 +50,7 @@ func loadConfig() Config {
 		CfAccessTeamDomain: getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
 		CfAccessAud:        getEnv("CF_ACCESS_AUD", ""),
 
-		ScanIntervalMinutes: getEnvInt("SCAN_INTERVAL_MINUTES", 1440),
-		ScanScheduleName:    getEnv("SCAN_SCHEDULE_NAME", ""),
-		ScanFunctionArn:     getEnv("SCAN_FUNCTION_ARN", ""),
-		SchedulerRoleArn:    getEnv("SCHEDULER_ROLE_ARN", ""),
+		ClassifyConcurrency: getEnvInt("CLASSIFY_CONCURRENCY", 6),
 	}
 }
 

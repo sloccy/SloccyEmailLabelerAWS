@@ -56,10 +56,11 @@ func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmail
 	}
 
 	procCfg := processor.ProcessConfig{
-		LookbackHours:  cfg.GmailLookbackHours,
-		MaxResults:     int64(cfg.GmailMaxResults),
-		BodyTruncation: cfg.EmailBodyTrunc,
-		DebugLogging:   cfg.DebugLogging,
+		LookbackHours:       cfg.GmailLookbackHours,
+		MaxResults:          int64(cfg.GmailMaxResults),
+		BodyTruncation:      cfg.EmailBodyTrunc,
+		DebugLogging:        cfg.DebugLogging,
+		ClassifyConcurrency: cfg.ClassifyConcurrency,
 	}
 
 	for _, account := range accounts {

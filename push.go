@@ -136,10 +136,11 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 		return fmt.Errorf("list prompts: %w", err)
 	}
 	procCfg := processor.ProcessConfig{
-		LookbackHours:  h.cfg.GmailLookbackHours,
-		MaxResults:     int64(h.cfg.GmailMaxResults),
-		BodyTruncation: h.cfg.EmailBodyTrunc,
-		DebugLogging:   h.cfg.DebugLogging,
+		LookbackHours:       h.cfg.GmailLookbackHours,
+		MaxResults:          int64(h.cfg.GmailMaxResults),
+		BodyTruncation:      h.cfg.EmailBodyTrunc,
+		DebugLogging:        h.cfg.DebugLogging,
+		ClassifyConcurrency: h.cfg.ClassifyConcurrency,
 	}
 	start := time.Now()
 	// History-driven: only new inbox messages since the stored history id are processed,

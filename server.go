@@ -51,7 +51,6 @@ type server struct {
 	cfg       *Config
 	auth      *gmail.Auth
 	secretKey []byte
-	scheduler *scanScheduler // nil when schedule rewriting is not configured
 	tmpl      *template.Template
 	mux       *http.ServeMux
 
@@ -65,7 +64,7 @@ type server struct {
 	modelsFetchedAt time.Time
 }
 
-func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte, sched *scanScheduler) http.Handler {
+func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
 	s := &server{
 		ctx:        ctx,
 		store:      store,
@@ -73,7 +72,6 @@ func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, a
 		cfg:        cfg,
 		auth:       auth,
 		secretKey:  secretKey,
-		scheduler:  sched,
 		oauthState: make(map[string]time.Time),
 	}
 
@@ -167,7 +165,7 @@ func (s *server) registerRoutes() {
 			return
 		}
 		s.render(w, "index.html", map[string]any{
-			"ScanCadence": cadenceLabel(s.scanIntervalMinutes(r.Context())),
+			"ScanCadence": scanCadenceLabel,
 		})
 	})
 
@@ -273,7 +271,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"AccountCount":  len(accounts),
 		"ActivePrompts": activePrompts,
 		"Logs":          logs,
-		"ScanCadence":   cadenceLabel(s.scanIntervalMinutes(ctx)),
+		"ScanCadence":   scanCadenceLabel,
 	}
 	s.fragmentResponse(w, "templates/fragments/dashboard.html", data, "")
 }
@@ -587,25 +585,13 @@ func classifyModelAllowed(m llm.ModelOption, tier string) bool {
 	return m.ProfileRegion == "" || m.ProfileRegion == "us" || m.ProfileRegion == "global"
 }
 
-func settingsTemplateData(classifyModel, improveModel, classifyTier string, models []llm.ModelOption, scanInterval int) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
 		"ClassifyModel": classifyModel,
 		"ImproveModel":  improveModel,
 		"ClassifyTier":  classifyTier,
 		"Models":        models,
-		"ScanInterval":  scanInterval,
 	}
-}
-
-// scanIntervalMinutes returns the stored scan cadence in minutes, falling back to the
-// configured default when unset or invalid.
-func (s *server) scanIntervalMinutes(ctx context.Context) int {
-	if v, err := s.store.GetSetting(ctx, llm.SettingScanInterval); err == nil {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
-			return n
-		}
-	}
-	return s.cfg.ScanIntervalMinutes
 }
 
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -624,7 +610,7 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, models, s.scanIntervalMinutes(ctx)), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, models), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -675,30 +661,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
 	}
 
-	// Scan cadence — validate, rewrite the EventBridge schedule, then persist. Persist only
-	// after a successful schedule update so DynamoDB and the live schedule stay consistent.
-	interval := s.scanIntervalMinutes(ctx)
-	schedErr := false
-	if v := r.FormValue("scan_interval"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 1440 {
-			if err := s.scheduler.UpdateInterval(ctx, n); err != nil {
-				slog.Error("update scan schedule", "err", err)
-				schedErr = true
-			} else {
-				interval = n
-				_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingScanInterval, Value: strconv.Itoa(n)})
-			}
-		}
-	}
-
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, models, interval)
-	if schedErr {
-		setHxTrigger(w, map[string]any{
-			triggerShowToast: map[string]any{toastKeyMessage: "Couldn't update scan schedule — try again.", jsonKeyType: "error"},
-		})
-		s.renderFragmentFile(w, "templates/fragments/settings_form.html", data)
-		return
-	}
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, models)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
 }
 

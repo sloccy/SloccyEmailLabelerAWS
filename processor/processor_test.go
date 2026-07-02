@@ -3,7 +3,9 @@ package processor
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sloccy/ollamail-aws/db"
@@ -362,6 +364,78 @@ func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected sentinel (no-match) history row for unmatched email")
+	}
+}
+
+// ============================================================
+// classifyConcurrency
+// ============================================================
+
+func TestClassifyConcurrency(t *testing.T) {
+	tests := []struct {
+		in   int
+		want int
+	}{
+		{0, 1},
+		{-5, 1},
+		{1, 1},
+		{6, 6},
+	}
+	for _, tc := range tests {
+		if got := classifyConcurrency(tc.in); got != tc.want {
+			t.Errorf("classifyConcurrency(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ============================================================
+// Concurrent classification (mirrors the worker-pool fan-out in processMessageIDs)
+// ============================================================
+
+// TestProcessEmail_ConcurrentFanOut drives processEmail from many goroutines against a
+// shared store, LLM client, and label cache — the same setup processMessageIDs now uses to
+// classify a batch of emails in parallel instead of one at a time. It asserts every email's
+// result is captured correctly regardless of goroutine scheduling, and (run with -race) that
+// the shared FakeStore and the mutex-guarded accumulators are race-free.
+func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
+	store := newTestStore(t)
+	ollamaClient := newLLMServer(t, `{"1": true}`)
+	account := newTestAccount()
+	prompts := []db.Prompt{
+		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
+	}
+	labelCache := map[string]string{"newsletters": "Label_42"}
+
+	const n = 20
+	const concurrency = 6
+	sem := make(chan struct{}, classifyConcurrency(concurrency))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := make(map[string]bool, n)
+
+	for i := 0; i < n; i++ {
+		msg := gmailpkg.Message{ID: fmt.Sprintf("msg%d", i), Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			modifies, _ := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, labelCache, false)
+
+			mu.Lock()
+			defer mu.Unlock()
+			for _, m := range modifies {
+				if contains(m.AddLabels, "Label_42") {
+					seen[m.MessageID] = true
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(seen) != n {
+		t.Fatalf("expected %d labeled messages, got %d: %v", n, len(seen), seen)
 	}
 }
 
