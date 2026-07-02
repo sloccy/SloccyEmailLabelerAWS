@@ -29,7 +29,7 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "local address to listen on")
 	target := flag.String("target",
-		"https://3ra437iva332tr3nct6kaovxzy0fyyqy.lambda-url.us-east-1.on.aws",
+		"https://kuckrjxu6rwcrgffhxhue46m6u0myzmq.lambda-url.us-east-2.on.aws",
 		"Web UI Function URL to sign requests to")
 	region := flag.String("region", "us-east-2", "AWS region of the function")
 	flag.Parse()
