@@ -288,7 +288,11 @@ Resources:
       Handler: bootstrap
       # Fixed name so SchedulerInvokeRole can grant invoke via a constructed ARN instead of
       # !GetAtt — that breaks the LambdaRole→SchedulerInvokeRole→ScanFunction→LambdaRole cycle.
-      FunctionName: ollamail-scan-fn
+      # Renamed from ollamail-scan-fn (-arm suffix) during the image→zip/arm64 migration:
+      # PackageType and Architectures are both immutable, so the update replaces this
+      # resource, and CloudFormation refuses in-place replacement of a custom-named
+      # resource unless the name itself changes too.
+      FunctionName: ollamail-scan-fn-arm
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
       Timeout: 120
@@ -364,7 +368,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ollamail-scan-fn
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ollamail-scan-fn-arm
 
   # ----------------------------------------------------------------
   # $5/month hard cap. AWS Budgets only alerts by default, so a Budgets Action
