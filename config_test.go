@@ -60,7 +60,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	keys := []string{
 		"BEDROCK_MODEL", "GMAIL_MAX_RESULTS", "GMAIL_LOOKBACK_HOURS", "EMAIL_BODY_TRUNCATION",
 		"LOG_RETENTION_DAYS",
-		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "DATA_DIR", "MODE",
+		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "MODE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
@@ -88,7 +88,6 @@ func TestLoadConfig_Defaults(t *testing.T) {
 func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("BEDROCK_MODEL", "us.amazon.nova-lite-v1:0")
 	t.Setenv("DEBUG_LOGGING", "1")
-	t.Setenv("DATA_DIR", "/tmp/data")
 	t.Setenv("MODE", "scan")
 
 	cfg := loadConfig()
@@ -98,9 +97,6 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if !cfg.DebugLogging {
 		t.Error("DebugLogging should be true when DEBUG_LOGGING=1")
-	}
-	if cfg.DataDir != "/tmp/data" {
-		t.Errorf("DataDir = %q", cfg.DataDir)
 	}
 	if cfg.Mode != "scan" {
 		t.Errorf("Mode = %q", cfg.Mode)
