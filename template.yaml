@@ -63,9 +63,13 @@ Conditions:
 
 Globals:
   Function:
-    # PackageType: Image functions must not set Runtime/Handler.
-    # x86_64 matches the amd64 GitHub Actions runner that builds the image (native, no QEMU).
-    Architectures: [x86_64]
+    # Zip (provided.al2023) packaging — no container image, no ECR. Each function's
+    # Metadata.BuildMethod: makefile builds the same Go binary to bootstrap; MODE
+    # env var selects behavior at runtime. arm64 (Graviton2): ~20% cheaper per
+    # GB-second than x86_64 and often faster; the app is pure Go (CGO_ENABLED=0,
+    # no cgo/arch-specific deps) so cross-compiling GOARCH=arm64 from the amd64
+    # GitHub Actions runner needs no emulation/QEMU — just a different GOARCH.
+    Architectures: [arm64]
     Environment:
       Variables:
         DDB_TABLE: !Ref OlamailTable
@@ -181,13 +185,18 @@ Resources:
   WebFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      DockerContext: .
-      Dockerfile: Dockerfile
+      BuildMethod: makefile
     Properties:
-      PackageType: Image
+      Runtime: provided.al2023
+      Handler: bootstrap
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
       Timeout: 30
+      # Lambda Web Adapter layer: lets the custom-runtime binary serve plain HTTP,
+      # forwarded from the Function URL. AWS_LAMBDA_EXEC_WRAPPER below points at
+      # this layer's /opt/bootstrap wrapper script.
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:28
       FunctionUrlConfig:
         # AWS_IAM when Cloudflare Access is off (CfAccessAud unset): only requests
         # signed with your AWS credentials can reach it — browse locally with the
@@ -203,7 +212,7 @@ Resources:
       Environment:
         Variables:
           MODE: web
-          AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
           # App listens on AWS_LWA_PORT; the adapter forwards Function URL requests here.
           AWS_LWA_PORT: "8080"
           # Scan-schedule rewriting: name to update + ARNs re-supplied on every UpdateSchedule.
@@ -222,6 +231,20 @@ Resources:
   # Point your Cloudflare proxied CNAME at this distribution's domain; Cloudflare Access
   # does Google SSO and injects the Cf-Access-Jwt-Assertion header, which the app verifies
   # so hitting the raw CloudFront/Function URL directly still 403s.
+  #
+  # WHY THIS RESOURCE IS REQUIRED — DO NOT REMOVE TO "SAVE A SERVICE":
+  # A Lambda Function URL only presents a TLS cert for its own *.lambda-url.*.on.aws
+  # domain and routes by Host header. Pointing a Cloudflare proxied CNAME straight at
+  # the Function URL sends SNI+Host = the custom domain (mailclass.sloccy.com), which
+  # mismatches the origin's cert and fails the TLS handshake (Cloudflare error 525/526).
+  # Overriding SNI to the .on.aws name is a Cloudflare Enterprise-only Origin Rules
+  # feature, not available on this account's plan. So a non-Enterprise Cloudflare setup
+  # needs an AWS-side custom-domain front between Cloudflare and the Function URL.
+  # CloudFront (with the ACM cert below) is that front: it presents the ACM cert to
+  # Cloudflare and rewrites Host back to the origin's domain via the
+  # AllViewerExceptHostHeader origin-request policy (while still forwarding
+  # Cf-Access-Jwt-Assertion). API Gateway custom domains are the only other AWS-native
+  # alternative, and would add a service rather than remove one.
   # ----------------------------------------------------------------
   WebDistribution:
     Type: AWS::CloudFront::Distribution
@@ -259,10 +282,10 @@ Resources:
   ScanFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      DockerContext: .
-      Dockerfile: Dockerfile
+      BuildMethod: makefile
     Properties:
-      PackageType: Image
+      Runtime: provided.al2023
+      Handler: bootstrap
       # Fixed name so SchedulerInvokeRole can grant invoke via a constructed ARN instead of
       # !GetAtt — that breaks the LambdaRole→SchedulerInvokeRole→ScanFunction→LambdaRole cycle.
       FunctionName: ollamail-scan-fn
@@ -285,20 +308,23 @@ Resources:
   PushFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      DockerContext: .
-      Dockerfile: Dockerfile
+      BuildMethod: makefile
     Properties:
-      PackageType: Image
+      Runtime: provided.al2023
+      Handler: bootstrap
       Role: !GetAtt LambdaRole.Arn
       MemorySize: 256
       Timeout: 120
+      # Lambda Web Adapter layer — see WebFunction above for why this is needed.
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:28
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
       Environment:
         Variables:
           MODE: push
-          AWS_LAMBDA_EXEC_WRAPPER: /opt/extensions/lambda-adapter
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
           AWS_LWA_PORT: "8080"
 
   # ----------------------------------------------------------------
