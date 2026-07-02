@@ -101,7 +101,20 @@ function _initDragReorder() {
   list.querySelectorAll('.drag-handle').forEach(handle => {
     const card = handle.closest('.card[data-id]');
     if (!card) return;
-    card.draggable = true;
+    // Only the handle grabs the card into drag mode - if the whole card were
+    // draggable, click-drag inside its inputs/textareas would be hijacked as a
+    // drag gesture instead of text selection.
+    card.draggable = false;
+
+    if (!handle.dataset.dragBound) {
+      handle.dataset.dragBound = '1';
+      const arm = () => { card.draggable = true; };
+      const disarm = () => { card.draggable = false; };
+      handle.addEventListener('mousedown', arm);
+      handle.addEventListener('touchstart', arm);
+      handle.addEventListener('mouseup', disarm);
+      handle.addEventListener('touchend', disarm);
+    }
 
     card.addEventListener('dragstart', e => {
       _dragEl = card;
@@ -113,6 +126,7 @@ function _initDragReorder() {
 
     card.addEventListener('dragend', async () => {
       card.classList.remove('drag-ghost');
+      card.draggable = false;
       if (_dragPlaceholder && _dragPlaceholder.parentNode) {
         _dragPlaceholder.parentNode.removeChild(_dragPlaceholder);
       }
