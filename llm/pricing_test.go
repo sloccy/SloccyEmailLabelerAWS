@@ -38,6 +38,9 @@ func TestPricingCatalogLookups(t *testing.T) {
 			normalizeKey("nvidia.nemotron-super-3-120b"):     0.15,
 			normalizeKey("NovaLite"):                         0.06, // legacy-style key: no dot to strip
 		},
+		flexInputPricePer1M: map[string]float64{
+			normalizeKey("qwen.qwen3-next-80b-a3b-instruct"): 0.035, // flex is cheaper than standard (0.07)
+		},
 		flexCapable: map[string]bool{
 			normalizeKey("qwen.qwen3-next-80b-a3b-instruct"): true,
 		},
@@ -67,6 +70,16 @@ func TestPricingCatalogLookups(t *testing.T) {
 	}
 	if cat.isFlexCapable("nvidia.nemotron-super-3-120b") {
 		t.Error("isFlexCapable() = true, want false for non-flex model")
+	}
+
+	// Flex price is a distinct (cheaper) figure from the standard price, not a re-display
+	// of inputCostPer1M.
+	if got := cat.flexCostPer1M("qwen.qwen3-next-80b-a3b-instruct-v1:0"); got != 0.035 {
+		t.Errorf("flexCostPer1M known flex model = %v, want 0.035", got)
+	}
+	// Not flex-capable at all — must not fall back to the standard price.
+	if got := cat.flexCostPer1M("nvidia.nemotron-super-3-120b"); got != CostUnknown {
+		t.Errorf("flexCostPer1M non-flex model = %v, want CostUnknown", got)
 	}
 }
 

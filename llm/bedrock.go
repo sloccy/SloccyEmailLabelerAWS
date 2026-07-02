@@ -50,7 +50,8 @@ const (
 type ModelOption struct {
 	ID             string  // value sent to Bedrock (modelId or inferenceProfileId)
 	Label          string  // human-readable display name
-	InputCostPer1M float64 // on-demand input price per 1M tokens; CostUnknown if unpriced
+	InputCostPer1M float64 // standard on-demand input price per 1M tokens; CostUnknown if unpriced
+	FlexCostPer1M  float64 // flex-tier input price per 1M tokens; CostUnknown if unpriced or not flex-capable
 	// ProfileRegion is the cross-region inference-profile geography ("us", "global", "eu",
 	// "apac", "us-gov"), or "" for a bare/single-datacenter foundation-model id.
 	ProfileRegion string
@@ -516,7 +517,11 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 	// permission): the dropdown still lists models, just without prices/flex info.
 	cat, err := fetchPricingCatalog(ctx, c.pc)
 	if err != nil {
-		cat = &pricingCatalog{inputPricePer1M: map[string]float64{}, flexCapable: map[string]bool{}}
+		cat = &pricingCatalog{
+			inputPricePer1M:     map[string]float64{},
+			flexInputPricePer1M: map[string]float64{},
+			flexCapable:         map[string]bool{},
+		}
 	}
 
 	// One unfiltered catalog call: drives the foundation-model list AND supplies the
@@ -560,6 +565,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			ID:             id,
 			Label:          label,
 			InputCostPer1M: cat.inputCostPer1M(id),
+			FlexCostPer1M:  cat.flexCostPer1M(id),
 			Flex:           cat.isFlexCapable(id),
 		}) // ProfileRegion left as "" — bare foundation-model id, single datacenter
 	}
@@ -604,6 +610,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			ID:             id,
 			Label:          label,
 			InputCostPer1M: cat.inputCostPer1M(base),
+			FlexCostPer1M:  cat.flexCostPer1M(base),
 			ProfileRegion:  profileRegion(id),
 			Flex:           cat.isFlexCapable(base),
 		})
