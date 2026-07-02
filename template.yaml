@@ -45,6 +45,15 @@ Parameters:
     Type: String
     Default: slocum.brendan@gmail.com
     Description: Email for the monthly billing-budget alerts
+  # AWS Budgets is account-global, not region-scoped — a budget with this stack's
+  # BudgetName can only exist once per account. Set to "false" when standing up a
+  # second same-account stack in another region alongside an existing one (e.g. a
+  # region migration), then back to "true" (the default) once the old stack/budget
+  # is torn down.
+  CreateBudget:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
   # Cloudflare Access (Zero Trust) in front of the Web UI. When CfAccessAud is set, a
   # CloudFront distribution (OAC-signed to the still-AWS_IAM Function URL) is created and
   # the app enforces the Cf-Access-Jwt-Assertion header. Leave both empty to keep the Web
@@ -60,6 +69,7 @@ Parameters:
 
 Conditions:
   CfAccessEnabled: !Not [!Equals [!Ref CfAccessAud, ""]]
+  ShouldCreateBudget: !Equals [!Ref CreateBudget, "true"]
 
 Globals:
   Function:
@@ -405,6 +415,7 @@ Resources:
   # ----------------------------------------------------------------
   BedrockDenyPolicy:
     Type: AWS::IAM::ManagedPolicy
+    Condition: ShouldCreateBudget
     Properties:
       Description: Deny-all Bedrock invocation; parked until the budget action attaches it.
       PolicyDocument:
@@ -418,6 +429,7 @@ Resources:
 
   BudgetActionRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateBudget
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -441,6 +453,7 @@ Resources:
 
   MonthlyBudget:
     Type: AWS::Budgets::Budget
+    Condition: ShouldCreateBudget
     Properties:
       Budget:
         BudgetName: ollamail-monthly-5usd
@@ -468,6 +481,7 @@ Resources:
   # At $5 actual spend, attach the Bedrock-deny policy to the Lambda role automatically.
   StopBedrockAtCap:
     Type: AWS::Budgets::BudgetsAction
+    Condition: ShouldCreateBudget
     DependsOn: MonthlyBudget
     Properties:
       BudgetName: ollamail-monthly-5usd

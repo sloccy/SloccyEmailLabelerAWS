@@ -12,6 +12,11 @@ confirm_changeset = false
 fail_on_empty_changeset = false
 parameter_overrides = [
     "CredentialsSsmArn=arn:aws:ssm:us-east-2:508768431323:parameter/ollamail/credentials",
+    # TEMP (us-east-1 -> us-east-2 migration): AWS Budgets is account-global, so the
+    # us-east-1 stack's "ollamail-monthly-5usd" budget blocks this stack from creating
+    # its own. Remove this override (reverting to the template default "true") once the
+    # us-east-1 stack is torn down, then redeploy to (re)create the budget here.
+    "CreateBudget=false",
     # Gmail push. Audience is an arbitrary constant we also set on the Pub/Sub
     # subscription (--push-auth-token-audience); it need not be the Function URL.
     "PubSubTopic=projects/gmail-auto-labeler-487804/topics/gmail-push",
