@@ -308,6 +308,26 @@ function handleConfigImport(input) {
     });
 }
 
+// ---- Classification model: Standard/Flex tier toggle ----
+// The settings form is HTMX-swapped, so this is a document-level delegated handler rather
+// than one bound to the (re-rendered) button elements directly.
+document.addEventListener('click', function(e) {
+  const btn = e.target.closest('#classify-tier-toggle button[data-tier]');
+  if (!btn) return;
+  const tier = btn.dataset.tier;
+  const toggle = document.getElementById('classify-tier-toggle');
+  toggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+  document.getElementById('classify-tier-input').value = tier;
+
+  const standardSel = document.getElementById('classify-model-standard');
+  const flexSel = document.getElementById('classify-model-flex');
+  const showFlex = tier === 'flex';
+  standardSel.classList.toggle('d-none', showFlex);
+  standardSel.disabled = showFlex;
+  flexSel.classList.toggle('d-none', !showFlex);
+  flexSel.disabled = !showFlex;
+});
+
 // ---- Hx-Trigger event handlers ----
 document.body.addEventListener('showToast', function(e) {
   const { message, type } = e.detail || {};

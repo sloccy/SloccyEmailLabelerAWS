@@ -31,9 +31,18 @@ type Settings interface {
 const (
 	SettingClassifyModel = "classify_model"
 	SettingImproveModel  = "improve_model"
+	// SettingClassifyTier holds the Bedrock service tier ("standard" or "flex") used for
+	// classification requests. Flex trades latency for lower cost; see resolveClassifyTier.
+	SettingClassifyTier = "classify_tier"
 	// SettingScanInterval holds the user-selected scan cadence in minutes. The web UI
 	// writes it and rewrites the EventBridge Scheduler schedule to match.
 	SettingScanInterval = "scan_interval_minutes"
+)
+
+// Values for SettingClassifyTier.
+const (
+	ClassifyTierStandard = "standard"
+	ClassifyTierFlex     = "flex"
 )
 
 // ModelOption is one entry in the model-selection dropdown.
@@ -41,6 +50,7 @@ type ModelOption struct {
 	ID             string  // value sent to Bedrock (modelId or inferenceProfileId)
 	Label          string  // human-readable display name
 	InputCostPer1M float64 // on-demand input price per 1M tokens; CostUnknown if unpriced
+	USProfile      bool    // true when ID is a "us." cross-region inference profile
 }
 
 // Client wraps the Bedrock runtime client with per-call model resolution.
@@ -90,6 +100,16 @@ func (c *Client) resolveModel(ctx context.Context, key string) string {
 		}
 	}
 	return c.defaultModel
+}
+
+// resolveClassifyTier looks up the classification service tier; defaults to "standard".
+func (c *Client) resolveClassifyTier(ctx context.Context) string {
+	if c.settings != nil {
+		if v, err := c.settings.GetSetting(ctx, SettingClassifyTier); err == nil && v != "" {
+			return v
+		}
+	}
+	return ClassifyTierStandard
 }
 
 // ============================================================
@@ -180,7 +200,9 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
-func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string) {
+// classifyPayload returns the request pieces plus the service tier ("flex" or "" for
+// standard) selected for classification.
+func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string, string) {
 	body := buildBody(email, prompts)
 	numPredict := int32(32)
 	if n := len(prompts) * 10; n > 32 {
@@ -197,7 +219,8 @@ func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Pro
 		Temperature: aws.Float32(0),
 	}
 	model := c.resolveModel(ctx, SettingClassifyModel)
-	return msgs, inf, model
+	tier := c.resolveClassifyTier(ctx)
+	return msgs, inf, model, tier
 }
 
 // BuildClassifyRequestJSON returns the serialised Bedrock Converse payload (for Troubleshooting UI).
@@ -205,11 +228,14 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 	if len(prompts) == 0 {
 		return ""
 	}
-	msgs, inf, model := c.classifyPayload(context.Background(), email, prompts)
+	msgs, inf, model, tier := c.classifyPayload(context.Background(), email, prompts)
 	payload := map[string]any{
 		"modelId":         model,
 		"messages":        msgs,
 		"inferenceConfig": inf,
+	}
+	if tier == ClassifyTierFlex {
+		payload["serviceTier"] = map[string]string{"type": ClassifyTierFlex}
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -223,9 +249,15 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		return ClassifyResult{}, nil
 	}
 
-	msgs, inf, model := c.classifyPayload(ctx, email, prompts)
+	msgs, inf, model, tier := c.classifyPayload(ctx, email, prompts)
 
-	reqJSON, marshalErr := json.Marshal(map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf})
+	reqPayload := map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf}
+	var svcTier *types.ServiceTier
+	if tier == ClassifyTierFlex {
+		svcTier = &types.ServiceTier{Type: types.ServiceTierTypeFlex}
+		reqPayload["serviceTier"] = map[string]string{"type": ClassifyTierFlex}
+	}
+	reqJSON, marshalErr := json.Marshal(reqPayload)
 	if marshalErr != nil {
 		reqJSON = []byte("{}")
 	}
@@ -235,12 +267,17 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	if len(subject) > 60 {
 		subject = subject[:60]
 	}
-	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s)", subject, len(prompts), model))
+	tierLabel := tier
+	if tierLabel == "" {
+		tierLabel = ClassifyTierStandard
+	}
+	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s, tier: %s)", subject, len(prompts), model, tierLabel))
 
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:         aws.String(model),
 		Messages:        msgs,
 		InferenceConfig: inf,
+		ServiceTier:     svcTier,
 	})
 	if err != nil {
 		store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
@@ -448,8 +485,11 @@ func baseModelID(id string) string {
 // ListAvailableModels returns Bedrock models suitable for text classification: text-in,
 // text-out, streaming, on-demand foundation models, unioned with the system-defined
 // inference profiles whose underlying model is likewise text-in/text-out. Image, embedding,
-// and other non-text models (e.g. stability.*, *embed*) are excluded. Sorted cheapest input
-// cost first, unpriced last.
+// and other non-text models (e.g. stability.*, *embed*) are excluded. Only "us."-prefixed
+// cross-region inference profiles are included — global./apac./eu./us-gov. profiles route
+// outside the US and are dropped entirely (data residency). ModelOption.USProfile marks
+// those "us." profiles so callers can offer a US-only Flex-tier subset. Sorted cheapest
+// input cost first, unpriced last.
 func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error) {
 	seen := make(map[string]bool)
 	var opts []ModelOption
@@ -520,6 +560,11 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		if id == "" || seen[id] {
 			continue
 		}
+		// Only US-scoped profiles are eligible — global./apac./eu./us-gov. profiles route
+		// outside the US and are excluded entirely (data residency), not just hidden from Flex.
+		if !strings.HasPrefix(id, "us.") {
+			continue
+		}
 		// Drop image/embedding/other non-text profiles by checking the backing model.
 		if mod, known := modalityOf(baseModelID(id)); known && (!mod.textIn || !mod.textOut) {
 			continue
@@ -529,7 +574,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
-		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id)})
+		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id), USProfile: true})
 	}
 
 	// Sort cheapest input cost first; unpriced (CostUnknown) sinks to the bottom,
