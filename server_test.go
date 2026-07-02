@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 func TestBuildAccountMap(t *testing.T) {
@@ -171,4 +172,37 @@ func TestGenerateToken(t *testing.T) {
 			t.Errorf("expected lowercase hex, got %q", tok)
 		}
 	})
+}
+
+func TestClassifyModelAllowed(t *testing.T) {
+	bare := llm.ModelOption{ID: "google.gemma-3-4b-it", Flex: true}                                   // single-datacenter, flex-capable
+	usProfile := llm.ModelOption{ID: "us.amazon.nova-pro-v1:0", ProfileRegion: "us"}                  // US-routed, not flex
+	globalProfile := llm.ModelOption{ID: "global.anthropic.claude-opus-4-8", ProfileRegion: "global"} // Global-routed, not flex
+	euProfile := llm.ModelOption{ID: "eu.some.model", ProfileRegion: "eu", Flex: true}                // EU-routed, flex-capable
+	apacNonFlex := llm.ModelOption{ID: "apac.some.model", ProfileRegion: "apac"}                      // APAC-routed, not flex
+
+	cases := []struct {
+		name  string
+		model llm.ModelOption
+		tier  string
+		want  bool
+	}{
+		{"standard: bare model allowed", bare, llm.ClassifyTierStandard, true},
+		{"standard: us profile allowed", usProfile, llm.ClassifyTierStandard, true},
+		{"standard: global profile allowed", globalProfile, llm.ClassifyTierStandard, true},
+		{"standard: eu profile rejected", euProfile, llm.ClassifyTierStandard, false},
+		{"standard: apac profile rejected", apacNonFlex, llm.ClassifyTierStandard, false},
+		{"flex: flex-capable bare model allowed regardless of (lack of) profile", bare, llm.ClassifyTierFlex, true},
+		{"flex: non-flex us profile rejected", usProfile, llm.ClassifyTierFlex, false},
+		{"flex: non-flex global profile rejected", globalProfile, llm.ClassifyTierFlex, false},
+		{"flex: flex-capable eu profile allowed — any geo eligible for flex", euProfile, llm.ClassifyTierFlex, true},
+		{"flex: non-flex apac profile rejected", apacNonFlex, llm.ClassifyTierFlex, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := classifyModelAllowed(c.model, c.tier); got != c.want {
+				t.Errorf("classifyModelAllowed(%+v, %q) = %v, want %v", c.model, c.tier, got, c.want)
+			}
+		})
+	}
 }

@@ -342,7 +342,7 @@
       </div>
       <div id="suggestions-list-container"
         hx-get="/fragments/prompt-suggestions"
-        hx-trigger="intersect once, every 60s, refreshSuggestions from:window"
+        hx-trigger="intersect once, every 60s [document.getElementById('page-prompt-suggestions').classList.contains('active') &amp;&amp; document.visibilityState === 'visible'], refreshSuggestions from:window"
         hx-swap="innerHTML">
         <div class="d-flex flex-column gap-3">
           <div class="skeleton rounded-3" style="height:4rem"></div>
