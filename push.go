@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -165,12 +166,12 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 // only thing guarding the public endpoint, so it fails closed on any misconfiguration.
 func (h *pushHandler) verify(ctx context.Context, r *http.Request) error {
 	if h.cfg.PushAudience == "" {
-		return fmt.Errorf("push audience not configured")
+		return errors.New("push audience not configured")
 	}
 	authz := r.Header.Get("Authorization")
 	token, ok := strings.CutPrefix(authz, "Bearer ")
 	if !ok || token == "" {
-		return fmt.Errorf("missing bearer token")
+		return errors.New("missing bearer token")
 	}
 	payload, err := idtoken.Validate(ctx, token, h.cfg.PushAudience)
 	if err != nil {
