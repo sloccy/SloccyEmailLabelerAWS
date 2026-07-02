@@ -2,12 +2,22 @@
   <div class="card">
     <div class="card-body p-0">
       <div class="d-flex align-items-center justify-content-between py-3 px-4 border-bottom setting-row">
-        <div><div class="fw-medium">Classification model</div><div class="small text-muted mt-1">Bedrock model used to label incoming emails. Sorted cheapest input cost first.</div></div>
-        <div class="flex-shrink-0 ms-4">
-          <select class="form-select form-select-sm" name="classify_model" style="min-width:300px;">
+        <div><div class="fw-medium">Classification model</div><div class="small text-muted mt-1">Bedrock model used to label incoming emails. Sorted cheapest input cost first. <strong>Standard</strong> is normal-latency processing; <strong>Flex</strong> is Bedrock's lower-cost tier — higher latency, but dynamically routed across US regions so it's still fast. Data never leaves the US in either tier.</div></div>
+        <div class="flex-shrink-0 ms-4 text-end">
+          <input type="hidden" name="classify_tier" id="classify-tier-input" value="{{.ClassifyTier}}">
+          <div class="btn-group btn-group-sm mb-2" role="group" aria-label="Classification tier" id="classify-tier-toggle">
+            <button type="button" class="btn btn-outline-primary{{if ne .ClassifyTier "flex"}} active{{end}}" data-tier="standard">Standard</button>
+            <button type="button" class="btn btn-outline-primary{{if eq .ClassifyTier "flex"}} active{{end}}" data-tier="flex">Flex</button>
+          </div>
+          <select class="form-select form-select-sm{{if eq .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-standard" style="min-width:300px;"{{if eq .ClassifyTier "flex"}} disabled{{end}}>
             {{range .Models}}
             <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .InputCostPer1M 0.0}} — ${{printf "%.3f" .InputCostPer1M}}/1M in{{else}} — price n/a{{end}}</option>
             {{end}}
+          </select>
+          <select class="form-select form-select-sm{{if ne .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-flex" style="min-width:300px;"{{if ne .ClassifyTier "flex"}} disabled{{end}}>
+            {{range .Models}}{{if .USProfile}}
+            <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .InputCostPer1M 0.0}} — ${{printf "%.3f" .InputCostPer1M}}/1M in{{else}} — price n/a{{end}}</option>
+            {{end}}{{end}}
           </select>
         </div>
       </div>

@@ -575,10 +575,11 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	return models
 }
 
-func settingsTemplateData(classifyModel, improveModel string, models []llm.ModelOption, scanInterval int) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier string, models []llm.ModelOption, scanInterval int) map[string]any {
 	return map[string]any{
 		"ClassifyModel": classifyModel,
 		"ImproveModel":  improveModel,
+		"ClassifyTier":  classifyTier,
 		"Models":        models,
 		"ScanInterval":  scanInterval,
 	}
@@ -605,9 +606,13 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if improveModel == "" {
 		improveModel = s.cfg.BedrockModel
 	}
+	classifyTier, _ := s.store.GetSetting(ctx, llm.SettingClassifyTier)
+	if classifyTier == "" {
+		classifyTier = llm.ClassifyTierStandard
+	}
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, models, s.scanIntervalMinutes(ctx)), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, models, s.scanIntervalMinutes(ctx)), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -616,22 +621,37 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	// Model selections — validate against available models to ignore garbage input
 	models := s.cachedModels(ctx)
-	validID := func(id string) bool {
-		for _, m := range models {
-			if m.ID == id {
-				return true
+	findModel := func(id string) *llm.ModelOption {
+		for i := range models {
+			if models[i].ID == id {
+				return &models[i]
 			}
 		}
-		return false
+		return nil
+	}
+	validID := func(id string) bool { return findModel(id) != nil }
+
+	// Classification tier — "standard" or "flex". Must be resolved before validating the
+	// classify_model choice: a flex selection may only be a "us." cross-region inference
+	// profile, so a non-US-profile model id is rejected outright when flex is chosen.
+	classifyTier, _ := s.store.GetSetting(ctx, llm.SettingClassifyTier)
+	if classifyTier == "" {
+		classifyTier = llm.ClassifyTierStandard
+	}
+	if v := r.FormValue("classify_tier"); v == llm.ClassifyTierStandard || v == llm.ClassifyTierFlex {
+		classifyTier = v
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyTier, Value: v})
 	}
 
 	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
 	if classifyModel == "" {
 		classifyModel = s.cfg.BedrockModel
 	}
-	if v := r.FormValue("classify_model"); v != "" && validID(v) {
-		classifyModel = v
-		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
+	if v := r.FormValue("classify_model"); v != "" {
+		if m := findModel(v); m != nil && (classifyTier != llm.ClassifyTierFlex || m.USProfile) {
+			classifyModel = v
+			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
+		}
 	}
 
 	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
@@ -659,7 +679,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data := settingsTemplateData(classifyModel, improveModel, models, interval)
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, models, interval)
 	if schedErr {
 		setHxTrigger(w, map[string]any{
 			triggerShowToast: map[string]any{toastKeyMessage: "Couldn't update scan schedule — try again.", jsonKeyType: "error"},
