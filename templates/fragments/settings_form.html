@@ -16,7 +16,7 @@
         </select>
         <select class="form-select form-select-sm{{if ne .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-flex" style="min-width:300px;"{{if ne .ClassifyTier "flex"}} disabled{{end}}>
           {{range .Models}}{{if .Flex}}
-          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .InputCostPer1M 0.0}} — ${{printf "%.3f" .InputCostPer1M}}/1M in{{else}} — price n/a{{end}}</option>
+          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .FlexCostPer1M 0.0}} — ${{printf "%.3f" .FlexCostPer1M}}/1M in (flex){{else}} — price n/a{{end}}</option>
           {{end}}{{end}}
         </select>
       </div>

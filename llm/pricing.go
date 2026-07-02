@@ -134,19 +134,24 @@ func candidateKeys(id string) []string {
 	return keys
 }
 
-// pricingCatalog is a snapshot of Bedrock's US on-demand pricing and flex-tier
-// eligibility, built entirely from the AWS Price List API — no hardcoded model data.
-// Keys are normalized (see normalizeKey/candidateKeys) so both Price List naming
-// conventions resolve to the same entry.
+// pricingCatalog is a snapshot of Bedrock's US on-demand and flex-tier pricing, built
+// entirely from the AWS Price List API — no hardcoded model data. Keys are normalized
+// (see normalizeKey/candidateKeys) so both Price List naming conventions resolve to the
+// same entry.
 type pricingCatalog struct {
-	inputPricePer1M map[string]float64
-	flexCapable     map[string]bool
+	inputPricePer1M     map[string]float64
+	flexInputPricePer1M map[string]float64
+	flexCapable         map[string]bool
 }
 
 // fetchPricingCatalog queries the AWS Price List API for Amazon Bedrock's us-east-1
-// on-demand catalog and derives per-model input pricing and flex-tier eligibility.
+// on-demand catalog and derives per-model standard and flex-tier input pricing.
 func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatalog, error) {
-	cat := &pricingCatalog{inputPricePer1M: map[string]float64{}, flexCapable: map[string]bool{}}
+	cat := &pricingCatalog{
+		inputPricePer1M:     map[string]float64{},
+		flexInputPricePer1M: map[string]float64{},
+		flexCapable:         map[string]bool{},
+	}
 
 	paginator := pricing.NewGetProductsPaginator(pc, &pricing.GetProductsInput{
 		ServiceCode: aws.String("AmazonBedrock"),
@@ -179,7 +184,14 @@ func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatal
 				for _, k := range candidateKeys(base) {
 					cat.flexCapable[k] = true
 				}
-				continue // flex pricing itself isn't shown in the dropdown, only standard price
+				if direction == "input" {
+					if price := firstOnDemandPricePer1K(e); price > 0 {
+						for _, k := range candidateKeys(base) {
+							cat.flexInputPricePer1M[k] = price * 1000
+						}
+					}
+				}
+				continue
 			}
 			if direction != "input" || (effTier != "standard" && effTier != "") {
 				continue
@@ -276,6 +288,15 @@ func lookup[V any](cat map[string]V, id string) (V, bool) {
 // model id (region prefix already stripped), or CostUnknown if the catalog has no match.
 func (cat *pricingCatalog) inputCostPer1M(baseModelID string) float64 {
 	if price, ok := lookup(cat.inputPricePer1M, baseModelID); ok {
+		return price
+	}
+	return CostUnknown
+}
+
+// flexCostPer1M returns the flex-tier input price per 1M tokens for a Bedrock base
+// model id (region prefix already stripped), or CostUnknown if the catalog has no match.
+func (cat *pricingCatalog) flexCostPer1M(baseModelID string) float64 {
+	if price, ok := lookup(cat.flexInputPricePer1M, baseModelID); ok {
 		return price
 	}
 	return CostUnknown
