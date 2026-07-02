@@ -135,11 +135,13 @@ func (g *gzipResponseWriter) Flush() {
 }
 
 func (s *server) registerRoutes() {
-	// Static (immutable per deploy — cache aggressively)
+	// Static (deliberately uncached — no cache-busting/versioned filenames exist yet,
+	// so an aggressive Cache-Control here means fixes deployed to app.js/style.css
+	// can take up to a day to reach returning users, behind CloudFront/Cloudflare too).
 	staticSub, _ := fs.Sub(staticFS, "static")
 	fileServer := http.StripPrefix("/static/", http.FileServer(http.FS(staticSub)))
 	s.mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Header().Set("Cache-Control", "no-store")
 		relPath := strings.TrimPrefix(r.URL.Path, "/static/")
 		if strings.Contains(r.Header.Get(headerAcceptEncoding), encodingGzip) {
 			if f, err := staticSub.Open(relPath + ".gz"); err == nil {
