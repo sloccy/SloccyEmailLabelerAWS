@@ -63,7 +63,7 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
 - **Amazon Bedrock** — classification and the prompt builder (`us.amazon.nova-micro-v1:0` by default; selectable in Settings).
 - **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
 
-> **Scan cadence is fixed in the template** (`template.yaml`, `rate(1 minute)`). There is no user-configurable poll interval — to change cadence, edit the `ScheduleExpression` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
+> **Scan cadence is fixed in the template** (`template.yaml`, `cron(0 2 * * ? *)` at `America/New_York`, i.e. 2 AM Eastern — off-peak for Bedrock flex-tier traffic). There is no user-configurable poll interval — to change cadence, edit the `ScanSchedule` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
 
 ---
 
@@ -209,9 +209,10 @@ Configuration is set via Lambda environment variables (see `template.yaml`).
 | `PUBSUB_TOPIC` | _(empty)_ | `projects/<proj>/topics/<name>`; enables Gmail `watch()` registration/renewal |
 | `PUSH_OIDC_AUDIENCE` | _(empty)_ | Expected OIDC audience on the Pub/Sub push token (the PushFunction URL) |
 | `PUSH_OIDC_SA_EMAIL` | _(empty)_ | Service-account email the push token must be issued by |
+| `CLASSIFY_CONCURRENCY` | `6` | Max emails classified against Bedrock in parallel per account |
 | `DEBUG_LOGGING` | `0` | Set to `1` for verbose logging |
 
-Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-verified). The scheduled scan is now a **daily safety net** that also renews Gmail watches; its cadence is the `ScheduleExpression` on the `ScanSchedule` in `template.yaml` (rewritable from Settings).
+Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-verified). The scheduled scan is a **daily safety net** that also renews Gmail watches; it runs at a fixed **2 AM (`America/New_York`)** via the `ScanSchedule` cron in `template.yaml`, timed off-peak since classification may run on Bedrock's flex tier. The cadence isn't user-configurable — there's no Settings control for it.
 
 ---
 

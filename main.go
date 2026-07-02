@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -73,25 +72,10 @@ func runWeb(cfg Config) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sched, err := newScanScheduler(ctx, cfg)
-	if err != nil {
-		slog.Error("init scan scheduler", "err", err)
-	}
-	// A fresh `sam deploy` resets the schedule to the template baseline; re-apply the stored
-	// interval so the user's choice survives deploys.
-	if sched != nil {
-		if v, gerr := store.GetSetting(ctx, llm.SettingScanInterval); gerr == nil {
-			if n, cerr := strconv.Atoi(v); cerr == nil && n >= 1 {
-				if uerr := sched.UpdateInterval(ctx, n); uerr != nil {
-					slog.Error("resync scan schedule", "err", uerr)
-				}
-			}
-		}
-	}
-
-	// Scheduled scanning is handled by the ScanFunction (EventBridge); the web UI's
-	// "Scan Now" runs an on-demand pass in-process via scanOnce.
-	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey, sched)
+	// Scheduled scanning is handled by the ScanFunction (EventBridge, fixed daily 2 AM ET
+	// cron — see ScanSchedule in template.yaml); the web UI's "Scan Now" runs an on-demand
+	// pass in-process via scanOnce.
+	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey)
 	handler := newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv)
 
 	port := os.Getenv("AWS_LWA_PORT")

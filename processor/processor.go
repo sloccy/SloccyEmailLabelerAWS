@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/sloccy/ollamail-aws/db"
 	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
@@ -139,23 +140,40 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient ll
 		return fmt.Errorf("build label cache: %w", err)
 	}
 
-	// Fetch and classify messages
+	// Fetch and classify messages. Fetching is already concurrent (IterMessageDetails);
+	// classification is now fanned out too, capped at cfg.ClassifyConcurrency, since flex-tier
+	// Bedrock requests can queue for minutes and no longer have to be serialized one-by-one.
 	msgCh, errCh := gmailpkg.IterMessageDetails(ctx, svc, unprocessed, cfg.BodyTruncation)
 
 	var allModifies []gmailpkg.Modify
 	var trashIDs []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
+	sem := make(chan struct{}, classifyConcurrency(cfg.ClassifyConcurrency))
 	for msg := range msgCh {
-		modifies, trash := processEmail(ctx, store, ollamaClient, account, msg, prompts, labelCache, cfg.DebugLogging)
-		for _, m := range modifies {
-			allModifies = append(allModifies, gmailpkg.Modify{
-				MessageIDs:   []string{m.MessageID},
-				AddLabels:    m.AddLabels,
-				RemoveLabels: m.RemoveLabels,
-			})
-		}
-		trashIDs = append(trashIDs, trash...)
+		msg := msg
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			modifies, trash := processEmail(ctx, store, ollamaClient, account, msg, prompts, labelCache, cfg.DebugLogging)
+
+			mu.Lock()
+			defer mu.Unlock()
+			for _, m := range modifies {
+				allModifies = append(allModifies, gmailpkg.Modify{
+					MessageIDs:   []string{m.MessageID},
+					AddLabels:    m.AddLabels,
+					RemoveLabels: m.RemoveLabels,
+				})
+			}
+			trashIDs = append(trashIDs, trash...)
+		}()
 	}
+	wg.Wait()
 	if err := <-errCh; err != nil {
 		slog.Error("fetch message details", "account", account.Email, "err", err)
 	}
@@ -359,4 +377,16 @@ type ProcessConfig struct {
 	MaxResults     int64
 	BodyTruncation int
 	DebugLogging   bool
+	// ClassifyConcurrency caps how many emails are classified against Bedrock in parallel.
+	// <= 0 falls back to 1 (fully sequential) — see classifyConcurrency.
+	ClassifyConcurrency int
+}
+
+// classifyConcurrency guards against a zero/negative config value collapsing the semaphore
+// buffer to 0, which would deadlock every classify goroutine.
+func classifyConcurrency(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }

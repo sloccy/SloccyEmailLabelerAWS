@@ -10,8 +10,10 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
@@ -19,6 +21,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 )
+
+// bedrockHTTPTimeout is the HTTP client read-timeout for Bedrock calls. Flex-tier requests
+// are queued at lower priority and can take minutes to return (vs. the near-instant default
+// tier), so this needs to be generous — set just under the Lambda's own hard timeout (900s)
+// so a killed request surfaces as a clean Lambda timeout rather than a silent hang.
+const bedrockHTTPTimeout = 14 * time.Minute
 
 var fenceRe = regexp.MustCompile(`(?s)^` + "```" + `(?:json)?\s*|\s*` + "```" + `$`)
 
@@ -35,9 +43,6 @@ const (
 	// SettingClassifyTier holds the Bedrock service tier ("standard" or "flex") used for
 	// classification requests. Flex trades latency for lower cost; see resolveClassifyTier.
 	SettingClassifyTier = "classify_tier"
-	// SettingScanInterval holds the user-selected scan cadence in minutes. The web UI
-	// writes it and rewrites the EventBridge Scheduler schedule to match.
-	SettingScanInterval = "scan_interval_minutes"
 )
 
 // Values for SettingClassifyTier.
@@ -77,7 +82,17 @@ func NewClient(settings Settings, defaultModel string) *Client {
 	if defaultModel == "" {
 		defaultModel = "us.amazon.nova-micro-v1:0"
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		// Generous read-timeout so the HTTP layer doesn't abort a queued flex-tier request
+		// before the Lambda's own timeout does.
+		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTimeout(bedrockHTTPTimeout)),
+		// Adaptive retry + client-side rate limiting: with classification now fanned out
+		// across goroutines (see processor.ProcessConfig.ClassifyConcurrency), concurrent
+		// requests are more likely to hit on-demand throttling, so back off instead of
+		// failing fast.
+		awsconfig.WithRetryMode(aws.RetryModeAdaptive),
+		awsconfig.WithRetryMaxAttempts(5),
+	)
 	if err != nil {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
 	}
