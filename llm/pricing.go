@@ -17,6 +17,9 @@ import (
 // It sorts last in the model dropdown.
 const CostUnknown = -1.0
 
+// directionInput identifies the input-token price direction, as opposed to output.
+const directionInput = "input"
+
 // pricingRegion is where the AWS Price List API is queried. It's a single global
 // catalog (the API itself only runs in us-east-1/ap-south-1, regardless of which
 // regions the priced models actually run in) — so this has no bearing on the geo
@@ -50,9 +53,9 @@ func bedrockPriceBaseID(usageType string) (base, direction, tier string, ok bool
 	s := usageTypeRegionPrefixRe.ReplaceAllString(usageType, "")
 
 	var rest string
-	if idx := strings.Index(s, "-mantle-"); idx >= 0 {
-		base = strings.ToLower(s[:idx])
-		rest = s[idx+len("-mantle-"):]
+	if before, after, found := strings.Cut(s, "-mantle-"); found {
+		base = strings.ToLower(before)
+		rest = after
 	} else {
 		m := legacyDirectionRe.FindStringIndex(s)
 		if m == nil {
@@ -65,7 +68,7 @@ func bedrockPriceBaseID(usageType string) (base, direction, tier string, ok bool
 	var tail string
 	switch {
 	case strings.HasPrefix(rest, "input-tokens"):
-		direction = "input"
+		direction = directionInput
 		tail = rest[len("input-tokens"):]
 	case strings.HasPrefix(rest, "output-tokens"):
 		direction = "output"
@@ -126,8 +129,8 @@ func normalizeKey(s string) string {
 func candidateKeys(id string) []string {
 	id = stripTrailingNoise(id)
 	keys := []string{normalizeKey(id)}
-	if i := strings.Index(id, "."); i >= 0 {
-		if stripped := normalizeKey(id[i+1:]); stripped != keys[0] {
+	if _, after, found := strings.Cut(id, "."); found {
+		if stripped := normalizeKey(after); stripped != keys[0] {
 			keys = append(keys, stripped)
 		}
 	}
@@ -184,7 +187,7 @@ func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatal
 				for _, k := range candidateKeys(base) {
 					cat.flexCapable[k] = true
 				}
-				if direction == "input" {
+				if direction == directionInput {
 					if price := firstOnDemandPricePer1K(e); price > 0 {
 						for _, k := range candidateKeys(base) {
 							cat.flexInputPricePer1M[k] = price * 1000
@@ -193,7 +196,7 @@ func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatal
 				}
 				continue
 			}
-			if direction != "input" || (effTier != "standard" && effTier != "") {
+			if direction != directionInput || (effTier != "standard" && effTier != "") {
 				continue
 			}
 			price := firstOnDemandPricePer1K(e)

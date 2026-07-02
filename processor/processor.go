@@ -152,7 +152,6 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient ll
 
 	sem := make(chan struct{}, classifyConcurrency(cfg.ClassifyConcurrency))
 	for msg := range msgCh {
-		msg := msg
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
