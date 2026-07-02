@@ -7,7 +7,6 @@ version = 0.1
 stack_name = "ollamail"
 region = "us-east-1"
 resolve_s3 = true
-resolve_image_repos = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 fail_on_empty_changeset = false
