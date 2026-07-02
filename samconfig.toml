@@ -12,6 +12,10 @@ confirm_changeset = false
 fail_on_empty_changeset = false
 parameter_overrides = [
     "CredentialsSsmArn=arn:aws:ssm:us-east-2:508768431323:parameter/ollamail/credentials",
+    # Explicit (not just the template Default) because CloudFormation reuses a stack's
+    # last-deployed parameter value for anything omitted from an update — it was
+    # temporarily "false" during the us-east-1 migration and won't revert on its own.
+    "CreateBudget=true",
     # Gmail push. Audience is an arbitrary constant we also set on the Pub/Sub
     # subscription (--push-auth-token-audience); it need not be the Function URL.
     "PubSubTopic=projects/gmail-auto-labeler-487804/topics/gmail-push",
