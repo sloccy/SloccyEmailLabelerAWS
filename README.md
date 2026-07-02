@@ -105,7 +105,7 @@ aws ssm put-parameter \
   --name /ollamail/credentials \
   --type SecureString \
   --value "$(cat credentials.json)" \
-  --region us-east-1
+  --region us-east-2
 ```
 
 The parameter ARN is referenced by `samconfig.toml` (`CredentialsSsmArn`). The Lambda reads it at runtime via `CREDENTIALS_SSM_PARAM`.
@@ -114,7 +114,7 @@ The parameter ARN is referenced by `samconfig.toml` (`CredentialsSsmArn`). The L
 
 ### 3. Enable Bedrock model access
 
-In the Bedrock console (**Model access**), request/enable access to the classification model — by default **Amazon Nova Micro** (`us.amazon.nova-micro-v1:0`) in `us-east-1`. The Lambda role grants `bedrock:InvokeModel*` and the list APIs used to populate the Settings model picker.
+In the Bedrock console (**Model access**), request/enable access to the classification model — by default **Amazon Nova Micro** (`us.amazon.nova-micro-v1:0`) in `us-east-2`. The Lambda role grants `bedrock:InvokeModel*` and the list APIs used to populate the Settings model picker.
 
 ---
 
@@ -158,7 +158,7 @@ Deploys happen automatically via GitHub Actions (`.github/workflows/deploy.yml`)
 
 ```bash
 sam build
-sam deploy   # uses samconfig.toml: stack `ollamail`, region us-east-1
+sam deploy   # uses samconfig.toml: stack `ollamail`, region us-east-2
 ```
 
 Outputs include the **WebFunctionUrl** (the AWS_IAM-protected Function URL) and the DynamoDB table name.

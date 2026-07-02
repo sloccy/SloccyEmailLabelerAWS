@@ -31,7 +31,7 @@ func main() {
 	target := flag.String("target",
 		"https://3ra437iva332tr3nct6kaovxzy0fyyqy.lambda-url.us-east-1.on.aws",
 		"Web UI Function URL to sign requests to")
-	region := flag.String("region", "us-east-1", "AWS region of the function")
+	region := flag.String("region", "us-east-2", "AWS region of the function")
 	flag.Parse()
 
 	targetURL, err := url.Parse(*target)
