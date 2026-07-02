@@ -17,6 +17,7 @@ import (
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/aws-sdk-go-v2/service/pricing"
 )
 
 var fenceRe = regexp.MustCompile(`(?s)^` + "```" + `(?:json)?\s*|\s*` + "```" + `$`)
@@ -50,13 +51,17 @@ type ModelOption struct {
 	ID             string  // value sent to Bedrock (modelId or inferenceProfileId)
 	Label          string  // human-readable display name
 	InputCostPer1M float64 // on-demand input price per 1M tokens; CostUnknown if unpriced
-	USProfile      bool    // true when ID is a "us." cross-region inference profile
+	// ProfileRegion is the cross-region inference-profile geography ("us", "global", "eu",
+	// "apac", "us-gov"), or "" for a bare/single-datacenter foundation-model id.
+	ProfileRegion string
+	Flex          bool // true when the AWS Price List API reports a flex-tier SKU
 }
 
 // Client wraps the Bedrock runtime client with per-call model resolution.
 type Client struct {
 	br           *bedrockruntime.Client
 	bc           *bedrock.Client // control-plane, for listing
+	pc           *pricing.Client // AWS Price List API, for dynamic pricing + flex eligibility
 	defaultModel string
 	settings     Settings
 }
@@ -75,15 +80,12 @@ func NewClient(settings Settings, defaultModel string) *Client {
 	if err != nil {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
 	}
-	// Hard-require a US region for all LLM traffic (data residency). The cross-region
-	// inference profiles we use (us.*) only fan out within the US, and the IAM policy
-	// denies non-US regions — this guarantees the client never even attempts one.
-	if !strings.HasPrefix(cfg.Region, "us-") {
-		cfg.Region = "us-east-1"
-	}
 	return &Client{
-		br:           bedrockruntime.NewFromConfig(cfg),
-		bc:           bedrock.NewFromConfig(cfg),
+		br: bedrockruntime.NewFromConfig(cfg),
+		bc: bedrock.NewFromConfig(cfg),
+		// The Price List API only runs in us-east-1 (and ap-south-1); pin it there
+		// regardless of cfg.Region — it's a read-only pricing catalog, not LLM traffic.
+		pc:           pricing.NewFromConfig(cfg, func(o *pricing.Options) { o.Region = pricingRegion }),
 		defaultModel: defaultModel,
 		settings:     settings,
 	}
@@ -482,17 +484,40 @@ func baseModelID(id string) string {
 	return id
 }
 
+// profileRegion returns the cross-region inference-profile geography embedded in id
+// ("us", "global", "eu", "apac", "us-gov"), or "" for a bare foundation-model id (no
+// profile — pinned to whichever single region/datacenter the caller's endpoint is in).
+func profileRegion(id string) string {
+	for _, p := range regionPrefixes {
+		if strings.HasPrefix(id, p) {
+			return strings.TrimSuffix(p, ".")
+		}
+	}
+	return ""
+}
+
 // ListAvailableModels returns Bedrock models suitable for text classification: text-in,
-// text-out, streaming, on-demand foundation models, unioned with the system-defined
-// inference profiles whose underlying model is likewise text-in/text-out. Image, embedding,
-// and other non-text models (e.g. stability.*, *embed*) are excluded. Only "us."-prefixed
-// cross-region inference profiles are included — global./apac./eu./us-gov. profiles route
-// outside the US and are dropped entirely (data residency). ModelOption.USProfile marks
-// those "us." profiles so callers can offer a US-only Flex-tier subset. Sorted cheapest
-// input cost first, unpriced last.
+// text-out, streaming, on-demand foundation models, unioned with all system-defined
+// inference profiles whose underlying model is likewise text-in/text-out (any geography —
+// "us.", "global.", "eu.", "apac.", "us-gov.", or whatever AWS adds next; see
+// ModelOption.ProfileRegion). Image, embedding, and other non-text models (e.g.
+// stability.*, *embed*) are excluded. ModelOption.Flex marks flex-tier eligibility per the
+// AWS Price List API. Callers decide their own geo policy from ProfileRegion/Flex — e.g.
+// the Settings UI restricts Standard to "" (bare/single-datacenter)/"us"/"global" but lets
+// Flex use any geography, since flex-eligible families currently have no "us." profile at
+// all (see dynamic-sources-only project memory). Sorted cheapest input cost first, unpriced
+// last.
 func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error) {
 	seen := make(map[string]bool)
 	var opts []ModelOption
+
+	// Pricing + flex-tier eligibility come entirely from the AWS Price List API — no
+	// hardcoded model data. Non-fatal on error (e.g. missing pricing:GetProducts IAM
+	// permission): the dropdown still lists models, just without prices/flex info.
+	cat, err := fetchPricingCatalog(ctx, c.pc)
+	if err != nil {
+		cat = &pricingCatalog{inputPricePer1M: map[string]float64{}, flexCapable: map[string]bool{}}
+	}
 
 	// One unfiltered catalog call: drives the foundation-model list AND supplies the
 	// modality of the models that back each inference profile.
@@ -531,7 +556,12 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
-		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id)})
+		opts = append(opts, ModelOption{
+			ID:             id,
+			Label:          label,
+			InputCostPer1M: cat.inputCostPer1M(id),
+			Flex:           cat.isFlexCapable(id),
+		}) // ProfileRegion left as "" — bare foundation-model id, single datacenter
 	}
 
 	// modalityOf resolves a profile's underlying model modality. Foundation ids sometimes
@@ -560,11 +590,6 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		if id == "" || seen[id] {
 			continue
 		}
-		// Only US-scoped profiles are eligible — global./apac./eu./us-gov. profiles route
-		// outside the US and are excluded entirely (data residency), not just hidden from Flex.
-		if !strings.HasPrefix(id, "us.") {
-			continue
-		}
 		// Drop image/embedding/other non-text profiles by checking the backing model.
 		if mod, known := modalityOf(baseModelID(id)); known && (!mod.textIn || !mod.textOut) {
 			continue
@@ -574,7 +599,14 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
-		opts = append(opts, ModelOption{ID: id, Label: label, InputCostPer1M: inputCostPer1M(id), USProfile: true})
+		base := baseModelID(id)
+		opts = append(opts, ModelOption{
+			ID:             id,
+			Label:          label,
+			InputCostPer1M: cat.inputCostPer1M(base),
+			ProfileRegion:  profileRegion(id),
+			Flex:           cat.isFlexCapable(base),
+		})
 	}
 
 	// Sort cheapest input cost first; unpriced (CostUnknown) sinks to the bottom,

@@ -147,21 +147,22 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  # Cross-region inference profile (us.*) fans the real InvokeModel
-                  # out to sibling US regions. Grant foundation-model in ANY US
-                  # region (us-*) — covers current + future US regions, stays
-                  # in-country, and excludes non-US regions.
-                  - arn:aws:bedrock:us-*::foundation-model/*
-                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
-                # Belt-and-suspenders: deny any InvokeModel targeting a non-US region,
-                # regardless of which model/profile ARN is selected.
-                Condition:
-                  StringLike:
-                    aws:RequestedRegion: us-*
+                  # Any region — geography is enforced solely by the app's model-selection
+                  # logic (ModelOption.ProfileRegion / Flex in llm/bedrock.go, rendered in
+                  # settings_form.html and server.go's classifyModelAllowed), not IAM.
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
               - Effect: Allow
                 Action:
                   - bedrock:ListFoundationModels
                   - bedrock:ListInferenceProfiles
+                Resource: "*"
+              # AWS Price List API: drives dynamic model pricing and flex-tier eligibility
+              # in the classification-model dropdown (see llm/pricing.go). Read-only,
+              # account-agnostic catalog data — no narrower resource scope exists.
+              - Effect: Allow
+                Action:
+                  - pricing:GetProducts
                 Resource: "*"
               - Effect: Allow
                 Action:

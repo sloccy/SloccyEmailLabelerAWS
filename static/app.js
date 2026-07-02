@@ -315,12 +315,19 @@ document.addEventListener('click', function(e) {
   const btn = e.target.closest('#classify-tier-toggle button[data-tier]');
   if (!btn) return;
   const tier = btn.dataset.tier;
-  const toggle = document.getElementById('classify-tier-toggle');
-  toggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
-  document.getElementById('classify-tier-input').value = tier;
+  const form = btn.closest('form');
+  if (!form) return;
 
-  const standardSel = document.getElementById('classify-model-standard');
-  const flexSel = document.getElementById('classify-model-flex');
+  // Resolve everything relative to the clicked button's own form, rather than via
+  // document-wide getElementById — that's what makes this robust to any duplicate/stale
+  // copy of these ids elsewhere in the DOM (the prior global lookup could silently mutate
+  // the wrong instance, making the button appear to do nothing).
+  btn.closest('.btn-group').querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+  const tierInput = form.querySelector('[name="classify_tier"]');
+  if (tierInput) tierInput.value = tier;
+
+  const standardSel = form.querySelector('#classify-model-standard');
+  const flexSel = form.querySelector('#classify-model-flex');
   const showFlex = tier === 'flex';
   standardSel.classList.toggle('d-none', showFlex);
   standardSel.disabled = showFlex;

@@ -575,6 +575,16 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	return models
 }
 
+// classifyModelAllowed mirrors the geo/tier policy rendered into the two <select>s in
+// settings_form.html: Standard is limited to single-datacenter, US-, or Global-routed
+// models; Flex accepts any flex-capable model regardless of routing region.
+func classifyModelAllowed(m llm.ModelOption, tier string) bool {
+	if tier == llm.ClassifyTierFlex {
+		return m.Flex
+	}
+	return m.ProfileRegion == "" || m.ProfileRegion == "us" || m.ProfileRegion == "global"
+}
+
 func settingsTemplateData(classifyModel, improveModel, classifyTier string, models []llm.ModelOption, scanInterval int) map[string]any {
 	return map[string]any{
 		"ClassifyModel": classifyModel,
@@ -632,8 +642,8 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	validID := func(id string) bool { return findModel(id) != nil }
 
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
-	// classify_model choice: a flex selection may only be a "us." cross-region inference
-	// profile, so a non-US-profile model id is rejected outright when flex is chosen.
+	// classify_model choice: the two tiers have different eligible-model policies (see
+	// classifyModelAllowed) enforced below.
 	classifyTier, _ := s.store.GetSetting(ctx, llm.SettingClassifyTier)
 	if classifyTier == "" {
 		classifyTier = llm.ClassifyTierStandard
@@ -648,7 +658,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		classifyModel = s.cfg.BedrockModel
 	}
 	if v := r.FormValue("classify_model"); v != "" {
-		if m := findModel(v); m != nil && (classifyTier != llm.ClassifyTierFlex || m.USProfile) {
+		if m := findModel(v); m != nil && classifyModelAllowed(*m, classifyTier) {
 			classifyModel = v
 			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
 		}
