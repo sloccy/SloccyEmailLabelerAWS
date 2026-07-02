@@ -189,9 +189,16 @@ Resources:
       MemorySize: 256
       Timeout: 30
       FunctionUrlConfig:
-        # Locked to AWS_IAM: only requests signed with your AWS credentials can reach it.
-        # Browse it locally with a SigV4 signing proxy (see README). Nothing is public.
-        AuthType: AWS_IAM
+        # AWS_IAM when Cloudflare Access is off (CfAccessAud unset): only requests
+        # signed with your AWS credentials can reach it — browse locally with the
+        # SigV4 signing proxy (see README), nothing is public.
+        #
+        # NONE when Cloudflare Access is on: CloudFront's OAC signer omits the
+        # request body from its SigV4 signature, so an AWS_IAM Function URL rejects
+        # every POST/PUT/PATCH (anything with a body) with InvalidSignatureException
+        # even though GETs succeed. The app's Cloudflare Access JWT check
+        # (cfaccess.go, wired in main.go) is the security gate in this mode instead.
+        AuthType: !If [CfAccessEnabled, NONE, AWS_IAM]
         InvokeMode: BUFFERED
       Environment:
         Variables:
@@ -207,30 +214,22 @@ Resources:
           CF_ACCESS_AUD: !Ref CfAccessAud
 
   # ----------------------------------------------------------------
-  # CloudFront in front of the IAM Function URL (created only when Cloudflare Access is
-  # configured). Origin Access Control SigV4-signs each request to the Function URL, which
-  # is why the URL can stay AWS_IAM (public Function URLs need not be enabled on the
-  # account). Point your Cloudflare proxied CNAME at this distribution's domain; Cloudflare
-  # Access does Google SSO and injects the Cf-Access-Jwt-Assertion header, which the app
-  # verifies (see cfaccess.go) so hitting the raw CloudFront/Function URL directly 403s.
+  # CloudFront in front of the public (AuthType NONE) Function URL, created only when
+  # Cloudflare Access is configured. No Origin Access Control: OAC's SigV4 signer omits
+  # the request body, which breaks every POST/PUT/PATCH against an IAM Function URL (see
+  # the AuthType comment on WebFunction above) — so the origin is public instead, and the
+  # security gate is entirely the app-layer Cloudflare Access JWT check (cfaccess.go).
+  # Point your Cloudflare proxied CNAME at this distribution's domain; Cloudflare Access
+  # does Google SSO and injects the Cf-Access-Jwt-Assertion header, which the app verifies
+  # so hitting the raw CloudFront/Function URL directly still 403s.
   # ----------------------------------------------------------------
-  WebOAC:
-    Type: AWS::CloudFront::OriginAccessControl
-    Condition: CfAccessEnabled
-    Properties:
-      OriginAccessControlConfig:
-        Name: !Sub "${AWS::StackName}-web-oac"
-        OriginAccessControlOriginType: lambda
-        SigningBehavior: always
-        SigningProtocol: sigv4
-
   WebDistribution:
     Type: AWS::CloudFront::Distribution
     Condition: CfAccessEnabled
     Properties:
       DistributionConfig:
         Enabled: true
-        Comment: OllaMail Web UI (OAC-signed to IAM Function URL; app enforces Cloudflare Access JWT)
+        Comment: OllaMail Web UI (public Function URL; app enforces Cloudflare Access JWT)
         PriceClass: PriceClass_100
         Aliases:
           - mailclass.sloccy.com
@@ -241,7 +240,6 @@ Resources:
         Origins:
           - Id: WebFunctionUrlOrigin
             DomainName: !Select [2, !Split ["/", !GetAtt WebFunctionUrl.FunctionUrl]]
-            OriginAccessControlId: !GetAtt WebOAC.Id
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols: [TLSv1.2]
@@ -251,19 +249,9 @@ Resources:
           AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
           # CachingDisabled + AllViewerExceptHostHeader (managed policies): don't cache
           # dynamic content, forward all viewer headers (incl. Cf-Access-Jwt-Assertion)
-          # except Host (Host must stay the origin's for OAC signing).
+          # except Host.
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
           OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
-
-  WebFunctionCloudFrontPermission:
-    Type: AWS::Lambda::Permission
-    Condition: CfAccessEnabled
-    Properties:
-      FunctionName: !Ref WebFunction
-      Action: lambda:InvokeFunctionUrl
-      Principal: cloudfront.amazonaws.com
-      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution.Id}"
-      FunctionUrlAuthType: AWS_IAM
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule
