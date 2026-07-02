@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 )
@@ -27,8 +29,6 @@ import (
 // tier), so this needs to be generous — set just under the Lambda's own hard timeout (900s)
 // so a killed request surfaces as a clean Lambda timeout rather than a silent hang.
 const bedrockHTTPTimeout = 14 * time.Minute
-
-var fenceRe = regexp.MustCompile(`(?s)^` + "```" + `(?:json)?\s*|\s*` + "```" + `$`)
 
 // Settings is the minimal interface the Client needs to look up per-call model
 // overrides. *db.Store and *db.FakeStore both satisfy this.
@@ -63,13 +63,29 @@ type ModelOption struct {
 	Flex          bool // true when the AWS Price List API reports a flex-tier SKU
 }
 
+// converseAPI is the subset of *bedrockruntime.Client used for chat calls. Narrowing to
+// an interface lets tests substitute a fake without a network round-trip.
+type converseAPI interface {
+	Converse(ctx context.Context, params *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
+	ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error)
+}
+
 // Client wraps the Bedrock runtime client with per-call model resolution.
 type Client struct {
-	br           *bedrockruntime.Client
+	br           converseAPI
 	bc           *bedrock.Client // control-plane, for listing
 	pc           *pricing.Client // AWS Price List API, for dynamic pricing + flex eligibility
 	defaultModel string
 	settings     Settings
+
+	// toolUseUnsupported records, per model ID, that a prior classification's forced
+	// tool-use attempt was rejected outright by Bedrock (e.g. Nova's "doesn't support
+	// the strict field" ValidationException). Bedrock exposes no capability flag for
+	// this (see ListAvailableModels) — it can only be learned by trying. Once learned,
+	// subsequent classifications for that model skip straight to the plain-text call
+	// instead of paying a doomed extra round-trip on every single email. Scoped to the
+	// process lifetime (cleared on cold start); self-heals if AWS adds support.
+	toolUseUnsupported sync.Map // model string -> struct{}
 }
 
 // NewClient creates a Bedrock client.
@@ -128,6 +144,13 @@ func (c *Client) resolveClassifyTier(ctx context.Context) string {
 		}
 	}
 	return ClassifyTierStandard
+}
+
+// toolUseSupported reports whether model has not already been observed, in this
+// process, to reject forced tool use. See Client.toolUseUnsupported.
+func (c *Client) toolUseSupported(model string) bool {
+	_, unsupported := c.toolUseUnsupported.Load(model)
+	return !unsupported
 }
 
 // ============================================================
@@ -190,7 +213,11 @@ func buildBody(email Email, prompts []Prompt) string {
 	}
 	rulesText := sb.String()
 
-	exampleParts := make([]string, min(2, len(prompts)))
+	// The example covers every rule number, not just the first couple — models that
+	// don't support forced tool use (see Client.toolUseUnsupported) only have this
+	// prompt to go on, and a partial example leaves them guessing whether to include
+	// keys for the rules it omitted.
+	exampleParts := make([]string, len(prompts))
 	for i := range exampleParts {
 		exampleParts[i] = fmt.Sprintf(`"%d": false`, i+1)
 	}
@@ -205,9 +232,9 @@ func buildBody(email Email, prompts []Prompt) string {
 
 Rules:
 %s
-Respond with ONLY a JSON object where each key is the rule's number (1, 2, 3...) and the value is true or false.
-Example: {%s}
-No explanation, no markdown, just the JSON object.
+Respond with a single JSON object and nothing else. Include exactly one boolean key per rule number listed above, even when the answer is false — do not omit any rule.
+Example (with a rule for every number, matching the count above): {%s}
+Output ONLY that JSON object. Do not include any explanation, reasoning, preamble, "<think>" block, or markdown code fences before or after it.
 
 Email:
 From: %s
@@ -218,12 +245,204 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
+// classifyToolName is the forced tool that gets Bedrock to return classification
+// results as schema-validated JSON instead of free text (see classifyToolConfig).
+const classifyToolName = "record_labels"
+
+// classifyToolDescription documents the forced tool to the model.
+const classifyToolDescription = "Record true/false for each numbered classification rule."
+
+// classifyToolSchema returns the JSON schema requiring a boolean for every rule
+// number (1-based, matching buildBody's numbering). Shared by classifyToolConfig
+// (the real SDK request) and classifyToolConfigJSON (the human-readable debug/preview
+// request), so the two never drift.
+// jsonTypeKey is the JSON Schema / Bedrock serviceTier "type" field name, factored out
+// because it recurs across the schema, the wire-shaped preview, and serviceTier maps.
+const jsonTypeKey = "type"
+
+func classifyToolSchema(prompts []Prompt) map[string]any {
+	properties := make(map[string]any, len(prompts))
+	required := make([]string, len(prompts))
+	for i := range prompts {
+		key := strconv.Itoa(i + 1)
+		properties[key] = map[string]any{jsonTypeKey: "boolean"}
+		required[i] = key
+	}
+	return map[string]any{
+		jsonTypeKey:            "object",
+		"properties":           properties,
+		"required":             required,
+		"additionalProperties": false,
+	}
+}
+
+// classifyToolConfig builds the forced-tool-use configuration for structured
+// classification output: one tool whose input schema requires a boolean for every
+// rule number. ToolChoice forces the model to call it — this is Bedrock's native
+// structured-output mechanism (see ToolSpecification.Strict), replacing the
+// prompt-coaxed "respond with only JSON" text approach. Not every model supports
+// forced tool use; ClassifyEmailBatch falls back to text parsing when it doesn't.
+func classifyToolConfig(prompts []Prompt) *types.ToolConfiguration {
+	schema := classifyToolSchema(prompts)
+	return &types.ToolConfiguration{
+		Tools: []types.Tool{
+			&types.ToolMemberToolSpec{
+				Value: types.ToolSpecification{
+					Name:        aws.String(classifyToolName),
+					Description: aws.String(classifyToolDescription),
+					InputSchema: &types.ToolInputSchemaMemberJson{Value: document.NewLazyDocument(schema)},
+					Strict:      aws.Bool(true),
+				},
+			},
+		},
+		ToolChoice: &types.ToolChoiceMemberTool{Value: types.SpecificToolChoice{Name: aws.String(classifyToolName)}},
+	}
+}
+
+// classifyToolConfigJSON returns the wire-shaped (Bedrock REST field names, not Go SDK
+// field names) representation of classifyToolConfig for the request-preview/debug JSON.
+// The real SDK ToolConfiguration can't be passed to encoding/json directly: its schema
+// is wrapped in an opaque document.Interface with no MarshalJSON, so it would render as
+// "{}" in the preview.
+func classifyToolConfigJSON(prompts []Prompt) map[string]any {
+	return map[string]any{
+		"tools": []map[string]any{
+			{
+				"toolSpec": map[string]any{
+					"name":        classifyToolName,
+					"description": classifyToolDescription,
+					"inputSchema": map[string]any{"json": classifyToolSchema(prompts)},
+					"strict":      true,
+				},
+			},
+		},
+		"toolChoice": map[string]any{"tool": map[string]any{"name": classifyToolName}},
+	}
+}
+
+// extractToolUse pulls the forced tool call's input out of a Converse response. ok is
+// false when the model didn't call the tool — the model may have ignored the forced
+// ToolChoice, signalling ClassifyEmailBatch to fall back to text parsing.
+func extractToolUse(output types.ConverseOutput, toolName string) (parsed map[string]any, rawJSON string, ok bool) {
+	msg, isMsg := output.(*types.ConverseOutputMemberMessage)
+	if !isMsg {
+		return nil, "", false
+	}
+	for _, block := range msg.Value.Content {
+		tu, isToolUse := block.(*types.ContentBlockMemberToolUse)
+		if !isToolUse || aws.ToString(tu.Value.Name) != toolName || tu.Value.Input == nil {
+			continue
+		}
+		var m map[string]any
+		// SDK quirk: a document.Interface built via document.NewLazyDocument (the
+		// send-side marshaler; used by tests to fake a response) populates m via the
+		// same pointer indirection the real receive-side unmarshaler uses, but then
+		// spuriously errors on internal double-processing of the already-populated
+		// value. Real Bedrock responses decode via the receive-side unmarshaler and
+		// never hit this, so len(m)==0 distinguishes a genuine decode failure from
+		// this cosmetic error.
+		if err := tu.Value.Input.UnmarshalSmithyDocument(&m); err != nil && len(m) == 0 {
+			continue
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		return m, string(b), true
+	}
+	return nil, "", false
+}
+
+// mapKeysToResults converts a {"1": true, "2": false, ...} map (1-based rule index →
+// verdict) into the prompt-ID-keyed result map ClassifyEmailBatch returns. Shared by
+// both the tool-use and text-fallback decode paths.
+func mapKeysToResults(parsed map[string]any, prompts []Prompt) map[int64]bool {
+	results := make(map[int64]bool, len(prompts))
+	for k, v := range parsed {
+		var idx int
+		if _, err := fmt.Sscanf(k, "%d", &idx); err != nil {
+			continue
+		}
+		idx-- // 1-based → 0-based
+		if idx >= 0 && idx < len(prompts) {
+			b, _ := v.(bool)
+			results[prompts[idx].ID] = b
+		}
+	}
+	return results
+}
+
+// extractJSONObject scans s for the first top-level {...} span that is itself valid
+// JSON, and returns it, or "" if none is found. Used to pull classification JSON out of
+// a text-fallback response (see ClassifyEmailBatch) that may be wrapped in prose,
+// markdown fences, or a reasoning model's "<think>...</think>" preamble — anything
+// outside the braces is simply ignored rather than needing to be pattern-matched and
+// stripped. A reasoning model's prose can itself contain unquoted "{...}" asides (e.g.
+// "seems {like a} match") that balance but aren't valid JSON; those are skipped in
+// favor of the next candidate rather than returned as a false match.
+func extractJSONObject(s string) string {
+	for start := strings.IndexByte(s, '{'); start >= 0; {
+		end, ok := balancedBraceEnd(s, start)
+		if !ok {
+			return ""
+		}
+		candidate := s[start : end+1]
+		if json.Valid([]byte(candidate)) {
+			return candidate
+		}
+		next := strings.IndexByte(s[end+1:], '{')
+		if next < 0 {
+			return ""
+		}
+		start = end + 1 + next
+	}
+	return ""
+}
+
+// balancedBraceEnd returns the index of the '}' that closes the '{' at s[start],
+// respecting quoted strings and backslash-escaped characters within them so braces
+// inside string values don't affect nesting depth. ok is false if the braces never
+// balance before the end of s.
+func balancedBraceEnd(s string, start int) (end int, ok bool) {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // classifyPayload returns the request pieces plus the service tier ("flex" or "" for
 // standard) selected for classification.
 func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string, string) {
 	body := buildBody(email, prompts)
-	numPredict := int32(32)
-	if n := len(prompts) * 10; n > 32 {
+	// Floor covers the forced tool-use JSON payload (schema-validated, so no markdown/
+	// prose overhead) plus the fallback's fenced free-text JSON for the same rule count.
+	numPredict := int32(64)
+	if n := len(prompts) * 12; n > 64 {
 		numPredict = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
 	}
 	msgs := []types.Message{
@@ -252,8 +471,11 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 		"messages":        msgs,
 		"inferenceConfig": inf,
 	}
+	if c.toolUseSupported(model) {
+		payload["toolConfig"] = classifyToolConfigJSON(prompts)
+	}
 	if tier == ClassifyTierFlex {
-		payload["serviceTier"] = map[string]string{"type": ClassifyTierFlex}
+		payload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -268,12 +490,16 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 
 	msgs, inf, model, tier := c.classifyPayload(ctx, email, prompts)
+	attemptToolUse := c.toolUseSupported(model)
 
 	reqPayload := map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf}
+	if attemptToolUse {
+		reqPayload["toolConfig"] = classifyToolConfigJSON(prompts)
+	}
 	var svcTier *types.ServiceTier
 	if tier == ClassifyTierFlex {
 		svcTier = &types.ServiceTier{Type: types.ServiceTierTypeFlex}
-		reqPayload["serviceTier"] = map[string]string{"type": ClassifyTierFlex}
+		reqPayload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
 	}
 	reqJSON, marshalErr := json.Marshal(reqPayload)
 	if marshalErr != nil {
@@ -291,15 +517,54 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s, tier: %s)", subject, len(prompts), model, tierLabel))
 
-	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:         aws.String(model),
-		Messages:        msgs,
-		InferenceConfig: inf,
-		ServiceTier:     svcTier,
-	})
-	if err != nil {
-		store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
-		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
+	plainConverse := func() (*bedrockruntime.ConverseOutput, error) {
+		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
+			ModelId:         aws.String(model),
+			Messages:        msgs,
+			InferenceConfig: inf,
+			ServiceTier:     svcTier,
+		})
+	}
+
+	var out *bedrockruntime.ConverseOutput
+	var err error
+	if attemptToolUse {
+		// Preferred path: force tool use so Bedrock returns schema-validated JSON
+		// directly (see classifyToolConfig). Not every model supports forced tool
+		// use — when the call itself fails for that reason, cache that (see
+		// Client.toolUseUnsupported) and retry once without ToolConfig below. When
+		// the call succeeds but the model didn't call the tool anyway, fall through
+		// to the same text-parsing logic used by the retry, applied to this response.
+		out, err = c.br.Converse(ctx, &bedrockruntime.ConverseInput{
+			ModelId:         aws.String(model),
+			Messages:        msgs,
+			InferenceConfig: inf,
+			ServiceTier:     svcTier,
+			ToolConfig:      classifyToolConfig(prompts),
+		})
+		if err == nil {
+			if parsed, rawJSON, ok := extractToolUse(out.Output, classifyToolName); ok {
+				store.Log("INFO", fmt.Sprintf("LLM classify response via tool-use: %d field(s)", len(parsed)))
+				res.RawResponse = rawJSON
+				res.Results = mapKeysToResults(parsed, prompts)
+				return res, nil
+			}
+			store.Log("INFO", "LLM response had no tool-use block; falling back to text parsing")
+		} else {
+			c.toolUseUnsupported.Store(model, struct{}{})
+			store.Log("INFO", fmt.Sprintf("LLM tool-use call failed (%v); disabling tool-use for model %s and retrying without it", err, model))
+			out, err = plainConverse()
+			if err != nil {
+				store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
+				return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
+			}
+		}
+	} else {
+		out, err = plainConverse()
+		if err != nil {
+			store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
+			return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
+		}
 	}
 
 	raw := extractText(out.Output)
@@ -313,25 +578,18 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 	res.RawResponse = raw
 
-	cleaned := strings.TrimSpace(fenceRe.ReplaceAllString(raw, ""))
+	cleaned := extractJSONObject(raw)
+	if cleaned == "" {
+		store.Log("ERROR", "LLM parse error: no JSON object found | raw: "+raw)
+		return res, &Error{Msg: "LLM parse error: no JSON object found in response"}
+	}
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
 		store.Log("ERROR", fmt.Sprintf("LLM parse error: %v | raw: %s", err, raw))
 		return res, &Error{Msg: fmt.Sprintf("LLM parse error: %v", err)}
 	}
 
-	res.Results = make(map[int64]bool, len(prompts))
-	for k, v := range parsed {
-		var idx int
-		if _, err := fmt.Sscanf(k, "%d", &idx); err != nil {
-			continue
-		}
-		idx-- // 1-based → 0-based
-		if idx >= 0 && idx < len(prompts) {
-			b, _ := v.(bool)
-			res.Results[prompts[idx].ID] = b
-		}
-	}
+	res.Results = mapKeysToResults(parsed, prompts)
 	return res, nil
 }
 

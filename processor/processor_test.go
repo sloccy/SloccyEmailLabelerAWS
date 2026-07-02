@@ -413,7 +413,7 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 	var mu sync.Mutex
 	seen := make(map[string]bool, n)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		msg := gmailpkg.Message{ID: fmt.Sprintf("msg%d", i), Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
 		wg.Add(1)
 		sem <- struct{}{}
