@@ -30,7 +30,7 @@ func main() {
 		// EventBridge invokes this via the Lambda Runtime API; lambda.Start keeps the
 		// process alive between scheduled invocations. Build deps once here (not per
 		// invocation) so warm invokes skip the redundant client/config/seed work.
-		store, llmClient, gmailAuth, _ := buildDeps(cfg)
+		store, llmClient, gmailAuth := buildDeps(cfg)
 		lambda.Start(func(ctx context.Context) error {
 			scanOnce(ctx, store, llmClient, gmailAuth, &cfg)
 			return nil
@@ -42,7 +42,7 @@ func main() {
 	}
 }
 
-func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
+func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth) {
 	store, err := db.Open()
 	if err != nil {
 		log.Fatalf("open db: %v", err)
@@ -53,17 +53,13 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 	if err := store.SeedSetting(llm.SettingImproveModel, cfg.BedrockModel); err != nil {
 		log.Fatalf("seed improve_model: %v", err)
 	}
-	secretKey, err := store.GetOrCreateSecretKey()
-	if err != nil {
-		log.Fatalf("secret key: %v", err)
-	}
 	llmClient := llm.NewClient(store, cfg.BedrockModel)
 	gmailAuth := gmail.NewAuth()
-	return store, llmClient, gmailAuth, secretKey
+	return store, llmClient, gmailAuth
 }
 
 func runWeb(cfg Config) {
-	store, llmClient, gmailAuth, secretKey := buildDeps(cfg)
+	store, llmClient, gmailAuth := buildDeps(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -71,9 +67,16 @@ func runWeb(cfg Config) {
 	// Scheduled scanning is handled by the ScanFunction (EventBridge, fixed daily 2 AM ET
 	// cron — see ScanSchedule in template.yaml); the web UI's "Scan Now" runs an on-demand
 	// pass in-process via scanOnce.
-	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg, secretKey)
+	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg)
 	handler := newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv)
 
+	serveHTTP(ctx, handler)
+}
+
+// serveHTTP runs an HTTP server on AWS_LWA_PORT (default 5000) with handler, behind the
+// Lambda Web Adapter, shutting down gracefully when ctx is cancelled. Shared by runWeb
+// and runPush — the two Function URL-backed modes need identical bootstrap/shutdown.
+func serveHTTP(ctx context.Context, handler http.Handler) {
 	port := os.Getenv("AWS_LWA_PORT")
 	if port == "" {
 		port = "5000"

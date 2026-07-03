@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/sloccy/ollamail-aws/llm"
+	"github.com/sloccy/ollamail-aws/processor"
 )
 
 type Config struct {
@@ -51,6 +52,21 @@ func loadConfig() Config {
 		CfAccessAud:        getEnv("CF_ACCESS_AUD", ""),
 
 		ClassifyConcurrency: getEnvInt("CLASSIFY_CONCURRENCY", 6),
+	}
+}
+
+// processConfig builds the processor.ProcessConfig shared by the scheduled scan and the
+// push webhook, which otherwise rebuild the same fields from Config independently.
+// suppressEmptyLog is true for push (frequent, often a no-op notification) and false for
+// scan (once daily, worth logging even when nothing new was found).
+func (c *Config) processConfig(suppressEmptyLog bool) processor.ProcessConfig {
+	return processor.ProcessConfig{
+		LookbackHours:       c.GmailLookbackHours,
+		MaxResults:          int64(c.GmailMaxResults),
+		BodyTruncation:      c.EmailBodyTrunc,
+		DebugLogging:        c.DebugLogging,
+		ClassifyConcurrency: c.ClassifyConcurrency,
+		SuppressEmptyLog:    suppressEmptyLog,
 	}
 }
 
