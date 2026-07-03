@@ -177,7 +177,9 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 			_ = gmail.BatchModifyEmails(ctx, svc, addModifies)
 		}
 
-		// Reverse removed prompts
+		// Reverse removed prompts. Derives from the same action→label mapping
+		// ModifyForPrompt uses (see processor.ReverseModifyForPrompt) so the add and remove
+		// paths can't drift apart.
 		var removeModifies []gmail.Modify
 		var trashReverseIDs []string
 		for _, pid := range removedIDs {
@@ -185,24 +187,11 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			mod := gmail.Modify{MessageIDs: []string{row.MessageID}}
-			if p.LabelName != "" {
-				if labelID, ok := labelCache[p.LabelName]; ok {
-					mod.RemoveLabels = append(mod.RemoveLabels, labelID)
-				}
-			}
-			switch {
-			case p.ActionSpam != 0:
-				mod.RemoveLabels = append(mod.RemoveLabels, gmail.LabelSpam)
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelInbox)
-			case p.ActionTrash != 0:
+			mod, untrash := processor.ReverseModifyForPrompt(p, labelCache[p.LabelName])
+			mod.MessageIDs = []string{row.MessageID}
+			if untrash {
 				// Untrash: remove TRASH, add INBOX
 				trashReverseIDs = append(trashReverseIDs, row.MessageID)
-			case p.ActionArchive != 0:
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelInbox)
-			}
-			if p.ActionMarkRead != 0 {
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelUnread)
 			}
 			if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
 				removeModifies = append(removeModifies, mod)

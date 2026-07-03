@@ -33,6 +33,30 @@ func mustMarshalMap(v any) map[string]types.AttributeValue {
 	return item
 }
 
+// keyedItem marshals v (a model struct with dynamodbav tags) and stamps it with the
+// DynamoDB key attributes, plus a TTL attribute when ttl > 0. Shared by the per-entity
+// xToItem builders below so the PK/SK/TTL stamping can't drift between them.
+func keyedItem(v any, pk, sk string, ttl int64) map[string]types.AttributeValue {
+	item := mustMarshalMap(v)
+	item["PK"] = sv(pk)
+	item["SK"] = sv(sk)
+	if ttl > 0 {
+		item[attrTTL] = nv(ttl)
+	}
+	return item
+}
+
+// unmarshalItem unmarshals a DynamoDB item into T, logging (not returning) any error —
+// matching the existing itemToX helpers' "best effort, zero value on failure" behavior,
+// since callers only ever pass items this same package wrote via mustMarshalMap/keyedItem.
+func unmarshalItem[T any](it map[string]types.AttributeValue) T {
+	var v T
+	if err := attributevalue.UnmarshalMap(it, &v); err != nil {
+		slog.Error("unmarshal item", "type", fmt.Sprintf("%T", v), "err", err)
+	}
+	return v
+}
+
 // Store wraps a DynamoDB client. All methods are safe for concurrent use.
 type Store struct {
 	ddb   *dynamodb.Client
@@ -343,20 +367,12 @@ func (s *Store) Log(level, message string) {
 }
 
 func logItem(id int64, ts string, arg LogEntry) map[string]types.AttributeValue {
-	item := mustMarshalMap(Log{ID: id, Timestamp: ts, Level: arg.Level, Message: arg.Message})
-	item["PK"] = sv("LOG")
-	item["SK"] = sv(tsKey(ts, id))
-	item[attrTTL] = nv(ttlDays(90)) // generous TTL; TrimLogs is also called
-	return item
+	// ttlDays(90) is a generous backstop; TrimLogs enforces the real (shorter, configurable)
+	// LogRetentionDays policy.
+	return keyedItem(Log{ID: id, Timestamp: ts, Level: arg.Level, Message: arg.Message}, "LOG", tsKey(ts, id), ttlDays(90))
 }
 
-func itemToLog(it map[string]types.AttributeValue) Log {
-	var l Log
-	if err := attributevalue.UnmarshalMap(it, &l); err != nil {
-		slog.Error("unmarshal log", "err", err)
-	}
-	return l
-}
+func itemToLog(it map[string]types.AttributeValue) Log { return unmarshalItem[Log](it) }
 
 func (s *Store) AddLog(ctx context.Context, arg AddLogParams) error {
 	id, err := s.nextID(ctx, "logs")
@@ -442,19 +458,10 @@ func (s *Store) QueriesTrimLogs(ctx context.Context, cutoff string) error {
 // ============================================================
 
 func accountItem(a Account) map[string]types.AttributeValue {
-	item := mustMarshalMap(a)
-	item["PK"] = sv("ACCOUNT")
-	item["SK"] = sv(padID(a.ID))
-	return item
+	return keyedItem(a, "ACCOUNT", padID(a.ID), 0)
 }
 
-func itemToAccount(it map[string]types.AttributeValue) Account {
-	var a Account
-	if err := attributevalue.UnmarshalMap(it, &a); err != nil {
-		slog.Error("unmarshal account", "err", err)
-	}
-	return a
-}
+func itemToAccount(it map[string]types.AttributeValue) Account { return unmarshalItem[Account](it) }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
@@ -707,19 +714,10 @@ func (s *Store) DeleteAccountCascade(ctx context.Context, accountID int64) error
 // Prompts
 // ============================================================
 
-func itemToPrompt(it map[string]types.AttributeValue) Prompt {
-	var p Prompt
-	if err := attributevalue.UnmarshalMap(it, &p); err != nil {
-		slog.Error("unmarshal prompt", "err", err)
-	}
-	return p
-}
+func itemToPrompt(it map[string]types.AttributeValue) Prompt { return unmarshalItem[Prompt](it) }
 
 func promptToItem(p Prompt) map[string]types.AttributeValue {
-	item := mustMarshalMap(p)
-	item["PK"] = sv("PROMPT")
-	item["SK"] = sv(padID(p.ID))
-	return item
+	return keyedItem(p, "PROMPT", padID(p.ID), 0)
 }
 
 func (s *Store) listAllPrompts(ctx context.Context) ([]Prompt, error) {
@@ -1029,18 +1027,14 @@ func (s *Store) ReorderPrompts(ctx context.Context, ids []int64) error {
 // ============================================================
 
 func itemToHistory(it map[string]types.AttributeValue) CategorizationHistory {
-	var h CategorizationHistory
-	if err := attributevalue.UnmarshalMap(it, &h); err != nil {
-		slog.Error("unmarshal history", "err", err)
-	}
-	return h
+	return unmarshalItem[CategorizationHistory](it)
 }
 
 // historyItem builds a history item from id/ts (allocated by the caller) plus a
 // HistoryEntry write DTO. ttl isn't part of CategorizationHistory (it's DynamoDB-internal
 // expiry, never read back into the model), so it's added after marshaling.
 func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.AttributeValue {
-	item := mustMarshalMap(CategorizationHistory{
+	return keyedItem(CategorizationHistory{
 		ID:           id,
 		Timestamp:    ts,
 		AccountID:    arg.AccountID,
@@ -1053,11 +1047,7 @@ func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.Attribu
 		LabelName:    arg.LabelName,
 		Actions:      arg.Actions,
 		LlmResponse:  arg.LlmResponse,
-	})
-	item["PK"] = sv(pkHistory(arg.AccountID))
-	item["SK"] = sv(tsKey(ts, id))
-	item[attrTTL] = nv(ttlDays(90))
-	return item
+	}, pkHistory(arg.AccountID), tsKey(ts, id), ttlDays(90))
 }
 
 func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
@@ -1734,15 +1724,11 @@ func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID str
 // ============================================================
 
 func itemToSuggestion(it map[string]types.AttributeValue) PromptSuggestion {
-	var sg PromptSuggestion
-	if err := attributevalue.UnmarshalMap(it, &sg); err != nil {
-		slog.Error("unmarshal suggestion", "err", err)
-	}
-	return sg
+	return unmarshalItem[PromptSuggestion](it)
 }
 
 func suggestionItem(id int64, ts string, arg InsertPromptSuggestionParams) map[string]types.AttributeValue {
-	item := mustMarshalMap(PromptSuggestion{
+	return keyedItem(PromptSuggestion{
 		ID:                    id,
 		CreatedAt:             ts,
 		UpdatedAt:             ts,
@@ -1758,10 +1744,7 @@ func suggestionItem(id int64, ts string, arg InsertPromptSuggestionParams) map[s
 		ConversationJSON:      arg.ConversationJSON,
 		UserComment:           "",
 		Status:                arg.Status,
-	})
-	item["PK"] = sv("SUGGESTION")
-	item["SK"] = sv(padID(id))
-	return item
+	}, "SUGGESTION", padID(id), 0)
 }
 
 func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSuggestionParams) (int64, error) {
@@ -1941,7 +1924,7 @@ func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, sugges
 // ============================================================
 
 func llmDebugItem(id int64, ts string, arg AddLlmDebugParams) map[string]types.AttributeValue {
-	item := mustMarshalMap(LlmDebug{
+	return keyedItem(LlmDebug{
 		ID:           id,
 		Timestamp:    ts,
 		AccountID:    arg.AccountID,
@@ -1952,10 +1935,7 @@ func llmDebugItem(id int64, ts string, arg AddLlmDebugParams) map[string]types.A
 		GmailRaw:     arg.GmailRaw,
 		LlmRequest:   arg.LlmRequest,
 		LlmResponse:  arg.LlmResponse,
-	})
-	item["PK"] = sv("LLM_DEBUG")
-	item["SK"] = sv(padID(id))
-	return item
+	}, "LLM_DEBUG", padID(id), 0)
 }
 
 func (s *Store) AddLlmDebug(ctx context.Context, arg AddLlmDebugParams) error {
@@ -2015,13 +1995,7 @@ func (s *Store) GetLatestLlmDebug(ctx context.Context) ([]LlmDebug, error) {
 	return result, nil
 }
 
-func itemToLlmDebug(it map[string]types.AttributeValue) LlmDebug {
-	var d LlmDebug
-	if err := attributevalue.UnmarshalMap(it, &d); err != nil {
-		slog.Error("unmarshal llm debug", "err", err)
-	}
-	return d
-}
+func itemToLlmDebug(it map[string]types.AttributeValue) LlmDebug { return unmarshalItem[LlmDebug](it) }
 
 func (s *Store) RecordLlmDebug(ctx context.Context, e AddLlmDebugParams) error {
 	if err := s.AddLlmDebug(ctx, e); err != nil {
