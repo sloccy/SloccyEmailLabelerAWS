@@ -38,6 +38,6 @@ jobs:
       - name: golangci-lint
         # v7 of the action supports golangci-lint v2 (our .golangci.yml is version "2").
         # Pin to a v2 build compiled with Go >= our go.mod toolchain.
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
