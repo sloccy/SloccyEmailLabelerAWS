@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -198,6 +199,40 @@ func (s *Store) nextIDs(ctx context.Context, entity string, n int) (start int64,
 	return 0, errors.New("counter response missing seq")
 }
 
+// localIDSeqBits sizes the per-process sequence counter packed into the low bits of a
+// localID(): 20 bits gives ~1M distinct ids per millisecond within one process, several
+// orders of magnitude beyond this app's actual write rate.
+const localIDSeqBits = 20
+
+var localIDSeq atomic.Uint32
+
+// localID generates a process-local, time-ordered, collision-safe int64 without a
+// DynamoDB round trip: a millisecond timestamp (top bits) plus an atomic per-process
+// sequence (low localIDSeqBits bits) to dedupe ids minted within the same millisecond.
+// Used by logs and history — both are keyed by tsKey(ts, id), where the timestamp prefix
+// already carries the real sort order, so the id only needs to be unique, not strictly
+// ordered; this generator's rough time-ordering is a free bonus, not a requirement.
+//
+// Scoped to logs/history only: other entities either round-trip their id through
+// client-side JS as a JSON number (prompts, static/app.js's reorder feature — unsafe
+// above 2^53, which a time-based id routinely exceeds) or rely on "highest id = most
+// recent" for actual ordering (suggestions, llm_debug) rather than a stored timestamp, so
+// they stay on the nextID/nextIDs counter.
+func localID() int64 {
+	ms := time.Now().UnixMilli()
+	seq := int64(localIDSeq.Add(1)) & (1<<localIDSeqBits - 1)
+	return ms<<localIDSeqBits | seq
+}
+
+// localIDs generates n distinct localID() values.
+func localIDs(n int) []int64 {
+	ids := make([]int64, n)
+	for i := range ids {
+		ids[i] = localID()
+	}
+	return ids
+}
+
 // ============================================================
 // Query helpers
 // ============================================================
@@ -380,13 +415,9 @@ func logItem(id int64, ts string, arg LogEntry) map[string]types.AttributeValue 
 func itemToLog(it map[string]types.AttributeValue) Log { return unmarshalItem[Log](it) }
 
 func (s *Store) AddLog(ctx context.Context, arg AddLogParams) error {
-	id, err := s.nextID(ctx, "logs")
-	if err != nil {
-		return err
-	}
-	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      logItem(id, Now(), arg),
+		Item:      logItem(localID(), Now(), arg),
 	})
 	return err
 }
@@ -1037,13 +1068,9 @@ func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.Attribu
 }
 
 func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
-	id, err := s.nextID(ctx, "history")
-	if err != nil {
-		return err
-	}
-	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item:      historyItem(id, Now(), arg),
+		Item:      historyItem(localID(), Now(), arg),
 	})
 	return err
 }
@@ -1382,21 +1409,15 @@ func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntr
 	items := make([]map[string]types.AttributeValue, 0, len(logs)+len(history))
 
 	if len(logs) > 0 {
-		start, err := s.nextIDs(ctx, "logs", len(logs))
-		if err != nil {
-			return err
-		}
+		ids := localIDs(len(logs))
 		for i, l := range logs {
-			items = append(items, logItem(start+int64(i), ts, l))
+			items = append(items, logItem(ids[i], ts, l))
 		}
 	}
 	if len(history) > 0 {
-		start, err := s.nextIDs(ctx, "history", len(history))
-		if err != nil {
-			return err
-		}
+		ids := localIDs(len(history))
 		for i, h := range history {
-			items = append(items, historyItem(start+int64(i), ts, h))
+			items = append(items, historyItem(ids[i], ts, h))
 		}
 	}
 	if len(items) > 0 {
