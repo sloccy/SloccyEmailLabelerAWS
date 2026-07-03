@@ -263,11 +263,15 @@ func classifyToolSchema(prompts []Prompt) map[string]any {
 		properties[key] = map[string]any{jsonTypeKey: "boolean"}
 		required[i] = key
 	}
+	// additionalProperties is deliberately omitted: AWS's Nova tool-use troubleshooting
+	// guide lists it as an unsupported top-level schema field for Nova ("Common
+	// unsupported fields at the top level are: $schema, description, title, and
+	// additionalProperties"), and required already lists every rule key, so it wasn't
+	// adding real enforcement anyway.
 	return map[string]any{
-		jsonTypeKey:            "object",
-		"properties":           properties,
-		"required":             required,
-		"additionalProperties": false,
+		jsonTypeKey:  "object",
+		"properties": properties,
+		"required":   required,
 	}
 }
 
@@ -432,10 +436,15 @@ func balancedBraceEnd(s string, start int) (end int, ok bool) {
 // standard) selected for classification.
 func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration) {
 	body := buildBody(email, prompts)
-	// Floor covers the forced tool-use JSON payload (schema-validated, so no markdown/
-	// prose overhead) plus the fallback's fenced free-text JSON for the same rule count.
-	numPredict := int32(64)
-	if n := len(prompts) * 12; n > 64 {
+	// Nova emits <thinking> chain-of-thought content as ordinary output tokens even
+	// under forced ToolChoice (AWS's Nova tool-use troubleshooting guide: "Amazon Nova
+	// uses chain-of-thought reasoning when calling a tool. You will see this output in
+	// the response in <thinking> tags."). Too small a MaxTokens truncates that mid-stream,
+	// which Bedrock reports as ModelErrorException "invalid sequence as part of ToolUse".
+	// 3000 is AWS's documented starting point for this error; it's a ceiling, not a
+	// target, so it costs nothing when the model finishes well under it.
+	numPredict := int32(3000)
+	if n := len(prompts) * 12; n > 3000 {
 		numPredict = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
 	}
 	msgs := []types.Message{
