@@ -36,9 +36,8 @@ type promptCheckbox struct {
 }
 
 func (s *server) handleRecategorizeForm(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -53,12 +52,7 @@ func (s *server) handleRecategorizeForm(w http.ResponseWriter, r *http.Request) 
 		currentIDs = map[int64]bool{}
 	}
 
-	var prompts []db.Prompt
-	if row.AccountID != 0 {
-		prompts, _ = s.store.ListActivePromptsByAccount(ctx, sql.NullInt64{Int64: row.AccountID, Valid: true})
-	} else {
-		prompts, _ = s.store.ListActivePrompts(ctx)
-	}
+	prompts, _ := s.store.ListActivePromptsForAccount(ctx, row.AccountID)
 
 	checkboxes := make([]promptCheckbox, len(prompts))
 	for i, p := range prompts {
@@ -77,9 +71,8 @@ func (s *server) handleRecategorizeForm(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -118,12 +111,7 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	currentIDs, _ := s.store.GetCurrentPromptIDsForMessage(ctx, row.AccountID, row.MessageID)
 
 	// Load all prompts for this account (to get labels + actions)
-	var allPrompts []db.Prompt
-	if row.AccountID != 0 {
-		allPrompts, _ = s.store.ListActivePromptsByAccount(ctx, sql.NullInt64{Int64: row.AccountID, Valid: true})
-	} else {
-		allPrompts, _ = s.store.ListActivePrompts(ctx)
-	}
+	allPrompts, _ := s.store.ListActivePromptsForAccount(ctx, row.AccountID)
 	promptByID := make(map[int64]db.Prompt, len(allPrompts))
 	for _, p := range allPrompts {
 		promptByID[p.ID] = p

@@ -66,6 +66,12 @@ Parameters:
     Type: String
     Default: ""
     Description: Cloudflare Access application Audience (AUD) tag
+  # Lambda Web Adapter layer (arm64) — lets the custom-runtime binary serve plain HTTP.
+  # Referenced by both WebFunction and PushFunction via !Sub (below) so the region stays
+  # dynamic (${AWS::Region}); only the version number is duplicated, and only here.
+  LambdaWebAdapterLayerVersion:
+    Type: Number
+    Default: 28
 
 Conditions:
   CfAccessEnabled: !Not [!Equals [!Ref CfAccessAud, ""]]
@@ -196,7 +202,7 @@ Resources:
       # forwarded from the Function URL. AWS_LAMBDA_EXEC_WRAPPER below points at
       # this layer's /opt/bootstrap wrapper script.
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:28
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:${LambdaWebAdapterLayerVersion}
       FunctionUrlConfig:
         # AWS_IAM when Cloudflare Access is off (CfAccessAud unset): only requests
         # signed with your AWS credentials can reach it — browse locally with the
@@ -350,7 +356,7 @@ Resources:
       Timeout: 900
       # Lambda Web Adapter layer — see WebFunction above for why this is needed.
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:28
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:${LambdaWebAdapterLayerVersion}
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED

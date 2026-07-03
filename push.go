@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -37,7 +36,7 @@ type pushHandler struct {
 // runPush serves the push webhook behind the Lambda Web Adapter (public Function URL).
 // Auth is enforced in-app by validating the Google-signed OIDC token on each request.
 func runPush(cfg Config) {
-	store, llmClient, gmailAuth, _ := buildDeps(cfg)
+	store, llmClient, gmailAuth := buildDeps(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -48,27 +47,7 @@ func runPush(cfg Config) {
 	// Health check for the adapter / manual probes.
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
-	port := os.Getenv("AWS_LWA_PORT")
-	if port == "" {
-		port = "5000"
-	}
-	httpSrv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		slog.Info("push listening", "addr", httpSrv.Addr)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server: %v", err)
-		}
-	}()
-
-	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	serveHTTP(ctx, mux)
 }
 
 // pubsubPush is the envelope Pub/Sub POSTs; message.data is base64 Gmail notification JSON.
@@ -143,14 +122,7 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 	if err != nil {
 		return fmt.Errorf("list prompts: %w", err)
 	}
-	procCfg := processor.ProcessConfig{
-		LookbackHours:       h.cfg.GmailLookbackHours,
-		MaxResults:          int64(h.cfg.GmailMaxResults),
-		BodyTruncation:      h.cfg.EmailBodyTrunc,
-		DebugLogging:        h.cfg.DebugLogging,
-		ClassifyConcurrency: h.cfg.ClassifyConcurrency,
-		SuppressEmptyLog:    true,
-	}
+	procCfg := h.cfg.processConfig(true)
 	start := time.Now()
 	// History-driven: only new inbox messages since the stored history id are processed,
 	// so our own label/read changes don't retrigger. Advance the stored id afterwards.

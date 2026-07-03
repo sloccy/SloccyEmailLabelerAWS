@@ -2,9 +2,7 @@ package db
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -334,29 +332,6 @@ func (s *Store) GetAllSettings(ctx context.Context) ([]Setting, error) {
 		items = append(items, Setting{Key: key, Value: getStr(it, "val")})
 	}
 	return items, nil
-}
-
-// ============================================================
-// Secret key (stored as a setting)
-// ============================================================
-
-func (s *Store) GetOrCreateSecretKey() ([]byte, error) {
-	ctx := context.Background()
-	val, err := s.GetSetting(ctx, "secret_key")
-	if err == nil {
-		b, e := hex.DecodeString(val)
-		if e == nil {
-			return b, nil
-		}
-	}
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, err
-	}
-	if err := s.SetSetting(ctx, SetSettingParams{Key: "secret_key", Value: hex.EncodeToString(key)}); err != nil {
-		return nil, err
-	}
-	return key, nil
 }
 
 // ============================================================
@@ -824,6 +799,17 @@ func (s *Store) ListActivePromptsByAccount(ctx context.Context, accountID sql.Nu
 	return filtered, nil
 }
 
+// ListActivePromptsForAccount returns the active prompts scoped to accountID, or every
+// active prompt when accountID is 0 (the "no specific account" case some history rows
+// have). Small wrapper so callers don't hand-roll the ListActivePromptsByAccount vs.
+// ListActivePrompts branch themselves.
+func (s *Store) ListActivePromptsForAccount(ctx context.Context, accountID int64) ([]Prompt, error) {
+	if accountID != 0 {
+		return s.ListActivePromptsByAccount(ctx, sql.NullInt64{Int64: accountID, Valid: true})
+	}
+	return s.ListActivePrompts(ctx)
+}
+
 func (s *Store) GetPrompt(ctx context.Context, id int64) (Prompt, error) {
 	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.table),
@@ -1216,11 +1202,7 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 	return filtered, nil
 }
 
-// GetHistory returns the N most recent history rows across all accounts.
-func (s *Store) GetHistory(ctx context.Context, limit int64) ([]CategorizationHistory, error) {
-	return s.GetHistoryFiltered(ctx, HistoryFilter{Limit: limit})
-}
-
+// DeleteHistoryByAccount deletes every history row for one account.
 func (s *Store) DeleteHistoryByAccount(ctx context.Context, accountID int64) error {
 	return s.deleteAllByPK(ctx, pkHistory(accountID))
 }
@@ -2039,27 +2021,6 @@ func itemToLlmDebug(it map[string]types.AttributeValue) LlmDebug {
 		slog.Error("unmarshal llm debug", "err", err)
 	}
 	return d
-}
-
-func (s *Store) DeleteIncompleteLlmDebug(ctx context.Context) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		FilterExpression:       aws.String("gmailRaw = :empty OR llmRequest = :empty"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK:   sv("LLM_DEBUG"),
-			":empty": sv(""),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
 }
 
 func (s *Store) RecordLlmDebug(ctx context.Context, e AddLlmDebugParams) error {

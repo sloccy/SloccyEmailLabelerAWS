@@ -14,9 +14,9 @@ import (
 )
 
 // trimInterval bounds how often the DynamoDB retention trims run. The scan process stays
-// warm across EventBridge invocations, so an in-process timestamp keeps the once-a-minute
-// scan from issuing the (relatively expensive) trim queries every pass. DynamoDB TTL handles
-// expiry between trims.
+// warm across EventBridge invocations, so an in-process timestamp keeps the daily scan (and
+// any push-triggered warm invokes) from issuing the (relatively expensive) trim queries every
+// pass. DynamoDB TTL handles expiry between trims.
 const trimInterval = time.Hour
 
 var (
@@ -55,13 +55,7 @@ func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmail
 		return
 	}
 
-	procCfg := processor.ProcessConfig{
-		LookbackHours:       cfg.GmailLookbackHours,
-		MaxResults:          int64(cfg.GmailMaxResults),
-		BodyTruncation:      cfg.EmailBodyTrunc,
-		DebugLogging:        cfg.DebugLogging,
-		ClassifyConcurrency: cfg.ClassifyConcurrency,
-	}
+	procCfg := cfg.processConfig(false)
 
 	for _, account := range accounts {
 		if account.Active == 0 {

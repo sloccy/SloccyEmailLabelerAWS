@@ -53,12 +53,14 @@ func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bo
 	return mod, trash
 }
 
-// setupAccountContext loads OAuth config, creates a Gmail client, and filters
-// prompts for the given account. Shared by ProcessAccount and BackfillLlmDebug.
-func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt) (*gmailpkg.Client, []db.Prompt, error) {
+// NewAccountGmailService builds an authenticated Gmail client for account, wiring the
+// OAuth token-refresh callback to persist any rotated credentials back to store. Shared
+// by setupAccountContext (scan/push) and the web server's ad-hoc Gmail lookups
+// (retention labels, recategorize) so both paths build the client identically.
+func NewAccountGmailService(ctx context.Context, store db.StoreIface, gmailAuth *gmailpkg.Auth, account db.Account) (*gmailpkg.Client, error) {
 	oauthCfg, err := gmailAuth.Config()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load oauth config: %w", err)
+		return nil, fmt.Errorf("load oauth config: %w", err)
 	}
 	svc, err := gmailpkg.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 		_ = store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
@@ -67,7 +69,17 @@ func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gm
 		})
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("create gmail service: %w", err)
+		return nil, fmt.Errorf("create gmail service: %w", err)
+	}
+	return svc, nil
+}
+
+// setupAccountContext creates a Gmail client and filters prompts for the given account.
+// Shared by ProcessAccount and the account-history backfill/reprocessing paths.
+func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt) (*gmailpkg.Client, []db.Prompt, error) {
+	svc, err := NewAccountGmailService(ctx, store, gmailAuth, account)
+	if err != nil {
+		return nil, nil, err
 	}
 	return svc, filterPrompts(allPrompts, account.ID), nil
 }
