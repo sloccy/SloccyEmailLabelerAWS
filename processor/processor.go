@@ -153,7 +153,9 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 		return fmt.Errorf("filter unprocessed: %w", err)
 	}
 	if len(unprocessed) == 0 {
-		store.Log("INFO", fmt.Sprintf("[%s] No new emails to process.", account.Email))
+		if !cfg.SuppressEmptyLog {
+			store.Log("INFO", fmt.Sprintf("[%s] No new emails to process.", account.Email))
+		}
 		_ = store.UpdateLastScan(ctx, account.ID)
 		return nil
 	}
@@ -400,6 +402,11 @@ type ProcessConfig struct {
 	// ClassifyConcurrency caps how many emails are classified against Bedrock in parallel.
 	// <= 0 falls back to 1 (fully sequential) — see classifyConcurrency.
 	ClassifyConcurrency int
+	// SuppressEmptyLog silences the "No new emails to process." log when there's nothing
+	// new. Set by the push path, where a no-op run is routine (any inbox touch — read,
+	// star, our own label add — wakes the webhook) and would otherwise spam the activity
+	// feed; left false for the once-daily scan, where it's a useful "scan ran" signal.
+	SuppressEmptyLog bool
 }
 
 // classifyConcurrency guards against a zero/negative config value collapsing the semaphore
