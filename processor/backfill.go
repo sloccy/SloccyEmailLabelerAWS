@@ -15,7 +15,7 @@ import (
 // and rebuilds the LLM request JSON locally (no LLM call). llm_response is
 // taken from categorization_history. If the table already has any rows, this is
 // a no-op.
-func BackfillLlmDebug(ctx context.Context, store *db.Store, ollamaClient *llm.Client, gmailAuth *gmailpkg.Auth, cfg ProcessConfig) error {
+func BackfillLlmDebug(ctx context.Context, store *db.Store, llmClient *llm.Client, gmailAuth *gmailpkg.Auth, cfg ProcessConfig) error {
 	// Purge rows missing gmail_raw or llm_request so the backfill can retry
 	// rather than being stuck on incomplete rows from a prior boot.
 	if err := store.DeleteIncompleteLlmDebug(ctx); err != nil {
@@ -105,7 +105,7 @@ func BackfillLlmDebug(ctx context.Context, store *db.Store, ollamaClient *llm.Cl
 			for j, p := range entry.prompts {
 				llmPrompts[j] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
 			}
-			llmRequest = ollamaClient.BuildClassifyRequestJSON(llm.Email{
+			llmRequest = llmClient.BuildClassifyRequestJSON(llm.Email{
 				Sender:  msg.Sender,
 				Subject: msg.Subject,
 				Body:    msg.Body,

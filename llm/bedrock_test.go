@@ -179,7 +179,7 @@ func TestClassifyEmailBatch_ToolUseSuccess(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts())
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestClassifyEmailBatch_FallsBackWhenNoToolUseBlock(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts())
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestClassifyEmailBatch_FallsBackWhenToolCallErrors(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts())
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestClassifyEmailBatch_BothCallsFail(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts())
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err == nil {
 		t.Fatal("expected error when both the tool-use call and the fallback fail")
 	}
@@ -298,7 +298,7 @@ func TestClassifyEmailBatch_FallbackParsesThinkBlockPreamble(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts())
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}

@@ -3,6 +3,7 @@ package gmail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -27,14 +28,13 @@ var scopes = []string{
 
 // Auth handles OAuth2 for Gmail.
 type Auth struct {
-	credentialsFile string
-	once            sync.Once
-	cachedCfg       *oauth2.Config
-	cachedErr       error
+	once      sync.Once
+	cachedCfg *oauth2.Config
+	cachedErr error
 }
 
-func NewAuth(credentialsFile string) *Auth {
-	return &Auth{credentialsFile: credentialsFile}
+func NewAuth() *Auth {
+	return &Auth{}
 }
 
 // ssmFetch reads a SecureString parameter and returns its decrypted value.
@@ -62,7 +62,6 @@ func (a *Auth) loadConfig() (*oauth2.Config, error) {
 		// Credential source precedence:
 		//  1. CREDENTIALS_JSON env var (raw JSON).
 		//  2. SSM SecureString named by CREDENTIALS_SSM_PARAM (used in Lambda).
-		//  3. Local credentials file (used in local/dev runs).
 		var data []byte
 		if raw := os.Getenv("CREDENTIALS_JSON"); raw != "" {
 			data = []byte(raw)
@@ -74,12 +73,8 @@ func (a *Auth) loadConfig() (*oauth2.Config, error) {
 			}
 			data = []byte(raw)
 		} else {
-			var err error
-			data, err = os.ReadFile(a.credentialsFile)
-			if err != nil {
-				a.cachedErr = fmt.Errorf("read credentials file: %w", err)
-				return
-			}
+			a.cachedErr = errors.New("no credentials source configured (set CREDENTIALS_JSON or CREDENTIALS_SSM_PARAM)")
+			return
 		}
 		cfg, err := google.ConfigFromJSON(data, scopes...)
 		if err != nil {
@@ -152,7 +147,7 @@ func TokenFromJSON(data string) (*oauth2.Token, error) {
 	return &token, nil
 }
 
-// ConfigFromFile returns the oauth2.Config from the credentials file.
-func (a *Auth) ConfigFromFile() (*oauth2.Config, error) {
+// Config returns the resolved oauth2.Config (env var or SSM), cached after first load.
+func (a *Auth) Config() (*oauth2.Config, error) {
 	return a.loadConfig()
 }

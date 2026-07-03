@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/hex"
 	"strings"
 	"testing"
@@ -35,9 +34,10 @@ func TestBuildAccountMap_Empty(t *testing.T) {
 }
 
 func TestToAccountViews(t *testing.T) {
+	lastScan := "2024-01-02 00:00:00"
 	rows := []db.ListAccountsSafeRow{
-		{ID: 1, Email: "x@example.com", Active: 1, AddedAt: "2024-01-01 00:00:00", LastScanAt: sql.NullString{String: "2024-01-02 00:00:00", Valid: true}},
-		{ID: 2, Email: "y@example.com", Active: 0, AddedAt: "2024-02-01 00:00:00", LastScanAt: sql.NullString{}},
+		{ID: 1, Email: "x@example.com", Active: 1, AddedAt: "2024-01-01 00:00:00", LastScanAt: &lastScan},
+		{ID: 2, Email: "y@example.com", Active: 0, AddedAt: "2024-02-01 00:00:00", LastScanAt: nil},
 	}
 	views := toAccountViews(rows)
 	if len(views) != 2 {
@@ -60,13 +60,14 @@ func TestToAccountViews(t *testing.T) {
 		t.Error("views[1].Active should be false (Active=0)")
 	}
 	if v1.LastScanAt != "" {
-		t.Errorf("views[1].LastScanAt should be empty for NullString{Valid:false}, got %q", v1.LastScanAt)
+		t.Errorf("views[1].LastScanAt should be empty for nil *string, got %q", v1.LastScanAt)
 	}
 }
 
 func TestDbPromptToView(t *testing.T) {
 	accountMap := map[int64]string{5: "owner@example.com"}
 
+	accountID := int64(5)
 	p := db.Prompt{
 		ID:             10,
 		Name:           "Test Prompt",
@@ -79,7 +80,7 @@ func TestDbPromptToView(t *testing.T) {
 		ActionTrash:    1,
 		ActionMarkRead: 0,
 		StopProcessing: 1,
-		AccountID:      sql.NullInt64{Int64: 5, Valid: true},
+		AccountID:      &accountID,
 	}
 
 	pv := dbPromptToView(p, accountMap)
@@ -119,11 +120,11 @@ func TestDbPromptToView(t *testing.T) {
 func TestDbPromptToView_NoAccount(t *testing.T) {
 	p := db.Prompt{
 		ID:        1,
-		AccountID: sql.NullInt64{Valid: false},
+		AccountID: nil,
 	}
 	pv := dbPromptToView(p, map[int64]string{})
 	if pv.AccountID != 0 {
-		t.Errorf("AccountID should be 0 for invalid NullInt64, got %d", pv.AccountID)
+		t.Errorf("AccountID should be 0 for nil AccountID, got %d", pv.AccountID)
 	}
 	if pv.AccountEmail != "" {
 		t.Errorf("AccountEmail should be empty, got %q", pv.AccountEmail)

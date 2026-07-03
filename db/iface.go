@@ -5,9 +5,6 @@ import "context"
 // StoreIface is the subset of Store used by processor, poller, retention, and
 // their tests. *Store satisfies this interface; *FakeStore satisfies it for tests.
 type StoreIface interface {
-	Close() error
-	Migrate() error
-
 	Log(level, message string)
 
 	GetSetting(ctx context.Context, key string) (string, error)
