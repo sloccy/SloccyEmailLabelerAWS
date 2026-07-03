@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -77,15 +76,6 @@ type Client struct {
 	pc           *pricing.Client // AWS Price List API, for dynamic pricing + flex eligibility
 	defaultModel string
 	settings     Settings
-
-	// toolUseUnsupported records, per model ID, that a prior classification's forced
-	// tool-use attempt was rejected outright by Bedrock (e.g. Nova's "doesn't support
-	// the strict field" ValidationException). Bedrock exposes no capability flag for
-	// this (see ListAvailableModels) — it can only be learned by trying. Once learned,
-	// subsequent classifications for that model skip straight to the plain-text call
-	// instead of paying a doomed extra round-trip on every single email. Scoped to the
-	// process lifetime (cleared on cold start); self-heals if AWS adds support.
-	toolUseUnsupported sync.Map // model string -> struct{}
 }
 
 // NewClient creates a Bedrock client.
@@ -144,13 +134,6 @@ func (c *Client) resolveClassifyTier(ctx context.Context) string {
 		}
 	}
 	return ClassifyTierStandard
-}
-
-// toolUseSupported reports whether model has not already been observed, in this
-// process, to reject forced tool use. See Client.toolUseUnsupported.
-func (c *Client) toolUseSupported(model string) bool {
-	_, unsupported := c.toolUseUnsupported.Load(model)
-	return !unsupported
 }
 
 // ============================================================
@@ -213,10 +196,10 @@ func buildBody(email Email, prompts []Prompt) string {
 	}
 	rulesText := sb.String()
 
-	// The example covers every rule number, not just the first couple — models that
-	// don't support forced tool use (see Client.toolUseUnsupported) only have this
-	// prompt to go on, and a partial example leaves them guessing whether to include
-	// keys for the rules it omitted.
+	// The example covers every rule number, not just the first couple — when a
+	// classification falls back to plain-text parsing (see ClassifyEmailBatch), the
+	// model only has this prompt to go on, and a partial example leaves it guessing
+	// whether to include keys for the rules it omitted.
 	exampleParts := make([]string, len(prompts))
 	for i := range exampleParts {
 		exampleParts[i] = fmt.Sprintf(`"%d": false`, i+1)
@@ -279,9 +262,9 @@ func classifyToolSchema(prompts []Prompt) map[string]any {
 // classifyToolConfig builds the forced-tool-use configuration for structured
 // classification output: one tool whose input schema requires a boolean for every
 // rule number. ToolChoice forces the model to call it — this is Bedrock's native
-// structured-output mechanism (see ToolSpecification.Strict), replacing the
-// prompt-coaxed "respond with only JSON" text approach. Not every model supports
-// forced tool use; ClassifyEmailBatch falls back to text parsing when it doesn't.
+// structured-output mechanism, replacing the prompt-coaxed "respond with only JSON"
+// text approach. If a model rejects the tool-use call outright, ClassifyEmailBatch
+// falls back to text parsing.
 func classifyToolConfig(prompts []Prompt) *types.ToolConfiguration {
 	schema := classifyToolSchema(prompts)
 	return &types.ToolConfiguration{
@@ -291,7 +274,6 @@ func classifyToolConfig(prompts []Prompt) *types.ToolConfiguration {
 					Name:        aws.String(classifyToolName),
 					Description: aws.String(classifyToolDescription),
 					InputSchema: &types.ToolInputSchemaMemberJson{Value: document.NewLazyDocument(schema)},
-					Strict:      aws.Bool(true),
 				},
 			},
 		},
@@ -312,7 +294,6 @@ func classifyToolConfigJSON(prompts []Prompt) map[string]any {
 					"name":        classifyToolName,
 					"description": classifyToolDescription,
 					"inputSchema": map[string]any{"json": classifyToolSchema(prompts)},
-					"strict":      true,
 				},
 			},
 		},
@@ -470,9 +451,7 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 		"modelId":         model,
 		"messages":        msgs,
 		"inferenceConfig": inf,
-	}
-	if c.toolUseSupported(model) {
-		payload["toolConfig"] = classifyToolConfigJSON(prompts)
+		"toolConfig":      classifyToolConfigJSON(prompts),
 	}
 	if tier == ClassifyTierFlex {
 		payload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
@@ -490,11 +469,12 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 
 	msgs, inf, model, tier := c.classifyPayload(ctx, email, prompts)
-	attemptToolUse := c.toolUseSupported(model)
 
-	reqPayload := map[string]any{"modelId": model, "messages": msgs, "inferenceConfig": inf}
-	if attemptToolUse {
-		reqPayload["toolConfig"] = classifyToolConfigJSON(prompts)
+	reqPayload := map[string]any{
+		"modelId":         model,
+		"messages":        msgs,
+		"inferenceConfig": inf,
+		"toolConfig":      classifyToolConfigJSON(prompts),
 	}
 	var svcTier *types.ServiceTier
 	if tier == ClassifyTierFlex {
@@ -526,40 +506,28 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		})
 	}
 
-	var out *bedrockruntime.ConverseOutput
-	var err error
-	if attemptToolUse {
-		// Preferred path: force tool use so Bedrock returns schema-validated JSON
-		// directly (see classifyToolConfig). Not every model supports forced tool
-		// use — when the call itself fails for that reason, cache that (see
-		// Client.toolUseUnsupported) and retry once without ToolConfig below. When
-		// the call succeeds but the model didn't call the tool anyway, fall through
-		// to the same text-parsing logic used by the retry, applied to this response.
-		out, err = c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-			ModelId:         aws.String(model),
-			Messages:        msgs,
-			InferenceConfig: inf,
-			ServiceTier:     svcTier,
-			ToolConfig:      classifyToolConfig(prompts),
-		})
-		if err == nil {
-			if parsed, rawJSON, ok := extractToolUse(out.Output, classifyToolName); ok {
-				store.Log("INFO", fmt.Sprintf("LLM classify response via tool-use: %d field(s)", len(parsed)))
-				res.RawResponse = rawJSON
-				res.Results = mapKeysToResults(parsed, prompts)
-				return res, nil
-			}
-			store.Log("INFO", "LLM response had no tool-use block; falling back to text parsing")
-		} else {
-			c.toolUseUnsupported.Store(model, struct{}{})
-			store.Log("INFO", fmt.Sprintf("LLM tool-use call failed (%v); disabling tool-use for model %s and retrying without it", err, model))
-			out, err = plainConverse()
-			if err != nil {
-				store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
-				return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
-			}
+	// Preferred path: force tool use so Bedrock returns schema-validated JSON
+	// directly (see classifyToolConfig). If the model rejects the tool-use call
+	// outright, retry once without ToolConfig below. When the call succeeds but the
+	// model didn't call the tool anyway, fall through to the same text-parsing logic
+	// used by the retry, applied to this response.
+	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
+		ModelId:         aws.String(model),
+		Messages:        msgs,
+		InferenceConfig: inf,
+		ServiceTier:     svcTier,
+		ToolConfig:      classifyToolConfig(prompts),
+	})
+	if err == nil {
+		if parsed, rawJSON, ok := extractToolUse(out.Output, classifyToolName); ok {
+			store.Log("INFO", fmt.Sprintf("LLM classify response via tool-use: %d field(s)", len(parsed)))
+			res.RawResponse = rawJSON
+			res.Results = mapKeysToResults(parsed, prompts)
+			return res, nil
 		}
+		store.Log("INFO", "LLM response had no tool-use block; falling back to text parsing")
 	} else {
+		store.Log("INFO", fmt.Sprintf("LLM tool-use call failed (%v); retrying without tool use", err))
 		out, err = plainConverse()
 		if err != nil {
 			store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
