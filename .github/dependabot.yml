@@ -11,21 +11,6 @@ updates:
         patterns:
           - "*"
 
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: daily
-    open-pull-requests-limit: 10
-    groups:
-      npm-deps:
-        patterns:
-          - "*"
-
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: daily
-
   - package-ecosystem: github-actions
     directory: /
     schedule:
