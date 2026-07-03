@@ -597,9 +597,21 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier string, mode
 	}
 }
 
-// settingOr returns the stored setting value, falling back to def when unset or empty.
-func (s *server) settingOr(ctx context.Context, key, def string) string {
-	if v, err := s.store.GetSetting(ctx, key); err == nil && v != "" {
+// loadSettings fetches every stored setting in one Query and returns it as a key->value
+// map, for handlers that need several keys in one request instead of a separate
+// GetSetting round trip per key.
+func (s *server) loadSettings(ctx context.Context) map[string]string {
+	all, _ := s.store.GetAllSettings(ctx)
+	m := make(map[string]string, len(all))
+	for _, st := range all {
+		m[st.Key] = st.Value
+	}
+	return m
+}
+
+// settingOr returns settings[key], falling back to def when unset or empty.
+func settingOr(settings map[string]string, key, def string) string {
+	if v := settings[key]; v != "" {
 		return v
 	}
 	return def
@@ -607,9 +619,10 @@ func (s *server) settingOr(ctx context.Context, key, def string) string {
 
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	classifyModel := s.settingOr(ctx, llm.SettingClassifyModel, s.cfg.BedrockModel)
-	improveModel := s.settingOr(ctx, llm.SettingImproveModel, s.cfg.BedrockModel)
-	classifyTier := s.settingOr(ctx, llm.SettingClassifyTier, llm.ClassifyTierStandard)
+	settings := s.loadSettings(ctx)
+	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
+	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
+	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.ClassifyTierStandard)
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
 		settingsTemplateData(classifyModel, improveModel, classifyTier, models), "")
@@ -618,6 +631,7 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
+	settings := s.loadSettings(ctx)
 
 	// Model selections — validate against available models to ignore garbage input
 	models := s.cachedModels(ctx)
@@ -634,13 +648,13 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
 	// classify_model choice: the two tiers have different eligible-model policies (see
 	// classifyModelAllowed) enforced below.
-	classifyTier := s.settingOr(ctx, llm.SettingClassifyTier, llm.ClassifyTierStandard)
+	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.ClassifyTierStandard)
 	if v := r.FormValue("classify_tier"); v == llm.ClassifyTierStandard || v == llm.ClassifyTierFlex {
 		classifyTier = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyTier, Value: v})
 	}
 
-	classifyModel := s.settingOr(ctx, llm.SettingClassifyModel, s.cfg.BedrockModel)
+	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	if v := r.FormValue("classify_model"); v != "" {
 		if m := findModel(v); m != nil && classifyModelAllowed(*m, classifyTier) {
 			classifyModel = v
@@ -648,7 +662,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	improveModel := s.settingOr(ctx, llm.SettingImproveModel, s.cfg.BedrockModel)
+	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
 	if v := r.FormValue("improve_model"); v != "" && validID(v) {
 		improveModel = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})

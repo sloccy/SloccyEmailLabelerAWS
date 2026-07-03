@@ -14,6 +14,13 @@ import (
 	"github.com/sloccy/ollamail-aws/llm"
 )
 
+// Log levels used for db.LogEntry / store.Log throughout this file.
+const (
+	logInfo    = "INFO"
+	logWarning = "WARNING"
+	logDebug   = "DEBUG"
+)
+
 // ptr returns a pointer to v — for building the *int64/*string nullable fields on
 // db.HistoryEntry from a computed value (Go has no address-of operator for a struct
 // field expression like p.ID).
@@ -53,6 +60,19 @@ func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bo
 	return mod, trash
 }
 
+// ReverseModifyForPrompt returns the Gmail label changes that undo what ModifyForPrompt
+// would apply for prompt p — used by the recategorize "remove" path when a previously
+// matched prompt is unmarked. Derived by swapping ModifyForPrompt's add/remove labels
+// (untrash mirrors trash: both mean "handle via the separate batch trash/untrash call, not
+// a label op") instead of re-deriving the action→label mapping a second time, so the two
+// can't drift apart.
+func ReverseModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, untrash bool) {
+	fwd, trash := ModifyForPrompt(p, labelID)
+	mod.AddLabels = fwd.RemoveLabels
+	mod.RemoveLabels = fwd.AddLabels
+	return mod, trash
+}
+
 // NewAccountGmailService builds an authenticated Gmail client for account, wiring the
 // OAuth token-refresh callback to persist any rotated credentials back to store. Shared
 // by setupAccountContext (scan/push) and the web server's ad-hoc Gmail lookups
@@ -82,6 +102,19 @@ func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gm
 		return nil, nil, err
 	}
 	return svc, filterPrompts(allPrompts, account.ID), nil
+}
+
+// bufferedLogger collects log entries in memory instead of writing each one straight to
+// DynamoDB. It satisfies llm.StoreLogger, so it's a drop-in stand-in for the live store on
+// the ClassifyEmailBatch call in processEmail: the buffered entries are flushed together
+// with the email's history through BatchInsertProcessingResults instead of costing a
+// separate counter-update-plus-PutItem per log line.
+type bufferedLogger struct {
+	entries []db.LogEntry
+}
+
+func (b *bufferedLogger) Log(level, message string) {
+	b.entries = append(b.entries, db.LogEntry{Level: level, Message: message})
 }
 
 // marshalGmailDebug serialises a Gmail message to compact JSON for the debug table.
@@ -166,12 +199,12 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 	}
 	if len(unprocessed) == 0 {
 		if !cfg.SuppressEmptyLog {
-			store.Log("INFO", fmt.Sprintf("[%s] No new emails to process.", account.Email))
+			store.Log(logInfo, fmt.Sprintf("[%s] No new emails to process.", account.Email))
 		}
 		_ = store.UpdateLastScan(ctx, account.ID)
 		return nil
 	}
-	store.Log("INFO", fmt.Sprintf("[%s] Processing %d new email(s) against %d rule(s).", account.Email, len(unprocessed), len(prompts)))
+	store.Log(logInfo, fmt.Sprintf("[%s] Processing %d new email(s) against %d rule(s).", account.Email, len(unprocessed), len(prompts)))
 
 	// Resolve the classify model/tier once for the whole batch instead of per email —
 	// they don't change mid-pass, and re-resolving is a DynamoDB GetSetting round trip.
@@ -261,18 +294,26 @@ func processEmail(
 		Snippet: msg.Snippet,
 	}
 
-	store.Log("INFO", fmt.Sprintf("[%s] Classifying: '%s' from %s",
-		account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60)))
+	logs := []db.LogEntry{{
+		Level: logInfo,
+		Message: fmt.Sprintf("[%s] Classifying: '%s' from %s",
+			account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60)),
+	}}
 
 	gmailRaw := marshalGmailDebug(msg)
 
-	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, store, email, llmPrompts, model, tier)
+	// Buffer the classify call's own log lines instead of writing each one straight to
+	// DynamoDB (a counter update + a PutItem per line): ClassifyEmailBatch logs several
+	// times per call, and buffering lets all of it flush through the single
+	// BatchInsertProcessingResults call below, alongside history, instead.
+	logger := &bufferedLogger{}
+	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier)
+	logs = append(logs, logger.entries...)
 
-	var logs []db.LogEntry
 	var history []db.HistoryEntry
 
 	if llmErr != nil {
-		logs = append(logs, db.LogEntry{Level: "WARNING", Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
+		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
 		if err := store.BatchInsertProcessingResults(ctx, logs, nil, account.ID, ""); err != nil {
 			slog.Error("db log write failed", "err", err)
 		}
@@ -286,9 +327,9 @@ func processEmail(
 		}
 	}
 	if len(matched) > 0 {
-		store.Log("INFO", fmt.Sprintf("[%s] Classification done: %d match(es): %v", account.Email, len(matched), matched))
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Classification done: %d match(es): %v", account.Email, len(matched), matched)})
 	} else {
-		store.Log("INFO", fmt.Sprintf("[%s] Classification done: 0 match(es): none", account.Email))
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Classification done: 0 match(es): none", account.Email)})
 	}
 
 	stop := false
@@ -335,7 +376,7 @@ func processEmail(
 		}
 
 		logs = append(logs, db.LogEntry{
-			Level:   "INFO",
+			Level:   logInfo,
 			Message: fmt.Sprintf("[%s] '%s' \u2014 %s (rule: %s)", account.Email, gmailpkg.Truncate(msg.Subject, 60), strings.Join(actions, ", "), p.Name),
 		})
 		history = append(history, db.HistoryEntry{
@@ -365,9 +406,9 @@ func processEmail(
 		})
 	}
 
-	logs = append(logs, db.LogEntry{Level: "INFO", Message: fmt.Sprintf("Processed %q", msg.Subject)})
+	logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("Processed %q", msg.Subject)})
 	if debugLogging {
-		logs = append(logs, db.LogEntry{Level: "DEBUG", Message: "LLM response: " + classified.RawResponse})
+		logs = append(logs, db.LogEntry{Level: logDebug, Message: "LLM response: " + classified.RawResponse})
 	}
 
 	if err := store.BatchInsertProcessingResults(ctx, logs, history, account.ID, msg.ID); err != nil {

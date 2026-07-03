@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -71,9 +72,18 @@ type converseAPI interface {
 
 // Client wraps the Bedrock runtime client with per-call model resolution.
 type Client struct {
-	br           converseAPI
-	bc           *bedrock.Client // control-plane, for listing
-	pc           *pricing.Client // AWS Price List API, for dynamic pricing + flex eligibility
+	br converseAPI
+
+	// awsCfg backs the lazily-built control-plane/pricing clients below. Only
+	// ListAvailableModels (the settings-UI model dropdown) ever touches them — scan/push
+	// cold starts never call it, so building bc/pc eagerly in NewClient would be pure
+	// waste on those paths.
+	awsCfg aws.Config
+	bcOnce sync.Once
+	bc     *bedrock.Client // control-plane, for listing
+	pcOnce sync.Once
+	pc     *pricing.Client // AWS Price List API, for dynamic pricing + flex eligibility
+
 	defaultModel string
 	settings     Settings
 }
@@ -106,11 +116,8 @@ func NewClient(settings Settings, defaultModel string) *Client {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
 	}
 	return &Client{
-		br: bedrockruntime.NewFromConfig(cfg),
-		bc: bedrock.NewFromConfig(cfg),
-		// The Price List API only runs in us-east-1 (and ap-south-1); pin it there
-		// regardless of cfg.Region — it's a read-only pricing catalog, not LLM traffic.
-		pc:           pricing.NewFromConfig(cfg, func(o *pricing.Options) { o.Region = pricingRegion }),
+		br:           bedrockruntime.NewFromConfig(cfg),
+		awsCfg:       cfg,
 		defaultModel: defaultModel,
 		settings:     settings,
 	}
@@ -118,6 +125,23 @@ func NewClient(settings Settings, defaultModel string) *Client {
 
 // Model returns the default model (used by tests and the troubleshooting UI).
 func (c *Client) Model() string { return c.defaultModel }
+
+// controlPlane lazily builds the Bedrock control-plane client (ListFoundationModels/
+// ListInferenceProfiles), built on first use rather than in NewClient.
+func (c *Client) controlPlane() *bedrock.Client {
+	c.bcOnce.Do(func() { c.bc = bedrock.NewFromConfig(c.awsCfg) })
+	return c.bc
+}
+
+// pricingClient lazily builds the AWS Price List API client, built on first use rather
+// than in NewClient. The Price List API only runs in us-east-1 (and ap-south-1); pin it
+// there regardless of c.awsCfg.Region — it's a read-only pricing catalog, not LLM traffic.
+func (c *Client) pricingClient() *pricing.Client {
+	c.pcOnce.Do(func() {
+		c.pc = pricing.NewFromConfig(c.awsCfg, func(o *pricing.Options) { o.Region = pricingRegion })
+	})
+	return c.pc
+}
 
 // resolveSetting looks up key in the store; falls back to def when unset, empty, or the
 // store has no value.
@@ -779,7 +803,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 	// Pricing + flex-tier eligibility come entirely from the AWS Price List API — no
 	// hardcoded model data. Non-fatal on error (e.g. missing pricing:GetProducts IAM
 	// permission): the dropdown still lists models, just without prices/flex info.
-	cat, err := fetchPricingCatalog(ctx, c.pc)
+	cat, err := fetchPricingCatalog(ctx, c.pricingClient())
 	if err != nil {
 		cat = &pricingCatalog{
 			inputPricePer1M:     map[string]float64{},
@@ -790,7 +814,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 
 	// One unfiltered catalog call: drives the foundation-model list AND supplies the
 	// modality of the models that back each inference profile.
-	fmOut, err := c.bc.ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{})
+	fmOut, err := c.controlPlane().ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{})
 	if err != nil {
 		return nil, fmt.Errorf("list foundation models: %w", err)
 	}
@@ -848,7 +872,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 
 	// System-defined inference profiles (cross-region; e.g. us.amazon.nova-micro-v1:0).
 	// These are the IDs required for models that mandate an inference profile.
-	ipOut, err := c.bc.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+	ipOut, err := c.controlPlane().ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
 		TypeEquals: bedrocktypes.InferenceProfileTypeSystemDefined,
 	})
 	if err != nil {
