@@ -467,9 +467,9 @@ func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.Inf
 	// which Bedrock reports as ModelErrorException "invalid sequence as part of ToolUse".
 	// 3000 is AWS's documented starting point for this error; it's a ceiling, not a
 	// target, so it costs nothing when the model finishes well under it.
-	numPredict := int32(3000)
+	maxTokens := int32(3000)
 	if n := len(prompts) * 12; n > 3000 {
-		numPredict = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
+		maxTokens = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
 	}
 	msgs := []types.Message{
 		{
@@ -478,7 +478,7 @@ func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.Inf
 		},
 	}
 	inf := &types.InferenceConfiguration{
-		MaxTokens:   aws.Int32(numPredict),
+		MaxTokens:   aws.Int32(maxTokens),
 		Temperature: aws.Float32(0),
 	}
 	return msgs, inf
