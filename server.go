@@ -26,12 +26,20 @@ import (
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
 	"github.com/sloccy/ollamail-aws/llm"
+	"github.com/sloccy/ollamail-aws/processor"
 )
 
 //go:embed static
 var staticFS embed.FS
 
 const retentionUnitYears = "years"
+
+// scanCadenceLabel is the human-readable schedule shown in the UI (sidebar + dashboard).
+// The catch-up scan runs on a fixed daily 2 AM ET schedule (see ScanSchedule in
+// template.yaml) — off-peak, so its flex-tier Bedrock traffic doesn't compete with
+// real-time push traffic during business hours. This is intentionally not configurable:
+// there is no EventBridge Scheduler rewrite path.
+const scanCadenceLabel = "Daily · 2 AM ET"
 
 const (
 	triggerShowToast              = "showToast"
@@ -44,14 +52,13 @@ const (
 
 // server holds all dependencies and the route mux.
 type server struct {
-	ctx       context.Context
-	store     *db.Store
-	llm       *llm.Client
-	cfg       *Config
-	auth      *gmail.Auth
-	secretKey []byte
-	tmpl      *template.Template
-	mux       *http.ServeMux
+	ctx   context.Context
+	store *db.Store
+	llm   *llm.Client
+	cfg   *Config
+	auth  *gmail.Auth
+	tmpl  *template.Template
+	mux   *http.ServeMux
 
 	// OAuth state: short-lived in-memory map (single instance, no need for persistent storage)
 	oauthMu    sync.Mutex
@@ -63,14 +70,13 @@ type server struct {
 	modelsFetchedAt time.Time
 }
 
-func newServer(ctx context.Context, store *db.Store, llmClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
+func newServer(ctx context.Context, store *db.Store, llmClient *llm.Client, auth *gmail.Auth, cfg *Config) http.Handler {
 	s := &server{
 		ctx:        ctx,
 		store:      store,
 		llm:        llmClient,
 		cfg:        cfg,
 		auth:       auth,
-		secretKey:  secretKey,
 		oauthState: make(map[string]time.Time),
 	}
 
@@ -287,9 +293,8 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleToggleAccount(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -298,9 +303,8 @@ func (s *server) handleToggleAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -415,9 +419,8 @@ func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleUpdatePrompt(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -908,15 +911,7 @@ func (s *server) handleRetentionQuery(w http.ResponseWriter, r *http.Request) {
 // refresh back to the store. Centralizes the OAuth-config + NewService + refresh-closure
 // boilerplate otherwise repeated at every call site.
 func (s *server) gmailServiceFor(ctx context.Context, account db.Account) (*gmail.Client, error) {
-	oauthCfg, err := s.auth.Config()
-	if err != nil {
-		return nil, err
-	}
-	return gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
-		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-			CredentialsJSON: newCreds, ID: account.ID,
-		})
-	})
+	return processor.NewAccountGmailService(ctx, s.store, s.auth, account)
 }
 
 func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int64) retentionPanelData {
@@ -1301,6 +1296,29 @@ type suggestionView struct {
 	Status                string
 }
 
+// toSuggestionView converts a stored suggestion + its prompt's name into the view shape
+// rendered by the prompt-suggestion templates. Shared by all three suggestion handlers
+// below so the 13-field mapping can't drift between them; callers that need a value other
+// than the suggestion's own (e.g. a freshly regenerated UpdatedAt/Status) overwrite the
+// specific field on the returned view.
+func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView {
+	return suggestionView{
+		ID:                    sg.ID,
+		CreatedAt:             sg.CreatedAt,
+		UpdatedAt:             sg.UpdatedAt,
+		PromptID:              sg.PromptID,
+		PromptName:            promptName,
+		TriggerKind:           sg.TriggerKind,
+		EmailSubject:          sg.EmailSubject,
+		EmailSender:           sg.EmailSender,
+		EmailBodySnapshot:     sg.EmailBodySnapshot,
+		OriginalInstructions:  sg.OriginalInstructions,
+		SuggestedInstructions: sg.SuggestedInstructions,
+		UserComment:           sg.UserComment,
+		Status:                sg.Status,
+	}
+}
+
 func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	suggestions, _ := s.store.ListPromptSuggestions(ctx)
@@ -1314,29 +1332,14 @@ func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Requ
 
 	views := make([]suggestionView, len(suggestions))
 	for i, sg := range suggestions {
-		views[i] = suggestionView{
-			ID:                    sg.ID,
-			CreatedAt:             sg.CreatedAt,
-			UpdatedAt:             sg.UpdatedAt,
-			PromptID:              sg.PromptID,
-			PromptName:            promptNames[sg.PromptID],
-			TriggerKind:           sg.TriggerKind,
-			EmailSubject:          sg.EmailSubject,
-			EmailSender:           sg.EmailSender,
-			EmailBodySnapshot:     sg.EmailBodySnapshot,
-			OriginalInstructions:  sg.OriginalInstructions,
-			SuggestedInstructions: sg.SuggestedInstructions,
-			UserComment:           sg.UserComment,
-			Status:                sg.Status,
-		}
+		views[i] = toSuggestionView(sg, promptNames[sg.PromptID])
 	}
 	s.fragmentResponse(w, "templates/fragments/prompt_suggestions_list.html", views, "")
 }
 
 func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1346,28 +1349,13 @@ func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Req
 		return
 	}
 	p, _ := s.store.GetPrompt(ctx, sg.PromptID)
-	view := suggestionView{
-		ID:                    sg.ID,
-		CreatedAt:             sg.CreatedAt,
-		UpdatedAt:             sg.UpdatedAt,
-		PromptID:              sg.PromptID,
-		PromptName:            p.Name,
-		TriggerKind:           sg.TriggerKind,
-		EmailSubject:          sg.EmailSubject,
-		EmailSender:           sg.EmailSender,
-		EmailBodySnapshot:     sg.EmailBodySnapshot,
-		OriginalInstructions:  sg.OriginalInstructions,
-		SuggestedInstructions: sg.SuggestedInstructions,
-		UserComment:           sg.UserComment,
-		Status:                sg.Status,
-	}
+	view := toSuggestionView(sg, p.Name)
 	s.fragmentResponse(w, "templates/fragments/prompt_suggestion_detail.html", view, "")
 }
 
 func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1417,28 +1405,17 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 		ID:                    id,
 	})
 
-	view := suggestionView{
-		ID:                    sg.ID,
-		CreatedAt:             sg.CreatedAt,
-		UpdatedAt:             db.Now(),
-		PromptID:              sg.PromptID,
-		PromptName:            p.Name,
-		TriggerKind:           sg.TriggerKind,
-		EmailSubject:          sg.EmailSubject,
-		EmailSender:           sg.EmailSender,
-		EmailBodySnapshot:     sg.EmailBodySnapshot,
-		OriginalInstructions:  sg.OriginalInstructions,
-		SuggestedInstructions: suggested,
-		UserComment:           userComment,
-		Status:                db.SuggestionStatusPending,
-	}
+	view := toSuggestionView(sg, p.Name)
+	view.UpdatedAt = db.Now()
+	view.SuggestedInstructions = suggested
+	view.UserComment = userComment
+	view.Status = db.SuggestionStatusPending
 	s.fragmentResponse(w, "templates/fragments/prompt_suggestion_detail.html", view, "")
 }
 
 func (s *server) handlePromptSuggestionApply(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1456,9 +1433,8 @@ func (s *server) handlePromptSuggestionApply(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *server) handlePromptSuggestionDismiss(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1499,6 +1475,20 @@ func pathInt(r *http.Request, key string) int64 {
 	v := r.PathValue(key)
 	n, _ := strconv.ParseInt(v, 10, 64)
 	return n
+}
+
+// requireID reads the "id" path parameter, writing a 400 and returning ok=false if it's
+// missing or non-numeric (pathInt returns 0). Shared by the handlers that take a single
+// numeric path id and reject a bad one outright, so the 400 guard can't drift between
+// them. (Other handlers read id/eid/ruleId via pathInt directly and fall through to a
+// downstream lookup instead of a hard 400 — that's a different, intentional behavior.)
+func requireID(w http.ResponseWriter, r *http.Request) (id int64, ok bool) {
+	id = pathInt(r, "id")
+	if id == 0 {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return 0, false
+	}
+	return id, true
 }
 
 func boolToInt(b bool) int64 {
