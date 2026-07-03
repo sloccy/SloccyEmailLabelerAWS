@@ -2,7 +2,6 @@ package processor
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,17 +14,49 @@ import (
 	"github.com/sloccy/ollamail-aws/llm"
 )
 
-// EmailModify tracks label changes for a single message.
-type EmailModify struct {
-	MessageID    string
-	AddLabels    []string
-	RemoveLabels []string
+// ptr returns a pointer to v — for building the *int64/*string nullable fields on
+// db.HistoryEntry from a computed value (Go has no address-of operator for a struct
+// field expression like p.ID).
+func ptr[T any](v T) *T { return &v }
+
+// labelNamePtr returns nil for an empty label (matching the "no label" NULL-sentinel
+// semantics of db.HistoryEntry.LabelName), or a pointer to name otherwise.
+func labelNamePtr(name string) *string {
+	if name == "" {
+		return nil
+	}
+	return &name
+}
+
+// ModifyForPrompt returns the Gmail label changes to apply when prompt p matches an
+// email, plus whether the message should be trashed (kept separate from mod since
+// trashing is a distinct Gmail API call, not a label add/remove). labelID is the
+// resolved Gmail label id for p.LabelName (pass "" if unresolved/not needed).
+// Shared by the classify path (processEmail) and the recategorize "add" path
+// (server.go's handleRecategorize) so the two can't drift.
+func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bool) {
+	if p.LabelName != "" && labelID != "" {
+		mod.AddLabels = append(mod.AddLabels, labelID)
+	}
+	switch {
+	case p.ActionSpam != 0:
+		mod.AddLabels = append(mod.AddLabels, gmailpkg.LabelSpam)
+		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
+	case p.ActionTrash != 0:
+		trash = true
+	case p.ActionArchive != 0:
+		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
+	}
+	if p.ActionMarkRead != 0 {
+		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelUnread)
+	}
+	return mod, trash
 }
 
 // setupAccountContext loads OAuth config, creates a Gmail client, and filters
 // prompts for the given account. Shared by ProcessAccount and BackfillLlmDebug.
 func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt) (*gmailpkg.Client, []db.Prompt, error) {
-	oauthCfg, err := gmailAuth.ConfigFromFile()
+	oauthCfg, err := gmailAuth.Config()
 	if err != nil {
 		return nil, nil, fmt.Errorf("load oauth config: %w", err)
 	}
@@ -52,7 +83,7 @@ func marshalGmailDebug(msg gmailpkg.Message) string {
 
 // ProcessAccount processes all new emails for one account.
 // Returns the Gmail service so it can be reused by retention.
-func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
+func ProcessAccount(ctx context.Context, store db.StoreIface, llmClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (*gmailpkg.ServiceWrapper, error) {
 	svc, prompts, err := setupAccountContext(ctx, store, gmailAuth, account, allPrompts)
 	if err != nil {
 		return nil, err
@@ -69,7 +100,7 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 		return wrapper, fmt.Errorf("list messages: %w", err)
 	}
 
-	return wrapper, processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, messageIDs, cfg)
+	return wrapper, processMessageIDs(ctx, store, llmClient, account, svc, prompts, messageIDs, cfg)
 }
 
 // ProcessAccountHistory processes only the messages *added to the inbox* since the
@@ -78,7 +109,7 @@ func ProcessAccount(ctx context.Context, store db.StoreIface, ollamaClient llm.C
 // label/read changes the app makes itself — so a push no longer retriggers on our own
 // modifications. Falls back to a full lookback scan (returning "") when there is no stored
 // history id yet or it has expired; the caller then reseeds from the notification's id.
-func ProcessAccountHistory(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (string, error) {
+func ProcessAccountHistory(ctx context.Context, store db.StoreIface, llmClient llm.ClientIface, gmailAuth *gmailpkg.Auth, account db.Account, allPrompts []db.Prompt, cfg ProcessConfig) (string, error) {
 	svc, prompts, err := setupAccountContext(ctx, store, gmailAuth, account, allPrompts)
 	if err != nil {
 		return "", err
@@ -93,7 +124,7 @@ func ProcessAccountHistory(ctx context.Context, store db.StoreIface, ollamaClien
 		if lerr != nil {
 			return "", fmt.Errorf("list messages: %w", lerr)
 		}
-		return "", processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, messageIDs, cfg)
+		return "", processMessageIDs(ctx, store, llmClient, account, svc, prompts, messageIDs, cfg)
 	}
 	if account.WatchHistoryID == "" {
 		return fullScan()
@@ -106,7 +137,7 @@ func ProcessAccountHistory(ctx context.Context, store db.StoreIface, ollamaClien
 	if herr != nil {
 		return account.WatchHistoryID, fmt.Errorf("history list: %w", herr)
 	}
-	if err := processMessageIDs(ctx, store, ollamaClient, account, svc, prompts, ids, cfg); err != nil {
+	if err := processMessageIDs(ctx, store, llmClient, account, svc, prompts, ids, cfg); err != nil {
 		return account.WatchHistoryID, err
 	}
 	return latest, nil
@@ -115,7 +146,7 @@ func ProcessAccountHistory(ctx context.Context, store db.StoreIface, ollamaClien
 // processMessageIDs dedupes the given message IDs against already-processed ones and, for
 // any new messages, classifies them and applies label actions. Shared by the lookback scan
 // (ProcessAccount) and the push history path (ProcessAccountHistory).
-func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient llm.ClientIface, account db.Account, svc *gmailpkg.Client, prompts []db.Prompt, messageIDs []string, cfg ProcessConfig) error {
+func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.ClientIface, account db.Account, svc *gmailpkg.Client, prompts []db.Prompt, messageIDs []string, cfg ProcessConfig) error {
 	// Filter out already-processed
 	unprocessed, err := store.FilterUnprocessed(ctx, account.ID, messageIDs)
 	if err != nil {
@@ -127,6 +158,10 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient ll
 		return nil
 	}
 	store.Log("INFO", fmt.Sprintf("[%s] Processing %d new email(s) against %d rule(s).", account.Email, len(unprocessed), len(prompts)))
+
+	// Resolve the classify model/tier once for the whole batch instead of per email —
+	// they don't change mid-pass, and re-resolving is a DynamoDB GetSetting round trip.
+	model, tier := llmClient.ResolveClassifySettings(ctx)
 
 	// Build label cache for all needed labels
 	var neededLabels []string
@@ -158,17 +193,11 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient ll
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, trash := processEmail(ctx, store, ollamaClient, account, msg, prompts, labelCache, cfg.DebugLogging)
+			modifies, trash := processEmail(ctx, store, llmClient, account, msg, prompts, labelCache, cfg.DebugLogging, model, tier)
 
 			mu.Lock()
 			defer mu.Unlock()
-			for _, m := range modifies {
-				allModifies = append(allModifies, gmailpkg.Modify{
-					MessageIDs:   []string{m.MessageID},
-					AddLabels:    m.AddLabels,
-					RemoveLabels: m.RemoveLabels,
-				})
-			}
+			allModifies = append(allModifies, modifies...)
 			trashIDs = append(trashIDs, trash...)
 		}()
 	}
@@ -198,13 +227,14 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, ollamaClient ll
 func processEmail(
 	ctx context.Context,
 	store db.StoreIface,
-	ollamaClient llm.ClientIface,
+	llmClient llm.ClientIface,
 	account db.Account,
 	msg gmailpkg.Message,
 	prompts []db.Prompt,
 	labelCache map[string]string,
 	debugLogging bool,
-) (modifies []EmailModify, trashIDs []string) {
+	model, tier string,
+) (modifies []gmailpkg.Modify, trashIDs []string) {
 	llmPrompts := make([]llm.Prompt, len(prompts))
 	for i, p := range prompts {
 		llmPrompts[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
@@ -222,7 +252,7 @@ func processEmail(
 
 	gmailRaw := marshalGmailDebug(msg)
 
-	classified, llmErr := ollamaClient.ClassifyEmailBatch(ctx, store, email, llmPrompts)
+	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, store, email, llmPrompts, model, tier)
 
 	var logs []db.LogEntry
 	var history []db.HistoryEntry
@@ -262,31 +292,22 @@ func processEmail(
 			actions = append(actions, "labeled → "+p.LabelName)
 		}
 
-		mod := EmailModify{MessageID: msg.ID}
+		mod, trash := ModifyForPrompt(p, labelCache[p.LabelName])
+		mod.MessageIDs = []string{msg.ID}
 
-		// Apply label
-		if p.LabelName != "" {
-			if labelID, ok := labelCache[p.LabelName]; ok {
-				mod.AddLabels = append(mod.AddLabels, labelID)
-			}
-		}
-
-		// Apply actions (spam takes priority over trash/archive)
+		// Action log text (spam takes priority over trash/archive, matching ModifyForPrompt).
 		switch {
 		case p.ActionSpam != 0:
-			mod.AddLabels = append(mod.AddLabels, gmailpkg.LabelSpam)
-			mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
 			actions = append(actions, "sent to spam")
 		case p.ActionTrash != 0:
-			trashIDs = append(trashIDs, msg.ID)
 			actions = append(actions, "trashed")
 		case p.ActionArchive != 0:
-			mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
 			actions = append(actions, "archived")
 		}
-
+		if trash {
+			trashIDs = append(trashIDs, msg.ID)
+		}
 		if p.ActionMarkRead != 0 {
-			mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelUnread)
 			actions = append(actions, "marked as read")
 		}
 
@@ -309,9 +330,9 @@ func processEmail(
 			MessageID:    msg.ID,
 			Subject:      msg.Subject,
 			Sender:       msg.Sender,
-			PromptID:     sql.NullInt64{Int64: p.ID, Valid: true},
-			PromptName:   sql.NullString{String: p.Name, Valid: true},
-			LabelName:    sql.NullString{String: p.LabelName, Valid: p.LabelName != ""},
+			PromptID:     ptr(p.ID),
+			PromptName:   ptr(p.Name),
+			LabelName:    labelNamePtr(p.LabelName),
 			Actions:      strings.Join(actions, ", "),
 			LlmResponse:  classified.RawResponse,
 		})
@@ -362,7 +383,7 @@ func filterPrompts(prompts []db.Prompt, accountID int64) []db.Prompt {
 		if p.Active == 0 {
 			continue
 		}
-		if p.AccountID.Valid && p.AccountID.Int64 != accountID {
+		if p.AccountID != nil && *p.AccountID != accountID {
 			continue
 		}
 		out = append(out, p)

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"sort"
@@ -16,9 +17,23 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+// mustMarshalMap marshals v (a model struct with dynamodbav tags — string/int64/pointer
+// fields only) to a DynamoDB item map. Panics on error: for these fixed, compiler-checked
+// struct shapes, a marshal failure can only mean a programming mistake (an unsupported
+// field type), not something data-dependent at runtime — the same class of "cannot fail"
+// already assumed by the JSON marshal-with-fallback calls elsewhere in this codebase.
+func mustMarshalMap(v any) map[string]types.AttributeValue {
+	item, err := attributevalue.MarshalMap(v)
+	if err != nil {
+		panic(fmt.Sprintf("marshal %T: %v", v, err))
+	}
+	return item
+}
 
 // Store wraps a DynamoDB client. All methods are safe for concurrent use.
 type Store struct {
@@ -38,11 +53,6 @@ func Open() (*Store, error) {
 	}
 	return &Store{ddb: dynamodb.NewFromConfig(cfg), table: table}, nil
 }
-
-func (s *Store) Close() error { return nil }
-
-// Migrate is a no-op; the DynamoDB table is provisioned by SAM/CloudFormation.
-func (s *Store) Migrate() error { return nil }
 
 // Now returns the current UTC time in the standard timestamp format.
 func Now() string {
@@ -69,18 +79,20 @@ func i32(v int64) int32 {
 	return int32(v)
 }
 
-func nullStrAttr(v sql.NullString) types.AttributeValue {
-	if !v.Valid {
-		return &types.AttributeValueMemberNULL{Value: true}
-	}
-	return &types.AttributeValueMemberS{Value: v.String}
-}
+// ptr returns a pointer to v — for building *string/*int64 field literals from computed
+// values (Go has no address-of operator for non-addressable expressions like a struct
+// field or map value).
+func ptr[T any](v T) *T { return &v }
 
-func nullInt64Attr(v sql.NullInt64) types.AttributeValue {
+// nullInt64Ptr converts the sql.NullInt64 "optional filter/DTO value" idiom (still used
+// for params structs and query filters throughout this file) into the *int64 form used
+// by attributevalue-tagged model fields.
+func nullInt64Ptr(v sql.NullInt64) *int64 {
 	if !v.Valid {
-		return &types.AttributeValueMemberNULL{Value: true}
+		return nil
 	}
-	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v.Int64, 10)}
+	val := v.Int64
+	return &val
 }
 
 func getStr(m map[string]types.AttributeValue, key string) string {
@@ -102,15 +114,6 @@ func getInt64(m map[string]types.AttributeValue, key string) int64 {
 	return 0
 }
 
-func getNullStr(m map[string]types.AttributeValue, key string) sql.NullString {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(*types.AttributeValueMemberS); ok {
-			return sql.NullString{String: s.Value, Valid: true}
-		}
-	}
-	return sql.NullString{}
-}
-
 func getNullInt64(m map[string]types.AttributeValue, key string) sql.NullInt64 {
 	if v, ok := m[key]; ok {
 		if n, ok := v.(*types.AttributeValueMemberN); ok {
@@ -127,30 +130,47 @@ func padID(id int64) string { return fmt.Sprintf("%020d", id) }
 // tsKey builds a sort key from a timestamp and ID (both sort correctly as strings).
 func tsKey(ts string, id int64) string { return ts + "#" + padID(id) }
 
+// Partition-key builders for per-account item collections, factored out so the prefix
+// string is defined once instead of repeated at every fmt.Sprintf call site.
+func pkHistory(accountID int64) string        { return fmt.Sprintf("HIST#%d", accountID) }
+func pkProcessed(accountID int64) string      { return fmt.Sprintf("PROC#%d", accountID) }
+func pkLabelRetention(accountID int64) string { return fmt.Sprintf("LBL_RET#%d", accountID) }
+func pkLabelExemption(accountID int64) string { return fmt.Sprintf("LBL_EX#%d", accountID) }
+
 // ============================================================
 // Atomic counter (replaces AUTOINCREMENT)
 // ============================================================
 
 func (s *Store) nextID(ctx context.Context, entity string) (int64, error) {
+	return s.nextIDs(ctx, entity, 1)
+}
+
+// nextIDs atomically reserves n sequential ids from entity's counter in one round trip
+// and returns the first of them (the rest are start, start+1, ..., start+n-1). Used to
+// batch-allocate ids for a group of items instead of one UpdateItem call per item.
+func (s *Store) nextIDs(ctx context.Context, entity string, n int) (start int64, err error) {
 	out, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
 			"PK": sv("META"),
 			"SK": sv("COUNTER#" + entity),
 		},
-		UpdateExpression: aws.String("ADD seq :one"),
+		UpdateExpression: aws.String("ADD seq :n"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":one": &types.AttributeValueMemberN{Value: "1"},
+			":n": &types.AttributeValueMemberN{Value: strconv.Itoa(n)},
 		},
 		ReturnValues: types.ReturnValueUpdatedNew,
 	})
 	if err != nil {
 		return 0, err
 	}
-	if n, ok := out.Attributes["seq"]; ok {
-		if nv, ok := n.(*types.AttributeValueMemberN); ok {
-			id, _ := strconv.ParseInt(nv.Value, 10, 64)
-			return id, nil
+	if v, ok := out.Attributes["seq"]; ok {
+		if nv, ok := v.(*types.AttributeValueMemberN); ok {
+			end, perr := strconv.ParseInt(nv.Value, 10, 64)
+			if perr != nil {
+				return 0, perr
+			}
+			return end - int64(n) + 1, nil
 		}
 	}
 	return 0, errors.New("counter response missing seq")
@@ -185,6 +205,45 @@ func (s *Store) batchDelete(ctx context.Context, keys []map[string]types.Attribu
 		reqs := make([]types.WriteRequest, len(batch))
 		for j, k := range batch {
 			reqs[j] = types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: k}}
+		}
+		_, err := s.ddb.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: map[string][]types.WriteRequest{s.table: reqs},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteAllByPK deletes every item under one partition key.
+func (s *Store) deleteAllByPK(ctx context.Context, pk string) error {
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pk),
+		},
+		ProjectionExpression: aws.String("PK, SK"),
+	})
+	if err != nil {
+		return err
+	}
+	keys := make([]map[string]types.AttributeValue, len(items))
+	for i, it := range items {
+		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
+	}
+	return s.batchDelete(ctx, keys)
+}
+
+// batchPut writes items in batches of 25.
+func (s *Store) batchPut(ctx context.Context, items []map[string]types.AttributeValue) error {
+	for i := 0; i < len(items); i += 25 {
+		end := min(i+25, len(items))
+		batch := items[i:end]
+		reqs := make([]types.WriteRequest, len(batch))
+		for j, it := range batch {
+			reqs[j] = types.WriteRequest{PutRequest: &types.PutRequest{Item: it}}
 		}
 		_, err := s.ddb.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
 			RequestItems: map[string][]types.WriteRequest{s.table: reqs},
@@ -308,23 +367,30 @@ func (s *Store) Log(level, message string) {
 	_ = s.AddLog(context.Background(), AddLogParams{Level: level, Message: message})
 }
 
+func logItem(id int64, ts string, arg LogEntry) map[string]types.AttributeValue {
+	item := mustMarshalMap(Log{ID: id, Timestamp: ts, Level: arg.Level, Message: arg.Message})
+	item["PK"] = sv("LOG")
+	item["SK"] = sv(tsKey(ts, id))
+	item[attrTTL] = nv(ttlDays(90)) // generous TTL; TrimLogs is also called
+	return item
+}
+
+func itemToLog(it map[string]types.AttributeValue) Log {
+	var l Log
+	if err := attributevalue.UnmarshalMap(it, &l); err != nil {
+		slog.Error("unmarshal log", "err", err)
+	}
+	return l
+}
+
 func (s *Store) AddLog(ctx context.Context, arg AddLogParams) error {
 	id, err := s.nextID(ctx, "logs")
 	if err != nil {
 		return err
 	}
-	ts := Now()
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			"PK":    sv("LOG"),
-			"SK":    sv(tsKey(ts, id)),
-			"id":    nv(id),
-			"ts":    sv(ts),
-			"level": sv(arg.Level),
-			"msg":   sv(arg.Message),
-			attrTTL: nv(ttlDays(90)), // generous TTL; TrimLogs is also called
-		},
+		Item:      logItem(id, Now(), arg),
 	})
 	return err
 }
@@ -344,12 +410,7 @@ func (s *Store) GetLogs(ctx context.Context, limit int64) ([]Log, error) {
 	}
 	logs := make([]Log, 0, len(out.Items))
 	for _, it := range out.Items {
-		logs = append(logs, Log{
-			ID:        getInt64(it, "id"),
-			Timestamp: getStr(it, "ts"),
-			Level:     getStr(it, "level"),
-			Message:   getStr(it, "msg"),
-		})
+		logs = append(logs, itemToLog(it))
 	}
 	return logs, nil
 }
@@ -370,12 +431,7 @@ func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log
 	}
 	logs := make([]Log, 0, len(out))
 	for _, it := range out {
-		logs = append(logs, Log{
-			ID:        getInt64(it, "id"),
-			Timestamp: getStr(it, "ts"),
-			Level:     getStr(it, "level"),
-			Message:   getStr(it, "msg"),
-		})
+		logs = append(logs, itemToLog(it))
 	}
 	return logs, nil
 }
@@ -411,40 +467,18 @@ func (s *Store) QueriesTrimLogs(ctx context.Context, cutoff string) error {
 // ============================================================
 
 func accountItem(a Account) map[string]types.AttributeValue {
-	item := map[string]types.AttributeValue{
-		"PK":      sv("ACCOUNT"),
-		"SK":      sv(padID(a.ID)),
-		"id":      nv(a.ID),
-		"email":   sv(a.Email),
-		"creds":   sv(a.CredentialsJSON),
-		"addedAt": sv(a.AddedAt),
-		"active":  nv(a.Active),
-	}
-	if a.LastScanAt.Valid {
-		item["lastScan"] = sv(a.LastScanAt.String)
-	} else {
-		item["lastScan"] = &types.AttributeValueMemberNULL{Value: true}
-	}
-	if a.WatchHistoryID != "" {
-		item["watchHist"] = sv(a.WatchHistoryID)
-	}
-	if a.WatchExpiration != 0 {
-		item["watchExp"] = nv(a.WatchExpiration)
-	}
+	item := mustMarshalMap(a)
+	item["PK"] = sv("ACCOUNT")
+	item["SK"] = sv(padID(a.ID))
 	return item
 }
 
 func itemToAccount(it map[string]types.AttributeValue) Account {
-	return Account{
-		ID:              getInt64(it, "id"),
-		Email:           getStr(it, "email"),
-		CredentialsJSON: getStr(it, "creds"),
-		AddedAt:         getStr(it, "addedAt"),
-		LastScanAt:      getNullStr(it, "lastScan"),
-		Active:          getInt64(it, "active"),
-		WatchHistoryID:  getStr(it, "watchHist"),
-		WatchExpiration: getInt64(it, "watchExp"),
+	var a Account
+	if err := attributevalue.UnmarshalMap(it, &a); err != nil {
+		slog.Error("unmarshal account", "err", err)
 	}
+	return a
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
@@ -699,41 +733,18 @@ func (s *Store) DeleteAccountCascade(ctx context.Context, accountID int64) error
 // ============================================================
 
 func itemToPrompt(it map[string]types.AttributeValue) Prompt {
-	return Prompt{
-		ID:             getInt64(it, "id"),
-		Name:           getStr(it, "name"),
-		Instructions:   getStr(it, "instructions"),
-		LabelName:      getStr(it, attrLabelName),
-		Active:         getInt64(it, "active"),
-		CreatedAt:      getStr(it, attrCreatedAt),
-		ActionArchive:  getInt64(it, "actionArchive"),
-		ActionSpam:     getInt64(it, "actionSpam"),
-		ActionTrash:    getInt64(it, "actionTrash"),
-		ActionMarkRead: getInt64(it, "actionMarkRead"),
-		SortOrder:      getInt64(it, "sortOrder"),
-		StopProcessing: getInt64(it, "stopProcessing"),
-		AccountID:      getNullInt64(it, attrAccountID),
+	var p Prompt
+	if err := attributevalue.UnmarshalMap(it, &p); err != nil {
+		slog.Error("unmarshal prompt", "err", err)
 	}
+	return p
 }
 
 func promptToItem(p Prompt) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
-		"PK":             sv("PROMPT"),
-		"SK":             sv(padID(p.ID)),
-		"id":             nv(p.ID),
-		"name":           sv(p.Name),
-		"instructions":   sv(p.Instructions),
-		attrLabelName:    sv(p.LabelName),
-		"active":         nv(p.Active),
-		attrCreatedAt:    sv(p.CreatedAt),
-		"actionArchive":  nv(p.ActionArchive),
-		"actionSpam":     nv(p.ActionSpam),
-		"actionTrash":    nv(p.ActionTrash),
-		"actionMarkRead": nv(p.ActionMarkRead),
-		"sortOrder":      nv(p.SortOrder),
-		"stopProcessing": nv(p.StopProcessing),
-		attrAccountID:    nullInt64Attr(p.AccountID),
-	}
+	item := mustMarshalMap(p)
+	item["PK"] = sv("PROMPT")
+	item["SK"] = sv(padID(p.ID))
+	return item
 }
 
 func (s *Store) listAllPrompts(ctx context.Context) ([]Prompt, error) {
@@ -774,7 +785,7 @@ func (s *Store) ListPromptsByAccount(ctx context.Context, accountID sql.NullInt6
 	}
 	var filtered []Prompt
 	for _, p := range all {
-		if !p.AccountID.Valid || p.AccountID.Int64 == accountID.Int64 {
+		if p.AccountID == nil || *p.AccountID == accountID.Int64 {
 			filtered = append(filtered, p)
 		}
 	}
@@ -805,7 +816,7 @@ func (s *Store) ListActivePromptsByAccount(ctx context.Context, accountID sql.Nu
 		if p.Active == 0 {
 			continue
 		}
-		if accountID.Valid && p.AccountID.Valid && p.AccountID.Int64 != accountID.Int64 {
+		if accountID.Valid && p.AccountID != nil && *p.AccountID != accountID.Int64 {
 			continue
 		}
 		filtered = append(filtered, p)
@@ -848,7 +859,7 @@ func (s *Store) CreatePrompt(ctx context.Context, arg CreatePromptParams) (int64
 		ActionMarkRead: arg.ActionMarkRead,
 		SortOrder:      arg.SortOrder,
 		StopProcessing: arg.StopProcessing,
-		AccountID:      arg.AccountID,
+		AccountID:      nullInt64Ptr(arg.AccountID),
 	}
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
@@ -870,7 +881,7 @@ func (s *Store) UpdatePrompt(ctx context.Context, arg UpdatePromptParams) error 
 	p.ActionTrash = arg.ActionTrash
 	p.ActionMarkRead = arg.ActionMarkRead
 	p.StopProcessing = arg.StopProcessing
-	p.AccountID = arg.AccountID
+	p.AccountID = nullInt64Ptr(arg.AccountID)
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item:      promptToItem(p),
@@ -929,7 +940,7 @@ func (s *Store) DeletePromptsByAccount(ctx context.Context, accountID sql.NullIn
 	}
 	var keys []map[string]types.AttributeValue
 	for _, p := range all {
-		if p.AccountID.Valid && p.AccountID.Int64 == accountID.Int64 {
+		if p.AccountID != nil && *p.AccountID == accountID.Int64 {
 			keys = append(keys, map[string]types.AttributeValue{
 				"PK": sv("PROMPT"),
 				"SK": sv(padID(p.ID)),
@@ -984,7 +995,7 @@ func (s *Store) PromptExistsGlobal(ctx context.Context, name string) (int64, err
 		return 0, err
 	}
 	for _, p := range all {
-		if p.Name == name && !p.AccountID.Valid {
+		if p.Name == name && p.AccountID == nil {
 			return 1, nil
 		}
 	}
@@ -997,11 +1008,21 @@ func (s *Store) PromptExistsForAccount(ctx context.Context, arg PromptExistsForA
 		return 0, err
 	}
 	for _, p := range all {
-		if p.Name == arg.Name && p.AccountID == arg.AccountID {
+		if p.Name == arg.Name && accountIDMatches(p.AccountID, arg.AccountID) {
 			return 1, nil
 		}
 	}
 	return 0, nil
+}
+
+// accountIDMatches reports whether a prompt's (possibly nil) AccountID matches the
+// sql.NullInt64 filter value, including the case where both are unset (global prompt,
+// no account filter).
+func accountIDMatches(p *int64, filter sql.NullInt64) bool {
+	if p == nil {
+		return !filter.Valid
+	}
+	return filter.Valid && *p == filter.Int64
 }
 
 // ReorderPrompts updates sort_order for each prompt ID in order.
@@ -1022,20 +1043,35 @@ func (s *Store) ReorderPrompts(ctx context.Context, ids []int64) error {
 // ============================================================
 
 func itemToHistory(it map[string]types.AttributeValue) CategorizationHistory {
-	return CategorizationHistory{
-		ID:           getInt64(it, "id"),
-		Timestamp:    getStr(it, "ts"),
-		AccountID:    getInt64(it, attrAccountID),
-		AccountEmail: getStr(it, "accountEmail"),
-		MessageID:    getStr(it, attrMessageID),
-		Subject:      getStr(it, "subject"),
-		Sender:       getStr(it, "sender"),
-		PromptID:     getNullInt64(it, "promptId"),
-		PromptName:   getNullStr(it, "promptName"),
-		LabelName:    getNullStr(it, attrLabelName),
-		Actions:      getStr(it, "actions"),
-		LlmResponse:  getStr(it, "llmResponse"),
+	var h CategorizationHistory
+	if err := attributevalue.UnmarshalMap(it, &h); err != nil {
+		slog.Error("unmarshal history", "err", err)
 	}
+	return h
+}
+
+// historyItem builds a history item from id/ts (allocated by the caller) plus a
+// HistoryEntry write DTO. ttl isn't part of CategorizationHistory (it's DynamoDB-internal
+// expiry, never read back into the model), so it's added after marshaling.
+func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.AttributeValue {
+	item := mustMarshalMap(CategorizationHistory{
+		ID:           id,
+		Timestamp:    ts,
+		AccountID:    arg.AccountID,
+		AccountEmail: arg.AccountEmail,
+		MessageID:    arg.MessageID,
+		Subject:      arg.Subject,
+		Sender:       arg.Sender,
+		PromptID:     arg.PromptID,
+		PromptName:   arg.PromptName,
+		LabelName:    arg.LabelName,
+		Actions:      arg.Actions,
+		LlmResponse:  arg.LlmResponse,
+	})
+	item["PK"] = sv(pkHistory(arg.AccountID))
+	item["SK"] = sv(tsKey(ts, id))
+	item[attrTTL] = nv(ttlDays(90))
+	return item
 }
 
 func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
@@ -1043,26 +1079,9 @@ func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
 	if err != nil {
 		return err
 	}
-	ts := Now()
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			"PK":           sv(fmt.Sprintf("HIST#%d", arg.AccountID)),
-			"SK":           sv(tsKey(ts, id)),
-			"id":           nv(id),
-			"ts":           sv(ts),
-			attrAccountID:  nv(arg.AccountID),
-			"accountEmail": sv(arg.AccountEmail),
-			attrMessageID:  sv(arg.MessageID),
-			"subject":      sv(arg.Subject),
-			"sender":       sv(arg.Sender),
-			"promptId":     nullInt64Attr(arg.PromptID),
-			"promptName":   nullStrAttr(arg.PromptName),
-			attrLabelName:  nullStrAttr(arg.LabelName),
-			"actions":      sv(arg.Actions),
-			"llmResponse":  sv(arg.LlmResponse),
-			attrTTL:        nv(ttlDays(90)),
-		},
+		Item:      historyItem(id, Now(), arg),
 	})
 	return err
 }
@@ -1079,7 +1098,7 @@ func (s *Store) GetHistoryRow(ctx context.Context, id int64) (CategorizationHist
 			TableName:              aws.String(s.table),
 			KeyConditionExpression: aws.String("PK = :pk"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK: sv(pkHistory(acc.ID)),
 			},
 		})
 		if err != nil {
@@ -1116,16 +1135,41 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 		}
 	}
 
+	// With no text/prompt filter to apply in Go, each account's query can be capped at
+	// f.Limit directly in DynamoDB: per-account results are already newest-first, so the
+	// merged top f.Limit across accounts is still exact. Filtered queries (subject/sender
+	// substring, prompt id, unmatched) still read the full partition since matches can be
+	// sparse and a DynamoDB-side Limit would cut off pre-filter, not post-filter.
+	unfiltered := !f.Unmatched && f.PromptID == nil && f.SubjectQ == "" && f.SenderQ == ""
+
 	var all []CategorizationHistory
 	for _, aid := range accountIDs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK: sv(fmt.Sprintf("HIST#%d", aid)),
-			},
-			ScanIndexForward: aws.Bool(false),
-		})
+		var items []map[string]types.AttributeValue
+		var err error
+		if unfiltered && f.Limit > 0 {
+			var out *dynamodb.QueryOutput
+			out, err = s.ddb.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(s.table),
+				KeyConditionExpression: aws.String("PK = :pk"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					exprPK: sv(pkHistory(aid)),
+				},
+				ScanIndexForward: aws.Bool(false),
+				Limit:            aws.Int32(i32(f.Limit)),
+			})
+			if out != nil {
+				items = out.Items
+			}
+		} else {
+			items, err = s.queryAll(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(s.table),
+				KeyConditionExpression: aws.String("PK = :pk"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					exprPK: sv(pkHistory(aid)),
+				},
+				ScanIndexForward: aws.Bool(false),
+			})
+		}
 		if err != nil {
 			continue
 		}
@@ -1152,10 +1196,10 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 	// Apply filters in Go
 	var filtered []CategorizationHistory
 	for _, h := range all {
-		if f.Unmatched && h.PromptID.Valid {
+		if f.Unmatched && h.PromptID != nil {
 			continue
 		}
-		if f.PromptID != nil && (!h.PromptID.Valid || h.PromptID.Int64 != *f.PromptID) {
+		if f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID) {
 			continue
 		}
 		if f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)) {
@@ -1178,22 +1222,7 @@ func (s *Store) GetHistory(ctx context.Context, limit int64) ([]CategorizationHi
 }
 
 func (s *Store) DeleteHistoryByAccount(ctx context.Context, accountID int64) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("HIST#%d", accountID)),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
+	return s.deleteAllByPK(ctx, pkHistory(accountID))
 }
 
 func (s *Store) TrimHistory(ctx context.Context, retentionDays int) error {
@@ -1207,7 +1236,7 @@ func (s *Store) TrimHistory(ctx context.Context, retentionDays int) error {
 			TableName:              aws.String(s.table),
 			KeyConditionExpression: aws.String("PK = :pk AND SK < :cutoff"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK:    sv(fmt.Sprintf("HIST#%d", acc.ID)),
+				exprPK:    sv(pkHistory(acc.ID)),
 				":cutoff": sv(cutoff),
 			},
 			ProjectionExpression: aws.String("PK, SK"),
@@ -1224,39 +1253,36 @@ func (s *Store) TrimHistory(ctx context.Context, retentionDays int) error {
 	return nil
 }
 
-func (s *Store) GetPromptIDsByMessageID(ctx context.Context, messageID string) ([]sql.NullInt64, error) {
-	accs, err := s.ListAccounts(ctx)
+// GetPromptIDsByMessageID returns the distinct prompt ids recorded in history for one
+// message, scoped to the message's own account partition (the caller already knows the
+// account, e.g. from a prior GetHistoryRow) rather than fanning out across every account.
+func (s *Store) GetPromptIDsByMessageID(ctx context.Context, accountID int64, messageID string) ([]sql.NullInt64, error) {
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		FilterExpression:       aws.String("messageId = :mid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkHistory(accountID)),
+			":mid": sv(messageID),
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
 	seen := map[int64]bool{}
 	var result []sql.NullInt64
-	for _, acc := range accs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk"),
-			FilterExpression:       aws.String("messageId = :mid"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
-				":mid": sv(messageID),
-			},
-		})
-		if err != nil {
-			continue
-		}
-		for _, it := range items {
-			pid := getNullInt64(it, "promptId")
-			if pid.Valid && !seen[pid.Int64] {
-				seen[pid.Int64] = true
-				result = append(result, pid)
-			}
+	for _, it := range items {
+		pid := getNullInt64(it, "promptId")
+		if pid.Valid && !seen[pid.Int64] {
+			seen[pid.Int64] = true
+			result = append(result, pid)
 		}
 	}
 	return result, nil
 }
 
-func (s *Store) GetCurrentPromptIDsForMessage(ctx context.Context, messageID string) (map[int64]bool, error) {
-	nullIDs, err := s.GetPromptIDsByMessageID(ctx, messageID)
+func (s *Store) GetCurrentPromptIDsForMessage(ctx context.Context, accountID int64, messageID string) (map[int64]bool, error) {
+	nullIDs, err := s.GetPromptIDsByMessageID(ctx, accountID, messageID)
 	if err != nil {
 		return nil, err
 	}
@@ -1269,39 +1295,34 @@ func (s *Store) GetCurrentPromptIDsForMessage(ctx context.Context, messageID str
 	return set, nil
 }
 
-// RewriteHistoryForMessage rewrites categorization history for a message after manual correction.
+// RewriteHistoryForMessage rewrites categorization history for a message after manual
+// correction, scoped to base.AccountID (the caller already resolved the row, so the
+// account is known — no need to fan out across every account's partition).
 func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, keptIDs []int64, addedPrompts []Prompt, base CategorizationHistory) error {
-	// Find all history items for this message across all accounts
-	accs, err := s.ListAccounts(ctx)
-	if err != nil {
-		return err
-	}
 	keptSet := map[int64]bool{}
 	for _, id := range keptIDs {
 		keptSet[id] = true
 	}
 
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		FilterExpression:       aws.String("messageId = :mid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkHistory(base.AccountID)),
+			":mid": sv(messageID),
+		},
+	})
+	if err != nil {
+		return err
+	}
 	var deleteKeys []map[string]types.AttributeValue
-	for _, acc := range accs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk"),
-			FilterExpression:       aws.String("messageId = :mid"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK: sv(fmt.Sprintf("HIST#%d", acc.ID)),
-				":mid": sv(messageID),
-			},
-		})
-		if err != nil {
-			continue
-		}
-		for _, it := range items {
-			pid := getNullInt64(it, "promptId")
-			if len(keptIDs) == 0 || !pid.Valid || !keptSet[pid.Int64] {
-				deleteKeys = append(deleteKeys, map[string]types.AttributeValue{
-					"PK": it["PK"], "SK": it["SK"],
-				})
-			}
+	for _, it := range items {
+		pid := getNullInt64(it, "promptId")
+		if len(keptIDs) == 0 || !pid.Valid || !keptSet[pid.Int64] {
+			deleteKeys = append(deleteKeys, map[string]types.AttributeValue{
+				"PK": it["PK"], "SK": it["SK"],
+			})
 		}
 	}
 	if err := s.batchDelete(ctx, deleteKeys); err != nil {
@@ -1309,15 +1330,19 @@ func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, 
 	}
 
 	for _, p := range addedPrompts {
+		var labelName *string
+		if p.LabelName != "" {
+			labelName = ptr(p.LabelName)
+		}
 		if err := s.AddHistory(ctx, AddHistoryParams{
 			AccountID:    base.AccountID,
 			AccountEmail: base.AccountEmail,
 			MessageID:    messageID,
 			Subject:      base.Subject,
 			Sender:       base.Sender,
-			PromptID:     sql.NullInt64{Int64: p.ID, Valid: true},
-			PromptName:   sql.NullString{String: p.Name, Valid: true},
-			LabelName:    sql.NullString{String: p.LabelName, Valid: p.LabelName != ""},
+			PromptID:     ptr(p.ID),
+			PromptName:   ptr(p.Name),
+			LabelName:    labelName,
 			Actions:      "manual",
 		}); err != nil {
 			return err
@@ -1347,7 +1372,7 @@ func (s *Store) MarkProcessed(ctx context.Context, arg MarkProcessedParams) erro
 	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":    sv(fmt.Sprintf("PROC#%d", arg.AccountID)),
+			"PK":    sv(pkProcessed(arg.AccountID)),
 			"SK":    sv(arg.MessageID),
 			attrTTL: nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
 		},
@@ -1370,7 +1395,7 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 	keys := make([]map[string]types.AttributeValue, len(messageIDs))
 	for i, mid := range messageIDs {
 		keys[i] = map[string]types.AttributeValue{
-			"PK": sv(fmt.Sprintf("PROC#%d", accountID)),
+			"PK": sv(pkProcessed(accountID)),
 			"SK": sv(mid),
 		}
 	}
@@ -1401,22 +1426,7 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 }
 
 func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID int64) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("PROC#%d", accountID)),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
+	return s.deleteAllByPK(ctx, pkProcessed(accountID))
 }
 
 func (s *Store) TrimProcessedEmails(ctx context.Context, lookbackHours int) error {
@@ -1425,14 +1435,35 @@ func (s *Store) TrimProcessedEmails(ctx context.Context, lookbackHours int) erro
 }
 
 // BatchInsertProcessingResults persists logs, history, and marks the email processed.
+// BatchInsertProcessingResults writes one email's worth of log lines and history entries.
+// IDs are reserved for the whole group in a single counter increment per entity (instead
+// of one per item) and all items are written via BatchWriteItem — cutting what was ~2
+// DynamoDB writes per log/history line down to one counter update per entity plus one
+// batched write per 25 items.
 func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, accountID int64, messageID string) error {
-	for _, l := range logs {
-		if err := s.AddLog(ctx, l); err != nil {
+	ts := Now()
+	items := make([]map[string]types.AttributeValue, 0, len(logs)+len(history))
+
+	if len(logs) > 0 {
+		start, err := s.nextIDs(ctx, "logs", len(logs))
+		if err != nil {
 			return err
 		}
+		for i, l := range logs {
+			items = append(items, logItem(start+int64(i), ts, l))
+		}
 	}
-	for _, h := range history {
-		if err := s.AddHistory(ctx, h); err != nil {
+	if len(history) > 0 {
+		start, err := s.nextIDs(ctx, "history", len(history))
+		if err != nil {
+			return err
+		}
+		for i, h := range history {
+			items = append(items, historyItem(start+int64(i), ts, h))
+		}
+	}
+	if len(items) > 0 {
+		if err := s.batchPut(ctx, items); err != nil {
 			return err
 		}
 	}
@@ -1511,7 +1542,7 @@ func (s *Store) GetLabelRetention(ctx context.Context, accountID int64) ([]Label
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("LBL_RET#%d", accountID)),
+			exprPK: sv(pkLabelRetention(accountID)),
 		},
 	})
 	if err != nil {
@@ -1538,7 +1569,7 @@ func (s *Store) AddLabelRetention(ctx context.Context, arg AddLabelRetentionPara
 				_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 					TableName: aws.String(s.table),
 					Key: map[string]types.AttributeValue{
-						"PK": sv(fmt.Sprintf("LBL_RET#%d", arg.AccountID)),
+						"PK": sv(pkLabelRetention(arg.AccountID)),
 						"SK": sv(padID(r.ID)),
 					},
 					UpdateExpression: aws.String("SET days = :d"),
@@ -1557,7 +1588,7 @@ func (s *Store) AddLabelRetention(ctx context.Context, arg AddLabelRetentionPara
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":          sv(fmt.Sprintf("LBL_RET#%d", arg.AccountID)),
+			"PK":          sv(pkLabelRetention(arg.AccountID)),
 			"SK":          sv(padID(id)),
 			"id":          nv(id),
 			attrAccountID: nv(arg.AccountID),
@@ -1572,7 +1603,7 @@ func (s *Store) DeleteLabelRetention(ctx context.Context, arg DeleteLabelRetenti
 	_, err := s.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
-			"PK": sv(fmt.Sprintf("LBL_RET#%d", arg.AccountID)),
+			"PK": sv(pkLabelRetention(arg.AccountID)),
 			"SK": sv(padID(arg.ID)),
 		},
 	})
@@ -1580,22 +1611,7 @@ func (s *Store) DeleteLabelRetention(ctx context.Context, arg DeleteLabelRetenti
 }
 
 func (s *Store) DeleteLabelRetentionByAccount(ctx context.Context, accountID int64) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("LBL_RET#%d", accountID)),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
+	return s.deleteAllByPK(ctx, pkLabelRetention(accountID))
 }
 
 func (s *Store) LabelRetentionExists(ctx context.Context, arg LabelRetentionExistsParams) (int64, error) {
@@ -1616,7 +1632,7 @@ func (s *Store) GetLabelExemptions(ctx context.Context, accountID int64) ([]Labe
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("LBL_EX#%d", accountID)),
+			exprPK: sv(pkLabelExemption(accountID)),
 		},
 	})
 	if err != nil {
@@ -1649,7 +1665,7 @@ func (s *Store) AddLabelExemption(ctx context.Context, arg AddLabelExemptionPara
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item: map[string]types.AttributeValue{
-			"PK":          sv(fmt.Sprintf("LBL_EX#%d", arg.AccountID)),
+			"PK":          sv(pkLabelExemption(arg.AccountID)),
 			"SK":          sv(padID(id)),
 			"id":          nv(id),
 			attrAccountID: nv(arg.AccountID),
@@ -1663,7 +1679,7 @@ func (s *Store) DeleteLabelExemption(ctx context.Context, arg DeleteLabelExempti
 	_, err := s.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
-			"PK": sv(fmt.Sprintf("LBL_EX#%d", arg.AccountID)),
+			"PK": sv(pkLabelExemption(arg.AccountID)),
 			"SK": sv(padID(arg.ID)),
 		},
 	})
@@ -1671,22 +1687,7 @@ func (s *Store) DeleteLabelExemption(ctx context.Context, arg DeleteLabelExempti
 }
 
 func (s *Store) DeleteLabelExemptionsByAccount(ctx context.Context, accountID int64) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(fmt.Sprintf("LBL_EX#%d", accountID)),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
+	return s.deleteAllByPK(ctx, pkLabelExemption(accountID))
 }
 
 // ============================================================
@@ -1751,23 +1752,34 @@ func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID str
 // ============================================================
 
 func itemToSuggestion(it map[string]types.AttributeValue) PromptSuggestion {
-	return PromptSuggestion{
-		ID:                    getInt64(it, "id"),
-		CreatedAt:             getStr(it, attrCreatedAt),
-		UpdatedAt:             getStr(it, "updatedAt"),
-		PromptID:              getInt64(it, "promptId"),
-		CorrectionID:          getNullInt64(it, "correctionId"),
-		TriggerKind:           getStr(it, "triggerKind"),
-		MessageID:             getStr(it, attrMessageID),
-		EmailSubject:          getStr(it, "emailSubject"),
-		EmailSender:           getStr(it, "emailSender"),
-		EmailBodySnapshot:     getStr(it, "emailBodySnapshot"),
-		OriginalInstructions:  getStr(it, "originalInstructions"),
-		SuggestedInstructions: getStr(it, "suggestedInstructions"),
-		ConversationJSON:      getStr(it, "conversationJson"),
-		UserComment:           getStr(it, "userComment"),
-		Status:                getStr(it, attrStatus),
+	var sg PromptSuggestion
+	if err := attributevalue.UnmarshalMap(it, &sg); err != nil {
+		slog.Error("unmarshal suggestion", "err", err)
 	}
+	return sg
+}
+
+func suggestionItem(id int64, ts string, arg InsertPromptSuggestionParams) map[string]types.AttributeValue {
+	item := mustMarshalMap(PromptSuggestion{
+		ID:                    id,
+		CreatedAt:             ts,
+		UpdatedAt:             ts,
+		PromptID:              arg.PromptID,
+		CorrectionID:          nullInt64Ptr(arg.CorrectionID),
+		TriggerKind:           arg.TriggerKind,
+		MessageID:             arg.MessageID,
+		EmailSubject:          arg.EmailSubject,
+		EmailSender:           arg.EmailSender,
+		EmailBodySnapshot:     arg.EmailBodySnapshot,
+		OriginalInstructions:  arg.OriginalInstructions,
+		SuggestedInstructions: arg.SuggestedInstructions,
+		ConversationJSON:      arg.ConversationJSON,
+		UserComment:           "",
+		Status:                arg.Status,
+	})
+	item["PK"] = sv("SUGGESTION")
+	item["SK"] = sv(padID(id))
+	return item
 }
 
 func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSuggestionParams) (int64, error) {
@@ -1775,28 +1787,9 @@ func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSugg
 	if err != nil {
 		return 0, err
 	}
-	ts := Now()
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			"PK":                    sv("SUGGESTION"),
-			"SK":                    sv(padID(id)),
-			"id":                    nv(id),
-			attrCreatedAt:           sv(ts),
-			"updatedAt":             sv(ts),
-			"promptId":              nv(arg.PromptID),
-			"correctionId":          nullInt64Attr(arg.CorrectionID),
-			"triggerKind":           sv(arg.TriggerKind),
-			attrMessageID:           sv(arg.MessageID),
-			"emailSubject":          sv(arg.EmailSubject),
-			"emailSender":           sv(arg.EmailSender),
-			"emailBodySnapshot":     sv(arg.EmailBodySnapshot),
-			"originalInstructions":  sv(arg.OriginalInstructions),
-			"suggestedInstructions": sv(arg.SuggestedInstructions),
-			"conversationJson":      sv(arg.ConversationJSON),
-			"userComment":           sv(""),
-			attrStatus:              sv(arg.Status),
-		},
+		Item:      suggestionItem(id, Now(), arg),
 	})
 	return id, err
 }
@@ -1965,28 +1958,32 @@ func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, sugges
 // LLM Debug
 // ============================================================
 
+func llmDebugItem(id int64, ts string, arg AddLlmDebugParams) map[string]types.AttributeValue {
+	item := mustMarshalMap(LlmDebug{
+		ID:           id,
+		Timestamp:    ts,
+		AccountID:    arg.AccountID,
+		AccountEmail: arg.AccountEmail,
+		MessageID:    arg.MessageID,
+		Subject:      arg.Subject,
+		Sender:       arg.Sender,
+		GmailRaw:     arg.GmailRaw,
+		LlmRequest:   arg.LlmRequest,
+		LlmResponse:  arg.LlmResponse,
+	})
+	item["PK"] = sv("LLM_DEBUG")
+	item["SK"] = sv(padID(id))
+	return item
+}
+
 func (s *Store) AddLlmDebug(ctx context.Context, arg AddLlmDebugParams) error {
 	id, err := s.nextID(ctx, "llm_debug")
 	if err != nil {
 		return err
 	}
-	ts := Now()
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			"PK":           sv("LLM_DEBUG"),
-			"SK":           sv(padID(id)),
-			"id":           nv(id),
-			"ts":           sv(ts),
-			attrAccountID:  nv(arg.AccountID),
-			"accountEmail": sv(arg.AccountEmail),
-			attrMessageID:  sv(arg.MessageID),
-			"subject":      sv(arg.Subject),
-			"sender":       sv(arg.Sender),
-			"gmailRaw":     sv(arg.GmailRaw),
-			"llmRequest":   sv(arg.LlmRequest),
-			"llmResponse":  sv(arg.LlmResponse),
-		},
+		Item:      llmDebugItem(id, Now(), arg),
 	})
 	return err
 }
@@ -2031,20 +2028,17 @@ func (s *Store) GetLatestLlmDebug(ctx context.Context) ([]LlmDebug, error) {
 	}
 	result := make([]LlmDebug, len(out.Items))
 	for i, it := range out.Items {
-		result[i] = LlmDebug{
-			ID:           getInt64(it, "id"),
-			Timestamp:    getStr(it, "ts"),
-			AccountID:    getInt64(it, attrAccountID),
-			AccountEmail: getStr(it, "accountEmail"),
-			MessageID:    getStr(it, attrMessageID),
-			Subject:      getStr(it, "subject"),
-			Sender:       getStr(it, "sender"),
-			GmailRaw:     getStr(it, "gmailRaw"),
-			LlmRequest:   getStr(it, "llmRequest"),
-			LlmResponse:  getStr(it, "llmResponse"),
-		}
+		result[i] = itemToLlmDebug(it)
 	}
 	return result, nil
+}
+
+func itemToLlmDebug(it map[string]types.AttributeValue) LlmDebug {
+	var d LlmDebug
+	if err := attributevalue.UnmarshalMap(it, &d); err != nil {
+		slog.Error("unmarshal llm debug", "err", err)
+	}
+	return d
 }
 
 func (s *Store) DeleteIncompleteLlmDebug(ctx context.Context) error {
@@ -2254,7 +2248,7 @@ type ListAccountsSafeRow struct {
 	ID         int64
 	Email      string
 	AddedAt    string
-	LastScanAt sql.NullString
+	LastScanAt *string
 	Active     int64
 }
 
@@ -2269,9 +2263,9 @@ type HistoryEntry struct {
 	MessageID    string
 	Subject      string
 	Sender       string
-	PromptID     sql.NullInt64
-	PromptName   sql.NullString
-	LabelName    sql.NullString
+	PromptID     *int64
+	PromptName   *string
+	LabelName    *string
 	Actions      string
 	LlmResponse  string
 }

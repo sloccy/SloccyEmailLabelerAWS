@@ -1,9 +1,0 @@
-.git
-.claude
-*.md
-*.db
-node_modules
-docker-compose.yml
-docker-compose*.yml
-.env
-.env.*

@@ -10,9 +10,6 @@ node_modules/
 # Frontend third-party deps are loaded from jsDelivr (see templates/index.html), not vendored
 static/vendor/
 
-# Data
-*.db
-
 # Local dev helper binary (source: tools/sigv4proxy/main.go)
 /sigv4proxy
 

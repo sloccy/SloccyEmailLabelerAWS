@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"strconv"
+
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 type Config struct {
@@ -13,7 +15,6 @@ type Config struct {
 	LogRetentionDays   int
 	HistoryMaxLimit    int
 	DebugLogging       bool
-	CredentialsFile    string // path to credentials.json; CREDENTIALS_JSON env var takes precedence
 	Mode               string // "web", "scan", or "push"
 
 	// Gmail push (users.watch → Pub/Sub → PushFunction webhook).
@@ -33,14 +34,13 @@ type Config struct {
 
 func loadConfig() Config {
 	return Config{
-		BedrockModel:       getEnv("BEDROCK_MODEL", "us.amazon.nova-micro-v1:0"),
+		BedrockModel:       getEnv("BEDROCK_MODEL", llm.DefaultModel),
 		GmailMaxResults:    getEnvInt("GMAIL_MAX_RESULTS", 50),
 		GmailLookbackHours: getEnvInt("GMAIL_LOOKBACK_HOURS", 24),
 		EmailBodyTrunc:     getEnvInt("EMAIL_BODY_TRUNCATION", 3000),
 		LogRetentionDays:   getEnvInt("LOG_RETENTION_DAYS", 30),
 		HistoryMaxLimit:    getEnvInt("HISTORY_MAX_LIMIT", 500),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
-		CredentialsFile:    getEnv("CREDENTIALS_FILE", "/credentials/credentials.json"),
 		Mode:               getEnv("MODE", "web"),
 
 		PubSubTopic:        getEnv("PUBSUB_TOPIC", ""),

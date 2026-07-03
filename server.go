@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,7 +46,7 @@ const (
 type server struct {
 	ctx       context.Context
 	store     *db.Store
-	ollama    *llm.Client
+	llm       *llm.Client
 	cfg       *Config
 	auth      *gmail.Auth
 	secretKey []byte
@@ -64,11 +63,11 @@ type server struct {
 	modelsFetchedAt time.Time
 }
 
-func newServer(ctx context.Context, store *db.Store, ollamaClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
+func newServer(ctx context.Context, store *db.Store, llmClient *llm.Client, auth *gmail.Auth, cfg *Config, secretKey []byte) http.Handler {
 	s := &server{
 		ctx:        ctx,
 		store:      store,
-		ollama:     ollamaClient,
+		llm:        llmClient,
 		cfg:        cfg,
 		auth:       auth,
 		secretKey:  secretKey,
@@ -239,16 +238,9 @@ func (s *server) renderFragmentFile(w http.ResponseWriter, path string, data any
 
 func (s *server) fragmentResponse(w http.ResponseWriter, path string, data any, toast string) {
 	if toast != "" {
-		triggers := map[string]any{triggerShowToast: toast}
-		if b, err := json.Marshal(triggers); err == nil {
-			w.Header().Set("Hx-Trigger", string(b))
-		}
+		setHxTrigger(w, map[string]any{triggerShowToast: toast})
 	}
 	s.renderFragmentFile(w, path, data)
-}
-
-func (s *server) fragmentResponseNamed(w http.ResponseWriter, name string, data any) {
-	s.render(w, name, data)
 }
 
 func setHxTrigger(w http.ResponseWriter, triggers map[string]any) {
@@ -478,7 +470,7 @@ func (s *server) handleTogglePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	accounts, _ := s.store.ListAccountsSafe(ctx)
 	pv := dbPromptToView(p, buildAccountMap(accounts))
-	s.fragmentResponseNamed(w, "prompt_card_view", pv)
+	s.render(w, "prompt_card_view", pv)
 }
 
 func (s *server) handleEditPrompt(w http.ResponseWriter, r *http.Request) {
@@ -494,7 +486,7 @@ func (s *server) handleEditPrompt(w http.ResponseWriter, r *http.Request) {
 		Prompt:   dbPromptToView(p, buildAccountMap(accounts)),
 		Accounts: toAccountViews(accounts),
 	}
-	s.fragmentResponseNamed(w, "prompt_card_edit", data)
+	s.render(w, "prompt_card_edit", data)
 }
 
 func (s *server) handleViewPrompt(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +498,7 @@ func (s *server) handleViewPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accounts, _ := s.store.ListAccountsSafe(ctx)
-	s.fragmentResponseNamed(w, "prompt_card_view", dbPromptToView(p, buildAccountMap(accounts)))
+	s.render(w, "prompt_card_view", dbPromptToView(p, buildAccountMap(accounts)))
 }
 
 func buildAccountMap(accounts []db.ListAccountsSafeRow) map[int64]string {
@@ -525,10 +517,18 @@ func toAccountViews(accounts []db.ListAccountsSafeRow) []accountView {
 			Email:      a.Email,
 			Active:     a.Active != 0,
 			AddedAt:    a.AddedAt,
-			LastScanAt: a.LastScanAt.String,
+			LastScanAt: strOrEmpty(a.LastScanAt),
 		}
 	}
 	return views
+}
+
+// strOrEmpty dereferences a possibly-nil *string, returning "" for nil.
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func dbPromptToView(p db.Prompt, accountMap map[int64]string) promptView {
@@ -545,9 +545,9 @@ func dbPromptToView(p db.Prompt, accountMap map[int64]string) promptView {
 		ActionMarkRead: p.ActionMarkRead != 0,
 		StopProcessing: p.StopProcessing != 0,
 	}
-	if p.AccountID.Valid {
-		pv.AccountID = p.AccountID.Int64
-		pv.AccountEmail = accountMap[p.AccountID.Int64]
+	if p.AccountID != nil {
+		pv.AccountID = *p.AccountID
+		pv.AccountEmail = accountMap[*p.AccountID]
 	}
 	return pv
 }
@@ -565,7 +565,7 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	if time.Since(s.modelsFetchedAt) < modelCacheTTL && len(s.modelsCache) > 0 {
 		return s.modelsCache
 	}
-	models, err := s.ollama.ListAvailableModels(ctx)
+	models, err := s.llm.ListAvailableModels(ctx)
 	if err != nil {
 		slog.Warn("list bedrock models", "err", err)
 		return s.modelsCache // return stale on error
@@ -594,20 +594,19 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier string, mode
 	}
 }
 
+// settingOr returns the stored setting value, falling back to def when unset or empty.
+func (s *server) settingOr(ctx context.Context, key, def string) string {
+	if v, err := s.store.GetSetting(ctx, key); err == nil && v != "" {
+		return v
+	}
+	return def
+}
+
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
-	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
-	if classifyModel == "" {
-		classifyModel = s.cfg.BedrockModel
-	}
-	if improveModel == "" {
-		improveModel = s.cfg.BedrockModel
-	}
-	classifyTier, _ := s.store.GetSetting(ctx, llm.SettingClassifyTier)
-	if classifyTier == "" {
-		classifyTier = llm.ClassifyTierStandard
-	}
+	classifyModel := s.settingOr(ctx, llm.SettingClassifyModel, s.cfg.BedrockModel)
+	improveModel := s.settingOr(ctx, llm.SettingImproveModel, s.cfg.BedrockModel)
+	classifyTier := s.settingOr(ctx, llm.SettingClassifyTier, llm.ClassifyTierStandard)
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
 		settingsTemplateData(classifyModel, improveModel, classifyTier, models), "")
@@ -632,19 +631,13 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
 	// classify_model choice: the two tiers have different eligible-model policies (see
 	// classifyModelAllowed) enforced below.
-	classifyTier, _ := s.store.GetSetting(ctx, llm.SettingClassifyTier)
-	if classifyTier == "" {
-		classifyTier = llm.ClassifyTierStandard
-	}
+	classifyTier := s.settingOr(ctx, llm.SettingClassifyTier, llm.ClassifyTierStandard)
 	if v := r.FormValue("classify_tier"); v == llm.ClassifyTierStandard || v == llm.ClassifyTierFlex {
 		classifyTier = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyTier, Value: v})
 	}
 
-	classifyModel, _ := s.store.GetSetting(ctx, llm.SettingClassifyModel)
-	if classifyModel == "" {
-		classifyModel = s.cfg.BedrockModel
-	}
+	classifyModel := s.settingOr(ctx, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	if v := r.FormValue("classify_model"); v != "" {
 		if m := findModel(v); m != nil && classifyModelAllowed(*m, classifyTier) {
 			classifyModel = v
@@ -652,10 +645,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	improveModel, _ := s.store.GetSetting(ctx, llm.SettingImproveModel)
-	if improveModel == "" {
-		improveModel = s.cfg.BedrockModel
-	}
+	improveModel := s.settingOr(ctx, llm.SettingImproveModel, s.cfg.BedrockModel)
 	if v := r.FormValue("improve_model"); v != "" && validID(v) {
 		improveModel = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
@@ -672,7 +662,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logs, _ := s.store.GetLogs(ctx, 100)
-	s.fragmentResponseNamed(w, "logs_list", logs)
+	s.render(w, "logs_list", logs)
 }
 
 // ============================================================
@@ -727,8 +717,8 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 			AccountEmail:   h.AccountEmail,
 			Subject:        h.Subject,
 			Sender:         h.Sender,
-			PromptName:     h.PromptName.String,
-			LabelName:      h.LabelName.String,
+			PromptName:     strOrEmpty(h.PromptName),
+			LabelName:      strOrEmpty(h.LabelName),
 			HasLlmResponse: h.LlmResponse != "",
 		}
 		if h.Actions != "" {
@@ -914,6 +904,21 @@ func (s *server) handleRetentionQuery(w http.ResponseWriter, r *http.Request) {
 	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "")
 }
 
+// gmailServiceFor builds an authenticated Gmail client for account, wiring credential
+// refresh back to the store. Centralizes the OAuth-config + NewService + refresh-closure
+// boilerplate otherwise repeated at every call site.
+func (s *server) gmailServiceFor(ctx context.Context, account db.Account) (*gmail.Client, error) {
+	oauthCfg, err := s.auth.Config()
+	if err != nil {
+		return nil, err
+	}
+	return gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
+		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
+			CredentialsJSON: newCreds, ID: account.ID,
+		})
+	})
+}
+
 func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int64) retentionPanelData {
 	data := s.buildRetentionData(ctx, accountID)
 
@@ -922,17 +927,9 @@ func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int6
 	if err != nil {
 		return data // graceful: no labels, return empty dropdowns
 	}
-	oauthCfg, err := s.auth.ConfigFromFile()
+	svc, err := s.gmailServiceFor(ctx, account)
 	if err != nil {
-		return data // graceful: credentials unavailable
-	}
-	svc, err := gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
-		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-			CredentialsJSON: newCreds, ID: account.ID,
-		})
-	})
-	if err != nil {
-		return data // graceful: oauth failure
+		return data // graceful: credentials/oauth unavailable
 	}
 	labels, err := gmail.ListLabels(ctx, svc)
 	if err != nil {
@@ -1039,16 +1036,7 @@ func (s *server) startWatch(ctx context.Context, accountID int64, credJSON strin
 	if s.cfg.PubSubTopic == "" {
 		return
 	}
-	oauthCfg, err := s.auth.ConfigFromFile()
-	if err != nil {
-		slog.Error("watch: load oauth config", "err", err)
-		return
-	}
-	svc, err := gmail.NewService(ctx, credJSON, oauthCfg, func(newCreds string) {
-		_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-			CredentialsJSON: newCreds, ID: accountID,
-		})
-	})
+	svc, err := s.gmailServiceFor(ctx, db.Account{ID: accountID, CredentialsJSON: credJSON})
 	if err != nil {
 		slog.Error("watch: gmail service", "err", err)
 		return
@@ -1069,7 +1057,7 @@ func (s *server) startWatch(ctx context.Context, accountID int64, credJSON strin
 
 func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 	s.store.Log("INFO", "Manual scan triggered")
-	scanOnce(r.Context(), s.store, s.ollama, s.auth, s.cfg)
+	scanOnce(r.Context(), s.store, s.llm, s.auth, s.cfg)
 	setHxTrigger(w, map[string]any{
 		triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: "success"},
 		"refreshDashboard": "",
@@ -1208,6 +1196,10 @@ func (s *server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 		if exists != 0 {
 			continue
 		}
+		var accountID sql.NullInt64
+		if p.AccountID != nil {
+			accountID = sql.NullInt64{Int64: *p.AccountID, Valid: true}
+		}
 		_, _ = s.store.CreatePrompt(ctx, db.CreatePromptParams{
 			Name:           p.Name,
 			Instructions:   p.Instructions,
@@ -1218,7 +1210,7 @@ func (s *server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 			ActionMarkRead: p.ActionMarkRead,
 			SortOrder:      p.SortOrder,
 			StopProcessing: p.StopProcessing,
-			AccountID:      p.AccountID,
+			AccountID:      accountID,
 		})
 		imported++
 	}
@@ -1276,7 +1268,7 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch := s.ollama.StreamGeneratePromptInstruction(r.Context(), description)
+	ch := s.llm.StreamGeneratePromptInstruction(r.Context(), description)
 	for chunk := range ch {
 		if chunk.Err != nil {
 			break
@@ -1287,406 +1279,6 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = fmt.Fprintf(w, "data: {\"type\":\"done\"}\n\n")
 	flusher.Flush()
-}
-
-// ============================================================
-// Recategorize
-// ============================================================
-
-type recategorizeFormData struct {
-	HistoryID int64
-	MessageID string
-	AccountID int64
-	Subject   string
-	Sender    string
-	Prompts   []promptCheckbox
-}
-
-type promptCheckbox struct {
-	Prompt  db.Prompt
-	Checked bool
-}
-
-func (s *server) handleRecategorizeForm(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
-		return
-	}
-	ctx := r.Context()
-	row, err := s.store.GetHistoryRow(ctx, id)
-	if err != nil {
-		http.Error(w, "history row not found", http.StatusNotFound)
-		return
-	}
-
-	currentIDs, err := s.store.GetCurrentPromptIDsForMessage(ctx, row.MessageID)
-	if err != nil {
-		currentIDs = map[int64]bool{}
-	}
-
-	var prompts []db.Prompt
-	if row.AccountID != 0 {
-		prompts, _ = s.store.ListActivePromptsByAccount(ctx, sql.NullInt64{Int64: row.AccountID, Valid: true})
-	} else {
-		prompts, _ = s.store.ListActivePrompts(ctx)
-	}
-
-	checkboxes := make([]promptCheckbox, len(prompts))
-	for i, p := range prompts {
-		checkboxes[i] = promptCheckbox{Prompt: p, Checked: currentIDs[p.ID]}
-	}
-
-	data := recategorizeFormData{
-		HistoryID: id,
-		MessageID: row.MessageID,
-		AccountID: row.AccountID,
-		Subject:   row.Subject,
-		Sender:    row.Sender,
-		Prompts:   checkboxes,
-	}
-	s.fragmentResponse(w, "templates/fragments/recategorize_form.html", data, "")
-}
-
-func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
-	id := pathInt(r, "id")
-	if id == 0 {
-		http.Error(w, "bad id", http.StatusBadRequest)
-		return
-	}
-	ctx := r.Context()
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-
-	row, err := s.store.GetHistoryRow(ctx, id)
-	if err != nil {
-		http.Error(w, "history row not found", http.StatusNotFound)
-		return
-	}
-
-	// Build set of newly-requested prompt IDs
-	requested := make(map[int64]bool)
-	for _, v := range r.Form["prompt_ids"] {
-		pid, err := strconv.ParseInt(v, 10, 64)
-		if err == nil {
-			requested[pid] = true
-		}
-	}
-
-	// Build set of prompts to improve
-	improveSet := make(map[int64]bool)
-	for _, v := range r.Form["improve_prompt_ids"] {
-		pid, err := strconv.ParseInt(v, 10, 64)
-		if err == nil {
-			improveSet[pid] = true
-		}
-	}
-
-	note := r.FormValue("note")
-
-	// Current applied prompts
-	currentIDs, _ := s.store.GetCurrentPromptIDsForMessage(ctx, row.MessageID)
-
-	// Load all prompts for this account (to get labels + actions)
-	var allPrompts []db.Prompt
-	if row.AccountID != 0 {
-		allPrompts, _ = s.store.ListActivePromptsByAccount(ctx, sql.NullInt64{Int64: row.AccountID, Valid: true})
-	} else {
-		allPrompts, _ = s.store.ListActivePrompts(ctx)
-	}
-	promptByID := make(map[int64]db.Prompt, len(allPrompts))
-	for _, p := range allPrompts {
-		promptByID[p.ID] = p
-	}
-
-	// Compute diffs
-	var addedIDs, removedIDs []int64
-	for pid := range requested {
-		if !currentIDs[pid] {
-			addedIDs = append(addedIDs, pid)
-		}
-	}
-	for pid := range currentIDs {
-		if !requested[pid] {
-			removedIDs = append(removedIDs, pid)
-		}
-	}
-
-	// Build new current set for storage
-	newCurrentIDs := map[int64]bool{}
-	for pid := range currentIDs {
-		newCurrentIDs[pid] = true
-	}
-	for _, pid := range addedIDs {
-		newCurrentIDs[pid] = true
-	}
-	for _, pid := range removedIDs {
-		delete(newCurrentIDs, pid)
-	}
-
-	// Apply Gmail changes if we have an account
-	account, gmailErr := s.store.GetAccount(ctx, row.AccountID)
-	var svc *gmail.Client
-	if gmailErr == nil && row.AccountID != 0 {
-		oauthCfg, cfgErr := s.auth.ConfigFromFile()
-		if cfgErr == nil {
-			svc, _ = gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
-				_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-					CredentialsJSON: newCreds, ID: account.ID,
-				})
-			})
-		}
-	}
-
-	if svc != nil && (len(addedIDs) > 0 || len(removedIDs) > 0) {
-		var neededLabels []string
-		for _, pid := range addedIDs {
-			if p, ok := promptByID[pid]; ok && p.LabelName != "" {
-				neededLabels = append(neededLabels, p.LabelName)
-			}
-		}
-		labelCache, _ := gmail.BuildLabelCache(ctx, svc, neededLabels)
-
-		// Apply added prompts
-		var addModifies []gmail.Modify
-		for _, pid := range addedIDs {
-			p, ok := promptByID[pid]
-			if !ok {
-				continue
-			}
-			mod := gmail.Modify{MessageIDs: []string{row.MessageID}}
-			if p.LabelName != "" {
-				if labelID, ok := labelCache[p.LabelName]; ok {
-					mod.AddLabels = append(mod.AddLabels, labelID)
-				}
-			}
-			if p.ActionSpam != 0 {
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelSpam)
-				mod.RemoveLabels = append(mod.RemoveLabels, gmail.LabelInbox)
-			} else if p.ActionArchive != 0 {
-				mod.RemoveLabels = append(mod.RemoveLabels, gmail.LabelInbox)
-			}
-			if p.ActionMarkRead != 0 {
-				mod.RemoveLabels = append(mod.RemoveLabels, gmail.LabelUnread)
-			}
-			if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
-				addModifies = append(addModifies, mod)
-			}
-		}
-		if len(addModifies) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, addModifies)
-		}
-
-		// Reverse removed prompts
-		var removeModifies []gmail.Modify
-		var trashReverseIDs []string
-		for _, pid := range removedIDs {
-			p, ok := promptByID[pid]
-			if !ok {
-				continue
-			}
-			mod := gmail.Modify{MessageIDs: []string{row.MessageID}}
-			if p.LabelName != "" {
-				if labelID, ok := labelCache[p.LabelName]; ok {
-					mod.RemoveLabels = append(mod.RemoveLabels, labelID)
-				}
-			}
-			switch {
-			case p.ActionSpam != 0:
-				mod.RemoveLabels = append(mod.RemoveLabels, gmail.LabelSpam)
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelInbox)
-			case p.ActionTrash != 0:
-				// Untrash: remove TRASH, add INBOX
-				trashReverseIDs = append(trashReverseIDs, row.MessageID)
-			case p.ActionArchive != 0:
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelInbox)
-			}
-			if p.ActionMarkRead != 0 {
-				mod.AddLabels = append(mod.AddLabels, gmail.LabelUnread)
-			}
-			if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
-				removeModifies = append(removeModifies, mod)
-			}
-		}
-		if len(removeModifies) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, removeModifies)
-		}
-		if len(trashReverseIDs) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, []gmail.Modify{{
-				MessageIDs:   trashReverseIDs,
-				AddLabels:    []string{gmail.LabelInbox},
-				RemoveLabels: []string{gmail.LabelTrash},
-			}})
-		}
-	}
-
-	// Rewrite history so it mirrors the post-correction labeling state
-	var keptIDs []int64
-	for pid := range newCurrentIDs {
-		if !slices.Contains(addedIDs, pid) {
-			keptIDs = append(keptIDs, pid)
-		}
-	}
-	var addedPrompts []db.Prompt
-	for _, pid := range addedIDs {
-		if p, ok := promptByID[pid]; ok {
-			addedPrompts = append(addedPrompts, p)
-		}
-	}
-	_ = s.store.RewriteHistoryForMessage(ctx, row.MessageID, keptIDs, addedPrompts, db.CategorizationHistory{
-		AccountID:    row.AccountID,
-		AccountEmail: row.AccountEmail,
-		MessageID:    row.MessageID,
-		Subject:      row.Subject,
-		Sender:       row.Sender,
-	})
-
-	// Build CSV of new current prompt IDs
-	var newCurrentSlice []string
-	for pid := range newCurrentIDs {
-		newCurrentSlice = append(newCurrentSlice, strconv.FormatInt(pid, 10))
-	}
-
-	var addedCSV, removedCSV []string
-	for _, pid := range addedIDs {
-		addedCSV = append(addedCSV, strconv.FormatInt(pid, 10))
-	}
-	for _, pid := range removedIDs {
-		removedCSV = append(removedCSV, strconv.FormatInt(pid, 10))
-	}
-
-	correctionID, corrErr := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
-		AccountID:        row.AccountID,
-		MessageID:        row.MessageID,
-		AddedPrompts:     strings.Join(addedCSV, ","),
-		RemovedPrompts:   strings.Join(removedCSV, ","),
-		CurrentPromptIds: strings.Join(newCurrentSlice, ","),
-		Note:             note,
-	})
-
-	// Insert placeholder suggestion rows immediately, then kick off the LLM in the background.
-	if len(improveSet) > 0 && svc != nil {
-		msg, fetchErr := gmail.FetchMessage(ctx, svc, row.MessageID, 0)
-		if fetchErr != nil {
-			slog.Error("recategorize: fetch message for suggestions", "err", fetchErr)
-		} else {
-			var corrID sql.NullInt64
-			if corrErr == nil {
-				corrID = sql.NullInt64{Int64: correctionID, Valid: true}
-			}
-
-			triggerKinds := make(map[int64]string, len(improveSet))
-			for pid := range improveSet {
-				if slices.Contains(addedIDs, pid) {
-					triggerKinds[pid] = db.TriggerKindFalseNegative
-				} else {
-					triggerKinds[pid] = db.TriggerKindFalsePositive
-				}
-			}
-
-			suggestionIDs := make(map[int64]int64, len(improveSet))
-			for pid := range improveSet {
-				p, ok := promptByID[pid]
-				if !ok {
-					continue
-				}
-				sid, insertErr := s.store.InsertPromptSuggestion(ctx, db.InsertPromptSuggestionParams{
-					PromptID:              p.ID,
-					CorrectionID:          corrID,
-					TriggerKind:           triggerKinds[pid],
-					MessageID:             row.MessageID,
-					EmailSubject:          row.Subject,
-					EmailSender:           row.Sender,
-					EmailBodySnapshot:     msg.Body,
-					OriginalInstructions:  p.Instructions,
-					SuggestedInstructions: "",
-					ConversationJSON:      "[]",
-					Status:                db.SuggestionStatusGenerating,
-				})
-				if insertErr != nil {
-					slog.Error("recategorize: insert generating suggestion", "prompt_id", pid, "err", insertErr)
-					continue
-				}
-				suggestionIDs[pid] = sid
-			}
-			if len(suggestionIDs) > 0 {
-				go s.runImproveSuggestions(s.ctx, msg, suggestionIDs, promptByID, triggerKinds)
-			}
-		}
-	}
-
-	setHxTrigger(w, map[string]any{
-		triggerShowToast:              map[string]any{toastKeyMessage: "Recategorization applied", jsonKeyType: "success"},
-		"closeModal":                  "recategorize-modal",
-		triggerRefreshSuggestionBadge: "1",
-		"refreshHistory":              "1",
-		"refreshSuggestions":          "1",
-	})
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-}
-
-// runImproveSuggestions calls the LLM to generate prompt improvement suggestions
-// for each flagged prompt. The suggestion rows (status='generating') must already
-// exist in the DB before this is called. Runs in a goroutine so the recategorize
-// handler can return without waiting for Ollama.
-func (s *server) runImproveSuggestions(
-	baseCtx context.Context,
-	msg gmail.Message,
-	suggestionIDs map[int64]int64,
-	promptByID map[int64]db.Prompt,
-	triggerKinds map[int64]string,
-) {
-	ctx, cancel := context.WithTimeout(baseCtx, 20*time.Minute)
-	defer cancel()
-
-	slog.Info("improve suggestions start", "count", len(suggestionIDs))
-
-	for pid, sid := range suggestionIDs {
-		p, ok := promptByID[pid]
-		if !ok {
-			continue
-		}
-
-		suggested, conv, llmErr := s.ollama.ImprovePromptInstructions(ctx, llm.ImproveRequest{
-			PromptName:           p.Name,
-			LabelName:            p.LabelName,
-			OriginalInstructions: p.Instructions,
-			TriggerKind:          triggerKinds[pid],
-			EmailSubject:         msg.Subject,
-			EmailSender:          msg.Sender,
-			EmailBody:            msg.Body,
-		})
-		if llmErr != nil {
-			slog.Error("improve prompt", "prompt_id", pid, "err", llmErr)
-			if err := s.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
-				ID:                    sid,
-				SuggestedInstructions: "",
-				ConversationJSON:      "[]",
-				Status:                db.SuggestionStatusFailed,
-				UserComment:           llmErr.Error(),
-			}); err != nil {
-				slog.Error("finalize suggestion failed", "prompt_id", pid, "err", err)
-			}
-			continue
-		}
-
-		convJSON, _ := json.Marshal(conv) //nolint:errchkjson // []ChatMessage cannot fail
-
-		if err := s.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
-			ID:                    sid,
-			SuggestedInstructions: suggested,
-			ConversationJSON:      string(convJSON),
-			Status:                db.SuggestionStatusPending,
-			UserComment:           "",
-		}); err != nil {
-			slog.Error("finalize suggestion failed", "prompt_id", pid, "err", err)
-		}
-		slog.Info("improve suggestions: suggestion ready", "prompt_id", pid)
-	}
-
-	slog.Debug("improve suggestions done", "count", len(suggestionIDs))
 }
 
 // ============================================================
@@ -1801,7 +1393,7 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 		_ = json.Unmarshal([]byte(sg.ConversationJSON), &conv)
 	}
 
-	suggested, newConv, llmErr := s.ollama.ImprovePromptInstructions(ctx, llm.ImproveRequest{
+	suggested, newConv, llmErr := s.llm.ImprovePromptInstructions(ctx, llm.ImproveRequest{
 		PromptName:           p.Name,
 		LabelName:            p.LabelName,
 		OriginalInstructions: sg.OriginalInstructions,
@@ -1887,19 +1479,11 @@ func (s *server) ensureLabelForAccounts(ctx context.Context, labelName string, a
 	if err != nil {
 		return
 	}
-	oauthCfg, err := s.auth.ConfigFromFile()
-	if err != nil {
-		return
-	}
 	for _, account := range accounts {
 		if accountID.Valid && accountID.Int64 != account.ID {
 			continue
 		}
-		svc, err := gmail.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
-			_ = s.store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
-				CredentialsJSON: newCreds, ID: account.ID,
-			})
-		})
+		svc, err := s.gmailServiceFor(ctx, account)
 		if err != nil {
 			continue
 		}
