@@ -130,6 +130,15 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 	if account.Active == 0 {
 		return nil
 	}
+	// Skip stale/duplicate Pub/Sub redeliveries. Gmail history ids are monotonic and we
+	// advance WatchHistoryID past every change we process, so a notification whose id we've
+	// already passed carries nothing new — ack without the ListActivePrompts + history.list
+	// round trips. Empty baseline is left to ProcessAccountHistory's full-scan reseed.
+	if account.WatchHistoryID != "" {
+		if stored, perr := strconv.ParseUint(account.WatchHistoryID, 10, 64); perr == nil && historyID <= stored {
+			return nil
+		}
+	}
 	prompts, err := h.store.ListActivePrompts(ctx)
 	if err != nil {
 		return fmt.Errorf("list prompts: %w", err)
@@ -140,6 +149,7 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 		BodyTruncation:      h.cfg.EmailBodyTrunc,
 		DebugLogging:        h.cfg.DebugLogging,
 		ClassifyConcurrency: h.cfg.ClassifyConcurrency,
+		SuppressEmptyLog:    true,
 	}
 	start := time.Now()
 	// History-driven: only new inbox messages since the stored history id are processed,
