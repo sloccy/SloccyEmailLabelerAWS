@@ -285,6 +285,13 @@ func ttlDays(days int) int64 {
 	return time.Now().UTC().AddDate(0, 0, days).Unix()
 }
 
+// logHistoryTTLDays is the item-level TTL for logs and history — matches the deployed
+// default of LogRetentionDays (template.yaml), so DynamoDB's own TTL sweep now enforces
+// the real retention policy directly instead of needing a separate scan+delete pass (see
+// TrimLogs/TrimHistory below, now no-ops). If LogRetentionDays is ever overridden away
+// from 30 at deploy time, bump this to match.
+const logHistoryTTLDays = 30
+
 // ============================================================
 // Settings
 // ============================================================
@@ -367,9 +374,7 @@ func (s *Store) Log(level, message string) {
 }
 
 func logItem(id int64, ts string, arg LogEntry) map[string]types.AttributeValue {
-	// ttlDays(90) is a generous backstop; TrimLogs enforces the real (shorter, configurable)
-	// LogRetentionDays policy.
-	return keyedItem(Log{ID: id, Timestamp: ts, Level: arg.Level, Message: arg.Message}, "LOG", tsKey(ts, id), ttlDays(90))
+	return keyedItem(Log{ID: id, Timestamp: ts, Level: arg.Level, Message: arg.Message}, "LOG", tsKey(ts, id), ttlDays(logHistoryTTLDays))
 }
 
 func itemToLog(it map[string]types.AttributeValue) Log { return unmarshalItem[Log](it) }
@@ -427,30 +432,11 @@ func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log
 	return logs, nil
 }
 
-// TrimLogs deletes log items older than the cutoff timestamp.
-func (s *Store) TrimLogs(ctx context.Context, retentionDays int) error {
-	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format("2006-01-02 15:04:05")
-	return s.QueriesTrimLogs(ctx, cutoff)
-}
-
-func (s *Store) QueriesTrimLogs(ctx context.Context, cutoff string) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk AND SK < :cutoff"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK:    sv("LOG"),
-			":cutoff": sv(cutoff),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
-	if err != nil {
-		return err
-	}
-	keys := make([]map[string]types.AttributeValue, len(items))
-	for i, it := range items {
-		keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-	}
-	return s.batchDelete(ctx, keys)
+// TrimLogs is a no-op: log items carry logHistoryTTLDays as their item-level TTL, which
+// matches the deployed LogRetentionDays default, so DynamoDB's own TTL sweep now enforces
+// retention directly instead of this scan+delete pass.
+func (s *Store) TrimLogs(_ context.Context, _ int) error {
+	return nil
 }
 
 // ============================================================
@@ -1047,7 +1033,7 @@ func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.Attribu
 		LabelName:    arg.LabelName,
 		Actions:      arg.Actions,
 		LlmResponse:  arg.LlmResponse,
-	}, pkHistory(arg.AccountID), tsKey(ts, id), ttlDays(90))
+	}, pkHistory(arg.AccountID), tsKey(ts, id), ttlDays(logHistoryTTLDays))
 }
 
 func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
@@ -1197,31 +1183,10 @@ func (s *Store) DeleteHistoryByAccount(ctx context.Context, accountID int64) err
 	return s.deleteAllByPK(ctx, pkHistory(accountID))
 }
 
-func (s *Store) TrimHistory(ctx context.Context, retentionDays int) error {
-	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format("2006-01-02 15:04:05")
-	accs, err := s.ListAccounts(ctx)
-	if err != nil {
-		return err
-	}
-	for _, acc := range accs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk AND SK < :cutoff"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK:    sv(pkHistory(acc.ID)),
-				":cutoff": sv(cutoff),
-			},
-			ProjectionExpression: aws.String("PK, SK"),
-		})
-		if err != nil {
-			continue
-		}
-		keys := make([]map[string]types.AttributeValue, len(items))
-		for i, it := range items {
-			keys[i] = map[string]types.AttributeValue{"PK": it["PK"], "SK": it["SK"]}
-		}
-		_ = s.batchDelete(ctx, keys)
-	}
+// TrimHistory is a no-op: history items carry logHistoryTTLDays as their item-level TTL,
+// which matches the deployed LogRetentionDays default, so DynamoDB's own TTL sweep now
+// enforces retention directly instead of this per-account scan+delete fan-out.
+func (s *Store) TrimHistory(_ context.Context, _ int) error {
 	return nil
 }
 
