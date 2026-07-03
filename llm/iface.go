@@ -16,7 +16,8 @@ type StoreLogger interface {
 // *Client satisfies this; *FakeClient satisfies it for tests.
 type ClientIface interface {
 	Model() string
-	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt) (ClassifyResult, error)
+	ResolveClassifySettings(ctx context.Context) (model, tier string)
+	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string) (ClassifyResult, error)
 	BuildClassifyRequestJSON(email Email, prompts []Prompt) string
 	StreamGeneratePromptInstruction(ctx context.Context, description string) <-chan StreamChunk
 	ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error)
@@ -45,7 +46,11 @@ func NewFakeErrorClient() *FakeClient {
 
 func (c *FakeClient) Model() string { return c.model }
 
-func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt) (ClassifyResult, error) {
+func (c *FakeClient) ResolveClassifySettings(_ context.Context) (model, tier string) {
+	return c.model, ClassifyTierStandard
+}
+
+func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt, _, _ string) (ClassifyResult, error) {
 	if c.callErr != nil {
 		return ClassifyResult{}, c.callErr
 	}

@@ -43,8 +43,6 @@ func (s *FakeStore) nextID(entity string) int64 {
 	return s.counters[entity]
 }
 
-func (s *FakeStore) Close() error    { return nil }
-func (s *FakeStore) Migrate() error  { return nil }
 func (s *FakeStore) Log(_, _ string) {}
 
 func (s *FakeStore) GetSetting(_ context.Context, key string) (string, error) {
@@ -142,8 +140,7 @@ func (s *FakeStore) UpdateLastScan(_ context.Context, id int64) error {
 		return fmt.Errorf("account %d not found", id)
 	}
 	t := Now()
-	acc.LastScanAt.String = t
-	acc.LastScanAt.Valid = true
+	acc.LastScanAt = &t
 	return nil
 }
 
@@ -199,10 +196,10 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) ([]Ca
 		if f.AccountID != nil && h.AccountID != *f.AccountID {
 			continue
 		}
-		if f.PromptID != nil && (!h.PromptID.Valid || h.PromptID.Int64 != *f.PromptID) {
+		if f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID) {
 			continue
 		}
-		if f.Unmatched && h.PromptID.Valid {
+		if f.Unmatched && h.PromptID != nil {
 			continue
 		}
 		if f.SubjectQ != "" && !strings.Contains(h.Subject, f.SubjectQ) {

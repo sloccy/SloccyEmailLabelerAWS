@@ -78,6 +78,9 @@ type Client struct {
 	settings     Settings
 }
 
+// DefaultModel is the Bedrock model id used when nothing else specifies one.
+const DefaultModel = "us.amazon.nova-micro-v1:0"
+
 // NewClient creates a Bedrock client.
 // settings provides per-call model lookups (classify_model / improve_model keys).
 // defaultModel is the fallback when neither a setting nor BEDROCK_MODEL is set.
@@ -86,7 +89,7 @@ func NewClient(settings Settings, defaultModel string) *Client {
 		defaultModel = os.Getenv("BEDROCK_MODEL")
 	}
 	if defaultModel == "" {
-		defaultModel = "us.amazon.nova-micro-v1:0"
+		defaultModel = DefaultModel
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		// Generous read-timeout so the HTTP layer doesn't abort a queued flex-tier request
@@ -116,28 +119,37 @@ func NewClient(settings Settings, defaultModel string) *Client {
 // Model returns the default model (used by tests and the troubleshooting UI).
 func (c *Client) Model() string { return c.defaultModel }
 
-// resolveModel looks up the setting key in the store; falls back to defaultModel.
-func (c *Client) resolveModel(ctx context.Context, key string) string {
+// resolveSetting looks up key in the store; falls back to def when unset, empty, or the
+// store has no value.
+func (c *Client) resolveSetting(ctx context.Context, key, def string) string {
 	if c.settings != nil {
 		if v, err := c.settings.GetSetting(ctx, key); err == nil && v != "" {
 			return v
 		}
 	}
-	return c.defaultModel
+	return def
+}
+
+// resolveModel looks up the setting key in the store; falls back to defaultModel.
+func (c *Client) resolveModel(ctx context.Context, key string) string {
+	return c.resolveSetting(ctx, key, c.defaultModel)
 }
 
 // resolveClassifyTier looks up the classification service tier; defaults to "standard".
 func (c *Client) resolveClassifyTier(ctx context.Context) string {
-	if c.settings != nil {
-		if v, err := c.settings.GetSetting(ctx, SettingClassifyTier); err == nil && v != "" {
-			return v
-		}
-	}
-	return ClassifyTierStandard
+	return c.resolveSetting(ctx, SettingClassifyTier, ClassifyTierStandard)
+}
+
+// ResolveClassifySettings resolves the classify model and service tier once. Callers
+// classifying many emails in one pass (e.g. a scan) should call this once up front and
+// pass the result into each ClassifyEmailBatch call, instead of re-resolving (a
+// GetSetting DynamoDB read) per email.
+func (c *Client) ResolveClassifySettings(ctx context.Context) (model, tier string) {
+	return c.resolveModel(ctx, SettingClassifyModel), c.resolveClassifyTier(ctx)
 }
 
 // ============================================================
-// Public types (unchanged from ollama.go for caller compatibility)
+// Public types (preserved from the pre-Bedrock LLM client for caller compatibility)
 // ============================================================
 
 type Email struct {
@@ -418,7 +430,7 @@ func balancedBraceEnd(s string, start int) (end int, ok bool) {
 
 // classifyPayload returns the request pieces plus the service tier ("flex" or "" for
 // standard) selected for classification.
-func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration, string, string) {
+func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration) {
 	body := buildBody(email, prompts)
 	// Floor covers the forced tool-use JSON payload (schema-validated, so no markdown/
 	// prose overhead) plus the fallback's fenced free-text JSON for the same rule count.
@@ -436,9 +448,7 @@ func (c *Client) classifyPayload(ctx context.Context, email Email, prompts []Pro
 		MaxTokens:   aws.Int32(numPredict),
 		Temperature: aws.Float32(0),
 	}
-	model := c.resolveModel(ctx, SettingClassifyModel)
-	tier := c.resolveClassifyTier(ctx)
-	return msgs, inf, model, tier
+	return msgs, inf
 }
 
 // BuildClassifyRequestJSON returns the serialised Bedrock Converse payload (for Troubleshooting UI).
@@ -446,7 +456,8 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 	if len(prompts) == 0 {
 		return ""
 	}
-	msgs, inf, model, tier := c.classifyPayload(context.Background(), email, prompts)
+	model, tier := c.ResolveClassifySettings(context.Background())
+	msgs, inf := classifyPayload(email, prompts)
 	payload := map[string]any{
 		"modelId":         model,
 		"messages":        msgs,
@@ -463,12 +474,15 @@ func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string 
 	return string(b)
 }
 
-func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt) (ClassifyResult, error) {
+// ClassifyEmailBatch classifies one email against prompts using the given model and
+// service tier. Callers classifying many emails in one pass should resolve model/tier
+// once via ResolveClassifySettings and reuse them across calls.
+func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string) (ClassifyResult, error) {
 	if len(prompts) == 0 {
 		return ClassifyResult{}, nil
 	}
 
-	msgs, inf, model, tier := c.classifyPayload(ctx, email, prompts)
+	msgs, inf := classifyPayload(email, prompts)
 
 	reqPayload := map[string]any{
 		"modelId":         model,

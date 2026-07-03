@@ -32,7 +32,7 @@ func TestLoadConfigCredentialSources(t *testing.T) {
 			return "", nil
 		}
 
-		cfg, err := NewAuth("/nonexistent.json").loadConfig()
+		cfg, err := NewAuth().loadConfig()
 		if err != nil {
 			t.Fatalf("loadConfig: %v", err)
 		}
@@ -52,7 +52,7 @@ func TestLoadConfigCredentialSources(t *testing.T) {
 			return validCredsJSON, nil
 		}
 
-		cfg, err := NewAuth("/nonexistent.json").loadConfig()
+		cfg, err := NewAuth().loadConfig()
 		if err != nil {
 			t.Fatalf("loadConfig: %v", err)
 		}
@@ -61,6 +61,13 @@ func TestLoadConfigCredentialSources(t *testing.T) {
 		}
 		if cfg.ClientID != "cid" {
 			t.Errorf("ClientID = %q, want cid", cfg.ClientID)
+		}
+	})
+
+	t.Run("no source configured returns error", func(t *testing.T) {
+		_, err := NewAuth().loadConfig()
+		if err == nil {
+			t.Fatal("expected error when neither CREDENTIALS_JSON nor CREDENTIALS_SSM_PARAM is set")
 		}
 	})
 }

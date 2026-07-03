@@ -60,7 +60,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	keys := []string{
 		"BEDROCK_MODEL", "GMAIL_MAX_RESULTS", "GMAIL_LOOKBACK_HOURS", "EMAIL_BODY_TRUNCATION",
 		"LOG_RETENTION_DAYS",
-		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "CREDENTIALS_FILE", "MODE",
+		"HISTORY_MAX_LIMIT", "DEBUG_LOGGING", "MODE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
@@ -76,9 +76,6 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	}
 	if cfg.DebugLogging {
 		t.Error("DebugLogging should default to false")
-	}
-	if cfg.CredentialsFile != "/credentials/credentials.json" {
-		t.Errorf("CredentialsFile = %q", cfg.CredentialsFile)
 	}
 	if cfg.Mode != "web" {
 		t.Errorf("Mode = %q", cfg.Mode)

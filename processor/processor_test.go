@@ -1,7 +1,6 @@
 package processor
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -28,19 +27,106 @@ func newLLMServer(t *testing.T, response string) *llm.FakeClient {
 }
 
 // ============================================================
+// ModifyForPrompt
+// ============================================================
+
+func TestModifyForPrompt(t *testing.T) {
+	tests := []struct {
+		name       string
+		prompt     db.Prompt
+		labelID    string
+		wantAdd    []string
+		wantRemove []string
+		wantTrash  bool
+	}{
+		{
+			name:    "label only",
+			prompt:  db.Prompt{LabelName: "Newsletters"},
+			labelID: "Label_1",
+			wantAdd: []string{"Label_1"},
+		},
+		{
+			name:    "label not resolved yet — no add",
+			prompt:  db.Prompt{LabelName: "Newsletters"},
+			labelID: "",
+			wantAdd: nil,
+		},
+		{
+			name:       "spam adds SPAM, removes INBOX",
+			prompt:     db.Prompt{ActionSpam: 1},
+			wantAdd:    []string{gmailpkg.LabelSpam},
+			wantRemove: []string{gmailpkg.LabelInbox},
+		},
+		{
+			name:      "trash sets trash flag, no label mutation",
+			prompt:    db.Prompt{ActionTrash: 1},
+			wantTrash: true,
+		},
+		{
+			name:       "archive removes INBOX",
+			prompt:     db.Prompt{ActionArchive: 1},
+			wantRemove: []string{gmailpkg.LabelInbox},
+		},
+		{
+			name:       "mark read removes UNREAD, composes with label",
+			prompt:     db.Prompt{LabelName: "Receipts", ActionMarkRead: 1},
+			labelID:    "Label_2",
+			wantAdd:    []string{"Label_2"},
+			wantRemove: []string{gmailpkg.LabelUnread},
+		},
+		{
+			name:       "spam takes priority over trash/archive",
+			prompt:     db.Prompt{ActionSpam: 1, ActionTrash: 1, ActionArchive: 1},
+			wantAdd:    []string{gmailpkg.LabelSpam},
+			wantRemove: []string{gmailpkg.LabelInbox},
+			wantTrash:  false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mod, trash := ModifyForPrompt(tc.prompt, tc.labelID)
+			if !slicesEqual(mod.AddLabels, tc.wantAdd) {
+				t.Errorf("AddLabels = %v, want %v", mod.AddLabels, tc.wantAdd)
+			}
+			if !slicesEqual(mod.RemoveLabels, tc.wantRemove) {
+				t.Errorf("RemoveLabels = %v, want %v", mod.RemoveLabels, tc.wantRemove)
+			}
+			if trash != tc.wantTrash {
+				t.Errorf("trash = %v, want %v", trash, tc.wantTrash)
+			}
+			if len(mod.MessageIDs) != 0 {
+				t.Errorf("MessageIDs should be left for the caller to set, got %v", mod.MessageIDs)
+			}
+		})
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ============================================================
 // filterPrompts
 // ============================================================
 
 func TestFilterPrompts(t *testing.T) {
-	prompt := func(id int64, active int64, accountID sql.NullInt64) db.Prompt {
+	prompt := func(id int64, active int64, accountID *int64) db.Prompt {
 		return db.Prompt{ID: id, Name: "P", Instructions: "x", Active: active, AccountID: accountID}
 	}
 
 	global := func(id int64, active int64) db.Prompt {
-		return prompt(id, active, sql.NullInt64{Valid: false})
+		return prompt(id, active, nil)
 	}
 	forAccount := func(id int64, active int64, accID int64) db.Prompt {
-		return prompt(id, active, sql.NullInt64{Int64: accID, Valid: true})
+		return prompt(id, active, &accID)
 	}
 
 	tests := []struct {
@@ -155,7 +241,7 @@ func newTestAccount() db.Account {
 func TestProcessEmail_MatchedPrompt(t *testing.T) {
 	store := newTestStore(t)
 	// LLM returns {"1": true} — prompt 1 matches.
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "msg1", Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
@@ -164,14 +250,14 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "Label_42"}
 
-	modifies, trashIDs := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, labelCache, false)
+	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected at least one modify")
 	}
 	found := false
 	for _, m := range modifies {
-		if m.MessageID == "msg1" {
+		if contains(m.MessageIDs, "msg1") {
 			found = true
 			if !contains(m.AddLabels, "Label_42") {
 				t.Errorf("AddLabels = %v, want Label_42", m.AddLabels)
@@ -188,7 +274,7 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 
 func TestProcessEmail_NoMatch(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": false}`)
+	llmClient := newLLMServer(t, `{"1": false}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "msg2", Subject: "Regular", Sender: "user@test.com"}
@@ -196,7 +282,7 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
 	}
 
-	modifies, trashIDs := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, nil, false)
+	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
 
 	if len(modifies) != 0 {
 		t.Errorf("expected no modifies for no-match, got %v", modifies)
@@ -208,7 +294,7 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 
 func TestProcessEmail_TrashAction(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "trash1", Subject: "Spam", Sender: "spam@test.com"}
@@ -216,7 +302,7 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 		{ID: 5, Name: "Spam", LabelName: "spam", ActionTrash: 1, Active: 1, Instructions: "trash spam"},
 	}
 
-	_, trashIDs := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, map[string]string{}, false)
+	_, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, map[string]string{}, false, "", "")
 
 	if !contains(trashIDs, "trash1") {
 		t.Errorf("expected trash1 in trashIDs, got %v", trashIDs)
@@ -226,7 +312,7 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 func TestProcessEmail_StopProcessing(t *testing.T) {
 	store := newTestStore(t)
 	// Both prompts match, but prompt 1 has StopProcessing=1.
-	ollamaClient := newLLMServer(t, `{"1": true, "2": true}`)
+	llmClient := newLLMServer(t, `{"1": true, "2": true}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "stop1", Subject: "Test"}
@@ -236,7 +322,7 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 	}
 	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
 
-	modifies, _ := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, labelCache, false)
+	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
 
 	for _, m := range modifies {
 		if contains(m.AddLabels, "L2") {
@@ -247,13 +333,13 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 
 func TestProcessEmail_LLMError(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := llm.NewFakeErrorClient()
+	llmClient := llm.NewFakeErrorClient()
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "err1", Subject: "Test"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 
-	modifies, trashIDs := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, nil, false)
+	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
 
 	// On LLM error, processEmail returns nil and does NOT mark the message processed.
 	if len(modifies) != 0 || len(trashIDs) != 0 {
@@ -263,7 +349,7 @@ func TestProcessEmail_LLMError(t *testing.T) {
 
 func TestProcessEmail_ArchiveAction(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "arch1", Subject: "Archive me"}
@@ -271,7 +357,7 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 		{ID: 1, Name: "Archive", LabelName: "", ActionArchive: 1, Active: 1, Instructions: "archive"},
 	}
 
-	modifies, _ := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, nil, false)
+	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected a modify for archive action")
@@ -289,7 +375,7 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 
 func TestProcessEmail_MarkReadAction(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "read1", Subject: "Mark me read"}
@@ -297,7 +383,7 @@ func TestProcessEmail_MarkReadAction(t *testing.T) {
 		{ID: 1, Name: "MarkRead", LabelName: "", ActionMarkRead: 1, Active: 1, Instructions: "mark read"},
 	}
 
-	modifies, _ := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, nil, false)
+	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
 
 	found := false
 	for _, m := range modifies {
@@ -316,7 +402,7 @@ func TestProcessEmail_MarkReadAction(t *testing.T) {
 
 func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 
 	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "test@example.com"})
 	account := db.Account{ID: accID, Email: "test@example.com", Active: 1}
@@ -326,7 +412,7 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "L1"}
 
-	processEmail(t.Context(), store, ollamaClient, account, msg, prompts, labelCache, false)
+	processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
 
 	// Verify history was written.
 	history, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &accID, Limit: 10})
@@ -346,14 +432,14 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 
 func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": false}`)
+	llmClient := newLLMServer(t, `{"1": false}`)
 
 	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "test@example.com"})
 	account := db.Account{ID: accID, Email: "test@example.com", Active: 1}
 	msg := gmailpkg.Message{ID: "nomatch1", Subject: "No Match"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", Active: 1, Instructions: "x"}}
 
-	processEmail(t.Context(), store, ollamaClient, account, msg, prompts, nil, false)
+	processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
 
 	history, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
 	found := false
@@ -399,7 +485,7 @@ func TestClassifyConcurrency(t *testing.T) {
 // the shared FakeStore and the mutex-guarded accumulators are race-free.
 func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 	store := newTestStore(t)
-	ollamaClient := newLLMServer(t, `{"1": true}`)
+	llmClient := newLLMServer(t, `{"1": true}`)
 	account := newTestAccount()
 	prompts := []db.Prompt{
 		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
@@ -421,13 +507,13 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, _ := processEmail(t.Context(), store, ollamaClient, account, msg, prompts, labelCache, false)
+			modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
 
 			mu.Lock()
 			defer mu.Unlock()
 			for _, m := range modifies {
-				if contains(m.AddLabels, "Label_42") {
-					seen[m.MessageID] = true
+				if contains(m.AddLabels, "Label_42") && len(m.MessageIDs) > 0 {
+					seen[m.MessageIDs[0]] = true
 				}
 			}
 		}()

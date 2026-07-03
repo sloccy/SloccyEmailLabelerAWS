@@ -38,7 +38,6 @@ type pushHandler struct {
 // Auth is enforced in-app by validating the Google-signed OIDC token on each request.
 func runPush(cfg Config) {
 	store, llmClient, gmailAuth, _ := buildDeps(cfg)
-	defer func() { _ = store.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

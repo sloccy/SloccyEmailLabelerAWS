@@ -47,9 +47,6 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
-	if err := store.Migrate(); err != nil {
-		log.Fatalf("migrate db: %v", err)
-	}
 	if err := store.SeedSetting(llm.SettingClassifyModel, cfg.BedrockModel); err != nil {
 		log.Fatalf("seed classify_model: %v", err)
 	}
@@ -61,13 +58,12 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth, []byte) {
 		log.Fatalf("secret key: %v", err)
 	}
 	llmClient := llm.NewClient(store, cfg.BedrockModel)
-	gmailAuth := gmail.NewAuth(cfg.CredentialsFile)
+	gmailAuth := gmail.NewAuth()
 	return store, llmClient, gmailAuth, secretKey
 }
 
 func runWeb(cfg Config) {
 	store, llmClient, gmailAuth, secretKey := buildDeps(cfg)
-	defer func() { _ = store.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
