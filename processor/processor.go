@@ -243,13 +243,11 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 	// instead of redoing work.
 	jobCh := make(chan writeJob, classifyConcurrency(cfg.ClassifyConcurrency))
 	var writerWG sync.WaitGroup
-	writerWG.Add(1)
-	go func() {
-		defer writerWG.Done()
+	writerWG.Go(func() {
 		for job := range jobCh {
 			applyWriteJob(ctx, store, job)
 		}
-	}()
+	})
 
 	sem := make(chan struct{}, classifyConcurrency(cfg.ClassifyConcurrency))
 	for msg := range msgCh {
