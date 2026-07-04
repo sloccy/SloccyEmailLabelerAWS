@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -189,6 +191,9 @@ func TestClassifyEmailBatch_ToolUseSuccess(t *testing.T) {
 	if !res.Results[101] || res.Results[102] {
 		t.Errorf("Results = %v, want {101:true, 102:false}", res.Results)
 	}
+	if res.LatencyMs < 0 {
+		t.Errorf("LatencyMs = %d, want >= 0", res.LatencyMs)
+	}
 }
 
 func TestClassifyEmailBatch_FallsBackWhenNoToolUseBlock(t *testing.T) {
@@ -252,6 +257,63 @@ func TestClassifyEmailBatch_BothCallsFail(t *testing.T) {
 	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
 	if err == nil {
 		t.Fatal("expected error when both the tool-use call and the fallback fail")
+	}
+}
+
+// recordingLogger captures every Log call so tests can assert on level/message.
+type recordingLogger struct{ entries []string }
+
+func (r *recordingLogger) Log(level, message string) {
+	r.entries = append(r.entries, level+": "+message)
+}
+
+// fakeTimeoutError mimics the net/http client-timeout error shape (a Timeout() bool method),
+// which is what actually surfaces when bedrockHTTPTimeout aborts a stuck Converse call.
+type fakeTimeoutError struct{}
+
+func (fakeTimeoutError) Error() string { return "context deadline exceeded (Client.Timeout exceeded)" }
+func (fakeTimeoutError) Timeout() bool { return true }
+
+func TestIsBedrockTimeout(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain error", errors.New("ValidationException"), false},
+		{"context deadline exceeded", context.DeadlineExceeded, true},
+		{"wrapped context deadline exceeded", fmt.Errorf("converse: %w", context.DeadlineExceeded), true},
+		{"timeout-shaped error", fakeTimeoutError{}, true},
+		{"wrapped timeout-shaped error", fmt.Errorf("converse: %w", fakeTimeoutError{}), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isBedrockTimeout(c.err); got != c.want {
+				t.Errorf("isBedrockTimeout(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestClassifyEmailBatch_TimeoutLoggedOnce(t *testing.T) {
+	// Both the primary tool-use call and the plain-Converse retry time out; only one
+	// TIMEOUT log entry should be recorded per ClassifyEmailBatch call.
+	fake := &fakeConverseAPI{errs: []error{fakeTimeoutError{}, fakeTimeoutError{}}}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	logger := &recordingLogger{}
+	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	if err == nil {
+		t.Fatal("expected error when both calls time out")
+	}
+	var timeoutLogs int
+	for _, e := range logger.entries {
+		if strings.HasPrefix(e, LogLevelTimeout+": ") {
+			timeoutLogs++
+		}
+	}
+	if timeoutLogs != 1 {
+		t.Errorf("expected exactly 1 TIMEOUT log entry, got %d: %v", timeoutLogs, logger.entries)
 	}
 }
 

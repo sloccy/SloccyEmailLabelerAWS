@@ -14,6 +14,21 @@
     <div class="stat-value font-monospace">{{.ScanCadence}}</div>
     <div class="stat-desc">Automatic</div>
   </div>
+  <div class="stat stat-accent-danger">
+    <div class="stat-title">Bedrock Timeouts</div>
+    <div class="stat-value text-danger font-monospace">{{.TimeoutCount}}</div>
+    <div class="stat-desc">Last 30 days</div>
+  </div>
+</div>
+<div class="chart-row mb-4">
+  <div class="chart-card">
+    <h6 class="section-title">LLM Latency Distribution (30d)</h6>
+    {{.TurnaroundBox}}
+  </div>
+  <div class="chart-card">
+    <h6 class="section-title">Avg Latency / Hour</h6>
+    {{.TurnaroundLine}}
+  </div>
 </div>
 <h6 class="section-title">Recent Activity</h6>
 {{template "logs_list" .Logs}}

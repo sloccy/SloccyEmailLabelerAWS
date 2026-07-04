@@ -442,6 +442,30 @@ func (s *Store) GetLogs(ctx context.Context, limit int64) ([]Log, error) {
 	return logs, nil
 }
 
+// CountLogsByLevel returns how many logs at the given level were recorded at or after
+// since — used for the dashboard's rolling 30-day Bedrock-timeout counter.
+func (s *Store) CountLogsByLevel(ctx context.Context, level string, since time.Time) (int64, error) {
+	sinceKey := tsKey(since.UTC().Format("2006-01-02 15:04:05"), 0)
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK:   sv("LOG"),
+			":since": sv(sinceKey),
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, it := range items {
+		if getStr(it, "level") == level {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log, error) {
 	out, err := s.queryAll(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
@@ -1064,6 +1088,7 @@ func historyItem(id int64, ts string, arg HistoryEntry) map[string]types.Attribu
 		LabelName:    arg.LabelName,
 		Actions:      arg.Actions,
 		LlmResponse:  arg.LlmResponse,
+		DurationMs:   arg.DurationMs,
 	}, pkHistory(arg.AccountID), tsKey(ts, id), ttlDays(logHistoryTTLDays))
 }
 
@@ -1203,6 +1228,60 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 		}
 	}
 	return filtered, nil
+}
+
+// TurnaroundSample is one LLM latency data point (one per processed email) used to build
+// the dashboard's turnaround-time charts.
+type TurnaroundSample struct {
+	Timestamp  string
+	DurationMs int64
+}
+
+// GetTurnaroundSamples returns latency samples recorded since the given time, one per
+// email. A single email can produce multiple history rows (one per matched rule, all
+// carrying the same LLM latency), so rows are deduped by MessageID.
+func (s *Store) GetTurnaroundSamples(ctx context.Context, since time.Time) ([]TurnaroundSample, error) {
+	accs, err := s.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// SK is "ts#paddedID"; padID(0) is all zeros, so this is the smallest possible SK at
+	// or after `since`, letting DynamoDB skip older rows instead of reading the whole
+	// partition.
+	sinceKey := tsKey(since.UTC().Format("2006-01-02 15:04:05"), 0)
+
+	seen := make(map[string]bool)
+	var samples []TurnaroundSample
+	for _, acc := range accs {
+		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.table),
+			KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				exprPK:   sv(pkHistory(acc.ID)),
+				":since": sv(sinceKey),
+			},
+		})
+		if err != nil {
+			continue
+		}
+		for _, it := range items {
+			dur := getInt64(it, "durationMs")
+			if dur <= 0 {
+				continue
+			}
+			if msgID := getStr(it, "messageId"); msgID != "" {
+				if seen[msgID] {
+					continue
+				}
+				seen[msgID] = true
+			}
+			samples = append(samples, TurnaroundSample{
+				Timestamp:  getStr(it, "ts"),
+				DurationMs: dur,
+			})
+		}
+	}
+	return samples, nil
 }
 
 // DeleteHistoryByAccount deletes every history row for one account.
@@ -2189,6 +2268,7 @@ type HistoryEntry struct {
 	LabelName    *string
 	Actions      string
 	LlmResponse  string
+	DurationMs   int64
 }
 
 type HistoryFilter struct {
