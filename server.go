@@ -169,9 +169,7 @@ func (s *server) registerRoutes() {
 			http.NotFound(w, r)
 			return
 		}
-		s.render(w, "index.html", map[string]any{
-			"ScanCadence": scanCadenceLabel,
-		})
+		s.render(w, "index.html", nil)
 	})
 
 	// Fragments
