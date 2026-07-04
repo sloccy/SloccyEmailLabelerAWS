@@ -49,10 +49,18 @@ func quartiles(vals []int64) (lo, q1, med, q3, hi int64) {
 	return vals[0], pct(0.25), pct(0.5), pct(0.75), vals[n-1]
 }
 
+// emptyTextBasePx is the "no data yet" font size, in the box chart's own coordinate
+// space (boxChartWidth). The browser scales each chart's differently-sized viewBox to fill
+// an (approximately) equal-width card, so a chart wider than boxChartWidth needs a
+// proportionally larger inline font-size to end up the same on-screen size as the box
+// chart's — which is the reference look here.
+const emptyTextBasePx = 13.0
+
 func emptyChartSVG(w int, msg string) template.HTML {
+	fontPx := emptyTextBasePx * float64(w) / float64(boxChartWidth)
 	return template.HTML(fmt.Sprintf( //nolint:gosec // msg is always one of this file's own constant strings, never user input, and is HTML-escaped regardless
-		`<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="%s"><text x="%d" y="%d" text-anchor="middle" class="chart-empty">%s</text></svg>`,
-		w, chartHeight, template.HTMLEscapeString(msg), w/2, chartHeight/2, template.HTMLEscapeString(msg)))
+		`<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="%s"><text x="%d" y="%d" style="font-size:%.1fpx" text-anchor="middle" class="chart-empty">%s</text></svg>`,
+		w, chartHeight, template.HTMLEscapeString(msg), w/2, chartHeight/2, fontPx, template.HTMLEscapeString(msg)))
 }
 
 // buildBoxPlotSVG renders a single box-and-whisker plot summarizing the latency
