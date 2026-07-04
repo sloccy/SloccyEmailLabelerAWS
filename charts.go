@@ -90,8 +90,24 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="LLM latency distribution over the last 30 days">`, boxChartWidth, chartHeight)
 
-	for _, v := range []int64{hi, med, lo} {
+	// Label every quartile boundary (hi/q3/med/q1/lo), skipping any that would land
+	// within minLabelGap px of an already-drawn label (e.g. a tight IQR) to avoid
+	// overlapping text.
+	const minLabelGap = 14.0
+	var labeledY []float64
+	for _, v := range []int64{hi, q3, med, q1, lo} {
 		y := scale(v)
+		tooClose := false
+		for _, py := range labeledY {
+			if d := y - py; d > -minLabelGap && d < minLabelGap {
+				tooClose = true
+				break
+			}
+		}
+		if tooClose {
+			continue
+		}
+		labeledY = append(labeledY, y)
 		fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, chartPadL, y, boxChartWidth-chartPadR, y)
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%dms</text>`, chartPadL-6, y+4, v)
 	}
