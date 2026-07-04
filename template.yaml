@@ -196,7 +196,7 @@ Resources:
       Runtime: provided.al2023
       Handler: bootstrap
       Role: !GetAtt LambdaRole.Arn
-      MemorySize: 256
+      MemorySize: 128
       Timeout: 30
       # Lambda Web Adapter layer: lets the custom-runtime binary serve plain HTTP,
       # forwarded from the Function URL. AWS_LAMBDA_EXEC_WRAPPER below points at
