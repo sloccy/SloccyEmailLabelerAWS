@@ -190,7 +190,9 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .chart-median { stroke: var(--om-primary); stroke-width: 2; }
 .chart-line { fill: none; stroke: var(--om-primary); stroke-width: 2; }
 .chart-point { fill: var(--om-primary); }
-.chart-empty { font-size: 0.8125rem; fill: var(--om-text-50); }
+/* font-size is set inline per-chart in charts.go (emptyChartSVG), scaled so differently
+   sized chart viewBoxes still render the placeholder text at the same on-screen size */
+.chart-empty { fill: var(--om-text-50); }
 
 /* Timeline */
 .timeline { list-style: none; padding: 0; margin: 0; }

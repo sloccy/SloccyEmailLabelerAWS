@@ -33,9 +33,13 @@
       </ul>
     </nav>
     <div class="sidebar-footer mt-auto pt-3 border-top">
-      <div class="d-inline-flex align-items-center gap-1 font-monospace small text-muted">
-        <span class="status-dot active" id="pollerDot"></span>
-        <span id="pollerLabel">auto-scan · {{.ScanCadence}}</span>
+      <div class="d-flex align-items-start gap-2 font-monospace small text-muted">
+        <span class="status-dot active mt-1" id="pollerDot"></span>
+        <div class="lh-sm" id="pollerLabel">
+          <div>auto-scan</div>
+          <div>Daily</div>
+          <div>2am ET</div>
+        </div>
       </div>
     </div>
   </aside>
