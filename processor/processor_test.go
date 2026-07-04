@@ -239,7 +239,6 @@ func newTestAccount() db.Account {
 }
 
 func TestProcessEmail_MatchedPrompt(t *testing.T) {
-	store := newTestStore(t)
 	// LLM returns {"1": true} — prompt 1 matches.
 	llmClient := newLLMServer(t, `{"1": true}`)
 
@@ -250,7 +249,7 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "Label_42"}
 
-	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected at least one modify")
@@ -273,7 +272,6 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 }
 
 func TestProcessEmail_NoMatch(t *testing.T) {
-	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": false}`)
 
 	account := newTestAccount()
@@ -282,7 +280,7 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
 	}
 
-	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
 
 	if len(modifies) != 0 {
 		t.Errorf("expected no modifies for no-match, got %v", modifies)
@@ -293,7 +291,6 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 }
 
 func TestProcessEmail_TrashAction(t *testing.T) {
-	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
@@ -302,7 +299,7 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 		{ID: 5, Name: "Spam", LabelName: "spam", ActionTrash: 1, Active: 1, Instructions: "trash spam"},
 	}
 
-	_, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, map[string]string{}, false, "", "")
+	_, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, map[string]string{}, false, "", "")
 
 	if !contains(trashIDs, "trash1") {
 		t.Errorf("expected trash1 in trashIDs, got %v", trashIDs)
@@ -310,7 +307,6 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 }
 
 func TestProcessEmail_StopProcessing(t *testing.T) {
-	store := newTestStore(t)
 	// Both prompts match, but prompt 1 has StopProcessing=1.
 	llmClient := newLLMServer(t, `{"1": true, "2": true}`)
 
@@ -322,7 +318,7 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 	}
 	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
 
-	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
 
 	for _, m := range modifies {
 		if contains(m.AddLabels, "L2") {
@@ -332,23 +328,24 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 }
 
 func TestProcessEmail_LLMError(t *testing.T) {
-	store := newTestStore(t)
 	llmClient := llm.NewFakeErrorClient()
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "err1", Subject: "Test"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 
-	modifies, trashIDs := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, trashIDs, job := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
 
 	// On LLM error, processEmail returns nil and does NOT mark the message processed.
 	if len(modifies) != 0 || len(trashIDs) != 0 {
 		t.Errorf("expected nil on LLM error, got modifies=%v trash=%v", modifies, trashIDs)
 	}
+	if job.messageID != "" {
+		t.Errorf("expected empty messageID (not marked processed) on LLM error, got %q", job.messageID)
+	}
 }
 
 func TestProcessEmail_ArchiveAction(t *testing.T) {
-	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
@@ -357,7 +354,7 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 		{ID: 1, Name: "Archive", LabelName: "", ActionArchive: 1, Active: 1, Instructions: "archive"},
 	}
 
-	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected a modify for archive action")
@@ -374,7 +371,6 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 }
 
 func TestProcessEmail_MarkReadAction(t *testing.T) {
-	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": true}`)
 
 	account := newTestAccount()
@@ -383,7 +379,7 @@ func TestProcessEmail_MarkReadAction(t *testing.T) {
 		{ID: 1, Name: "MarkRead", LabelName: "", ActionMarkRead: 1, Active: 1, Instructions: "mark read"},
 	}
 
-	modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
 
 	found := false
 	for _, m := range modifies {
@@ -412,7 +408,8 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "L1"}
 
-	processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	applyWriteJob(t.Context(), store, job)
 
 	// Verify history was written.
 	history, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &accID, Limit: 10})
@@ -430,6 +427,28 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 }
 
+// TestProcessEmail_LlmDebugGatedOnDebugLogging asserts the fattest per-email write (raw
+// Gmail message + full LLM request/response) is only built and returned for the writer
+// to persist when DebugLogging is on — keeping normal operation to just the batched
+// logs+history write plus the processed marker, which matters at low provisioned WCU.
+func TestProcessEmail_LlmDebugGatedOnDebugLogging(t *testing.T) {
+	llmClient := newLLMServer(t, `{"1": true}`)
+	account := newTestAccount()
+	msg := gmailpkg.Message{ID: "dbg1", Subject: "Test", Sender: "a@b.com"}
+	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
+	labelCache := map[string]string{"l": "L1"}
+
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	if job.llmDebug != nil {
+		t.Error("expected llmDebug to be nil when DebugLogging is false")
+	}
+
+	_, _, job = processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, true, "", "")
+	if job.llmDebug == nil {
+		t.Error("expected llmDebug to be populated when DebugLogging is true")
+	}
+}
+
 func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": false}`)
@@ -439,7 +458,8 @@ func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	msg := gmailpkg.Message{ID: "nomatch1", Subject: "No Match"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", Active: 1, Instructions: "x"}}
 
-	processEmail(t.Context(), store, llmClient, account, msg, prompts, nil, false, "", "")
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	applyWriteJob(t.Context(), store, job)
 
 	history, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
 	found := false
@@ -479,10 +499,13 @@ func TestClassifyConcurrency(t *testing.T) {
 // ============================================================
 
 // TestProcessEmail_ConcurrentFanOut drives processEmail from many goroutines against a
-// shared store, LLM client, and label cache — the same setup processMessageIDs now uses to
-// classify a batch of emails in parallel instead of one at a time. It asserts every email's
-// result is captured correctly regardless of goroutine scheduling, and (run with -race) that
-// the shared FakeStore and the mutex-guarded accumulators are race-free.
+// shared LLM client and label cache — the same setup processMessageIDs now uses to classify
+// a batch of emails in parallel instead of one at a time — while a single writer goroutine
+// drains their writeJobs sequentially, mirroring processMessageIDs' jobCh pattern that keeps
+// DynamoDB writes serialized (one in flight at a time) regardless of classify concurrency.
+// It asserts every email's classify result and DB write landed correctly regardless of
+// goroutine scheduling, and (run with -race) that the shared FakeStore, the writer, and the
+// mutex-guarded accumulators are race-free.
 func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 	store := newTestStore(t)
 	llmClient := newLLMServer(t, `{"1": true}`)
@@ -499,6 +522,16 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 	var mu sync.Mutex
 	seen := make(map[string]bool, n)
 
+	jobCh := make(chan writeJob, concurrency)
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for job := range jobCh {
+			applyWriteJob(t.Context(), store, job)
+		}
+	}()
+
 	for i := range n {
 		msg := gmailpkg.Message{ID: fmt.Sprintf("msg%d", i), Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
 		wg.Add(1)
@@ -507,21 +540,39 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, _ := processEmail(t.Context(), store, llmClient, account, msg, prompts, labelCache, false, "", "")
+			modifies, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
 
 			mu.Lock()
-			defer mu.Unlock()
 			for _, m := range modifies {
 				if contains(m.AddLabels, "Label_42") && len(m.MessageIDs) > 0 {
 					seen[m.MessageIDs[0]] = true
 				}
 			}
+			mu.Unlock()
+
+			jobCh <- job
 		}()
 	}
 	wg.Wait()
+	close(jobCh)
+	writerWG.Wait()
 
 	if len(seen) != n {
 		t.Fatalf("expected %d labeled messages, got %d: %v", n, len(seen), seen)
+	}
+
+	// Every message's write should have landed via the serialized writer: marked
+	// processed and present in history.
+	var ids []string
+	for i := range n {
+		ids = append(ids, fmt.Sprintf("msg%d", i))
+	}
+	unprocessed, err := store.FilterUnprocessed(t.Context(), account.ID, ids)
+	if err != nil {
+		t.Fatalf("FilterUnprocessed: %v", err)
+	}
+	if len(unprocessed) != 0 {
+		t.Errorf("expected all %d messages marked processed, still unprocessed: %v", n, unprocessed)
 	}
 }
 
