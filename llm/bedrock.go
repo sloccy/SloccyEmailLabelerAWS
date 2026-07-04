@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -27,8 +28,31 @@ import (
 // bedrockHTTPTimeout is the HTTP client read-timeout for Bedrock calls. Flex-tier requests
 // are queued at lower priority and can take minutes to return (vs. the near-instant default
 // tier), so this needs to be generous — set just under the Lambda's own hard timeout (900s)
-// so a killed request surfaces as a clean Lambda timeout rather than a silent hang.
-const bedrockHTTPTimeout = 14 * time.Minute
+// so a killed request surfaces as a clean Lambda timeout rather than a silent hang. Everything
+// after the Converse call returns (parsing, logging, DynamoDB writes) runs in well under a
+// second, so only a 30s margin is reserved for it rather than a full minute.
+const bedrockHTTPTimeout = 14*time.Minute + 30*time.Second
+
+// LogLevelTimeout is the db.Log level written when a Converse call is aborted by
+// bedrockHTTPTimeout, so the dashboard can count these over a rolling window.
+const LogLevelTimeout = "TIMEOUT"
+
+// isBedrockTimeout reports whether err stems from the client-side bedrockHTTPTimeout
+// (a queued flex-tier request that never returned) rather than some other failure
+// (bad request, throttling, etc).
+func isBedrockTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var te interface{ Timeout() bool }
+	if errors.As(err, &te) {
+		return te.Timeout()
+	}
+	return false
+}
 
 // Settings is the minimal interface the Client needs to look up per-call model
 // overrides. *db.Store and *db.FakeStore both satisfy this.
@@ -197,6 +221,7 @@ type ClassifyResult struct {
 	Results     map[int64]bool
 	RequestJSON string
 	RawResponse string
+	LatencyMs   int64 // wall time of the Bedrock Converse call(s), in milliseconds
 }
 
 type StreamChunk struct {
@@ -544,6 +569,19 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s, tier: %s)", subject, len(prompts), model, tierLabel))
 
+	// The Lambda invoking this has a hard 900s (15min) ceiling; bedrockHTTPTimeout aborts a
+	// stuck Converse call ~1min before that so the error below can still be logged rather
+	// than the whole invocation being silently killed. recordTimeout is checked against both
+	// the primary and retry calls but only logs once per ClassifyEmailBatch call.
+	timeoutLogged := false
+	recordTimeout := func(callErr error) {
+		if timeoutLogged || !isBedrockTimeout(callErr) {
+			return
+		}
+		timeoutLogged = true
+		store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call exceeded the %s client timeout (tier: %s): %v", bedrockHTTPTimeout, tierLabel, callErr))
+	}
+
 	plainConverse := func() (*bedrockruntime.ConverseOutput, error) {
 		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 			ModelId:         aws.String(model),
@@ -558,6 +596,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	// outright, retry once without ToolConfig below. When the call succeeds but the
 	// model didn't call the tool anyway, fall through to the same text-parsing logic
 	// used by the retry, applied to this response.
+	start := time.Now()
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:         aws.String(model),
 		Messages:        msgs,
@@ -567,20 +606,31 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	})
 	if err == nil {
 		if parsed, rawJSON, ok := extractToolUse(out.Output, classifyToolName); ok {
+			res.LatencyMs = time.Since(start).Milliseconds()
 			store.Log("INFO", fmt.Sprintf("LLM classify response via tool-use: %d field(s)", len(parsed)))
+			store.Log("INFO", fmt.Sprintf("LLM classify latency: %dms (tier: %s)", res.LatencyMs, tierLabel))
 			res.RawResponse = rawJSON
 			res.Results = mapKeysToResults(parsed, prompts)
 			return res, nil
 		}
 		store.Log("INFO", "LLM response had no tool-use block; falling back to text parsing")
 	} else {
+		recordTimeout(err)
 		store.Log("INFO", fmt.Sprintf("LLM tool-use call failed (%v); retrying without tool use", err))
 		out, err = plainConverse()
 		if err != nil {
+			recordTimeout(err)
+			res.LatencyMs = time.Since(start).Milliseconds()
 			store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
 			return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
 		}
 	}
+
+	// Total wall time across the tool-use attempt and (if it fell through) the
+	// plain-Converse retry; time.Since is cumulative from start regardless of
+	// which branch above ran.
+	res.LatencyMs = time.Since(start).Milliseconds()
+	store.Log("INFO", fmt.Sprintf("LLM classify latency: %dms (tier: %s)", res.LatencyMs, tierLabel))
 
 	raw := extractText(out.Output)
 	store.Log("INFO", fmt.Sprintf("LLM classify response: content=%d chars", len(raw)))

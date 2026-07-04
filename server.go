@@ -264,12 +264,18 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	accounts, _ := s.store.ListAccountsSafe(ctx)
 	activePrompts, _ := s.store.CountActivePrompts(ctx)
 	logs, _ := s.store.GetLogs(ctx, 100)
+	since30d := time.Now().AddDate(0, 0, -30)
+	turnaround, _ := s.store.GetTurnaroundSamples(ctx, since30d)
+	timeoutCount, _ := s.store.CountLogsByLevel(ctx, llm.LogLevelTimeout, since30d)
 
 	data := map[string]any{
-		"AccountCount":  len(accounts),
-		"ActivePrompts": activePrompts,
-		"Logs":          logs,
-		"ScanCadence":   scanCadenceLabel,
+		"AccountCount":   len(accounts),
+		"ActivePrompts":  activePrompts,
+		"Logs":           logs,
+		"ScanCadence":    scanCadenceLabel,
+		"TimeoutCount":   timeoutCount,
+		"TurnaroundBox":  buildBoxPlotSVG(turnaround),
+		"TurnaroundLine": buildLatencyLineSVG(turnaround),
 	}
 	s.fragmentResponse(w, "templates/fragments/dashboard.html", data, "")
 }

@@ -174,6 +174,7 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 			LabelName:    h.LabelName,
 			Actions:      h.Actions,
 			LlmResponse:  h.LlmResponse,
+			DurationMs:   h.DurationMs,
 		}
 		s.history = append(s.history, entry)
 	}

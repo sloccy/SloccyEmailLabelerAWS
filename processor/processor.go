@@ -390,6 +390,7 @@ func processEmail(
 			LabelName:    labelNamePtr(p.LabelName),
 			Actions:      strings.Join(actions, ", "),
 			LlmResponse:  classified.RawResponse,
+			DurationMs:   classified.LatencyMs,
 		})
 	}
 
@@ -403,6 +404,7 @@ func processEmail(
 			Sender:       msg.Sender,
 			Actions:      "no match",
 			LlmResponse:  classified.RawResponse,
+			DurationMs:   classified.LatencyMs,
 		})
 	}
 

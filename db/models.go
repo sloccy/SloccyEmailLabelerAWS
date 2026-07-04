@@ -52,6 +52,7 @@ type CategorizationHistory struct {
 	LabelName    *string `dynamodbav:"labelName"`
 	Actions      string  `dynamodbav:"actions"`
 	LlmResponse  string  `dynamodbav:"llmResponse"`
+	DurationMs   int64   `dynamodbav:"durationMs"`
 }
 
 type EmailCorrection struct {
