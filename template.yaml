@@ -106,12 +106,26 @@ Globals:
 Resources:
 
   # ----------------------------------------------------------------
-  # DynamoDB table (single-table design, on-demand, TTL enabled)
+  # DynamoDB table (single-table design, provisioned 2/2, TTL enabled)
+  # On-demand billing is excluded from DynamoDB's perpetual free tier (25 RCU + 25 WCU
+  # + 25 GB, account-wide). Provisioned at 2/2 stays free while leaving ~23/23 of that
+  # allowance for other projects. Classification concurrency (CLASSIFY_CONCURRENCY) is
+  # decoupled from DB writes — a single serial writer per invocation (see
+  # processor.processMessageIDs) keeps writes to one in flight at a time within a run,
+  # and the LLM-debug write only fires under DEBUG_LOGGING. 2 (not 1) leaves a little
+  # room for WebFunction/ScanFunction/PushFunction being separate Lambdas — or PushFunction
+  # getting more than one concurrent invocation — each running its own writer. Bursts
+  # above that may briefly throttle; the SDK retries and the scan dedupes + resumes next
+  # run, so nothing is lost — see processor/processor.go's writeJob/applyWriteJob for the
+  # write-serialization design.
   # ----------------------------------------------------------------
   OlamailTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      BillingMode: PAY_PER_REQUEST
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
       TableName: ollamail
       AttributeDefinitions:
         - AttributeName: PK
