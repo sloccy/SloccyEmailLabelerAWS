@@ -524,13 +524,11 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 
 	jobCh := make(chan writeJob, concurrency)
 	var writerWG sync.WaitGroup
-	writerWG.Add(1)
-	go func() {
-		defer writerWG.Done()
+	writerWG.Go(func() {
 		for job := range jobCh {
 			applyWriteJob(t.Context(), store, job)
 		}
-	}()
+	})
 
 	for i := range n {
 		msg := gmailpkg.Message{ID: fmt.Sprintf("msg%d", i), Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
@@ -563,7 +561,7 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 
 	// Every message's write should have landed via the serialized writer: marked
 	// processed and present in history.
-	var ids []string
+	ids := make([]string, 0, n)
 	for i := range n {
 		ids = append(ids, fmt.Sprintf("msg%d", i))
 	}
