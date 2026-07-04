@@ -10,13 +10,13 @@
           <button type="button" class="btn btn-outline-primary{{if eq .ClassifyTier "flex"}} active{{end}}" data-tier="flex">Flex</button>
         </div>
         <select class="form-select form-select-sm{{if eq .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-standard" style="min-width:300px;"{{if eq .ClassifyTier "flex"}} disabled{{end}}>
-          {{range .Models}}{{if or (eq .ProfileRegion "") (eq .ProfileRegion "us") (eq .ProfileRegion "global")}}
-          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .InputCostPer1M 0.0}} — ${{printf "%.3f" .InputCostPer1M}}/1M in{{else}} — price n/a{{end}}</option>
+          {{range .Models}}{{if and (or (eq .ProfileRegion "") (eq .ProfileRegion "us") (eq .ProfileRegion "global")) (ge .InputCostPer1M 0.0)}}
+          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .InputCostPer1M}}/1M in</option>
           {{end}}{{end}}
         </select>
         <select class="form-select form-select-sm{{if ne .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-flex" style="min-width:300px;"{{if ne .ClassifyTier "flex"}} disabled{{end}}>
-          {{range .Models}}{{if .Flex}}
-          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}}{{if ge .FlexCostPer1M 0.0}} — ${{printf "%.3f" .FlexCostPer1M}}/1M in (flex){{else}} — price n/a{{end}}</option>
+          {{range .Models}}{{if and .Flex (ge .FlexCostPer1M 0.0)}}
+          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .FlexCostPer1M}}/1M in (flex)</option>
           {{end}}{{end}}
         </select>
       </div>
@@ -24,9 +24,9 @@
         <div class="fw-medium">Prompt improver model</div>
         <div class="small text-muted mt-1">Bedrock model used for "Generate instruction" and "Improve rule". A smarter model here is fine since it runs infrequently.</div>
         <select class="form-select form-select-sm mt-2" name="improve_model" style="min-width:300px;">
-          {{range .Models}}
-          <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}}{{if ge .InputCostPer1M 0.0}} — ${{printf "%.3f" .InputCostPer1M}}/1M in{{else}} — price n/a{{end}}</option>
-          {{end}}
+          {{range .Models}}{{if ge .InputCostPer1M 0.0}}
+          <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .InputCostPer1M}}/1M in</option>
+          {{end}}{{end}}
         </select>
       </div>
     </div>
