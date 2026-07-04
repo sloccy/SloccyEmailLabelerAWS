@@ -232,6 +232,25 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// DynamoDB writes are deliberately kept off the classify fan-out: a single writer
+	// goroutine drains jobCh sequentially, so the table only ever sees one write in
+	// flight at a time regardless of ClassifyConcurrency. That's what lets the table run
+	// on a low provisioned capacity instead of on-demand. The channel is buffered to
+	// ClassifyConcurrency so a burst of simultaneous classify completions doesn't stall
+	// waiting on the writer. Streaming (rather than collecting all jobs and writing after
+	// wg.Wait) matters on a large backfill: a 900s Lambda timeout still leaves every
+	// already-classified email persisted and marked processed, so the next scan resumes
+	// instead of redoing work.
+	jobCh := make(chan writeJob, classifyConcurrency(cfg.ClassifyConcurrency))
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for job := range jobCh {
+			applyWriteJob(ctx, store, job)
+		}
+	}()
+
 	sem := make(chan struct{}, classifyConcurrency(cfg.ClassifyConcurrency))
 	for msg := range msgCh {
 		wg.Add(1)
@@ -240,15 +259,19 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, trash := processEmail(ctx, store, llmClient, account, msg, prompts, labelCache, cfg.DebugLogging, model, tier)
+			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, labelCache, cfg.DebugLogging, model, tier)
 
 			mu.Lock()
-			defer mu.Unlock()
 			allModifies = append(allModifies, modifies...)
 			trashIDs = append(trashIDs, trash...)
+			mu.Unlock()
+
+			jobCh <- job
 		}()
 	}
 	wg.Wait()
+	close(jobCh)
+	writerWG.Wait()
 	if err := <-errCh; err != nil {
 		slog.Error("fetch message details", "account", account.Email, "err", err)
 	}
@@ -271,9 +294,33 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 	return nil
 }
 
+// writeJob carries one email's DynamoDB writes so they can be applied by the single
+// serial writer in processMessageIDs instead of inline inside the classify goroutine.
+// messageID == "" means "don't mark processed" (the LLM-error retry case); llmDebug == nil
+// means skip the (comparatively large) LLM-debug write entirely.
+type writeJob struct {
+	accountID int64
+	logs      []db.LogEntry
+	history   []db.HistoryEntry
+	messageID string
+	llmDebug  *db.AddLlmDebugParams
+}
+
+// applyWriteJob persists one writeJob. Errors are logged, not propagated — matching the
+// prior inline behavior where a DB write failure doesn't block or retry email processing.
+func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
+	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.accountID, job.messageID); err != nil {
+		slog.Error("db write failed", "err", err)
+	}
+	if job.llmDebug != nil {
+		if err := store.RecordLlmDebug(ctx, *job.llmDebug); err != nil {
+			slog.Error("llm debug write failed", "err", err)
+		}
+	}
+}
+
 func processEmail(
 	ctx context.Context,
-	store db.StoreIface,
 	llmClient llm.ClientIface,
 	account db.Account,
 	msg gmailpkg.Message,
@@ -281,7 +328,7 @@ func processEmail(
 	labelCache map[string]string,
 	debugLogging bool,
 	model, tier string,
-) (modifies []gmailpkg.Modify, trashIDs []string) {
+) (modifies []gmailpkg.Modify, trashIDs []string, job writeJob) {
 	llmPrompts := make([]llm.Prompt, len(prompts))
 	for i, p := range prompts {
 		llmPrompts[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
@@ -300,8 +347,6 @@ func processEmail(
 			account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60)),
 	}}
 
-	gmailRaw := marshalGmailDebug(msg)
-
 	// Buffer the classify call's own log lines instead of writing each one straight to
 	// DynamoDB (a counter update + a PutItem per line): ClassifyEmailBatch logs several
 	// times per call, and buffering lets all of it flush through the single
@@ -314,10 +359,8 @@ func processEmail(
 
 	if llmErr != nil {
 		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
-		if err := store.BatchInsertProcessingResults(ctx, logs, nil, account.ID, ""); err != nil {
-			slog.Error("db log write failed", "err", err)
-		}
-		return nil, nil // Don't mark processed; will retry
+		// Don't mark processed (messageID left ""); will retry.
+		return nil, nil, writeJob{accountID: account.ID, logs: logs}
 	}
 
 	var matched []string
@@ -413,25 +456,32 @@ func processEmail(
 		logs = append(logs, db.LogEntry{Level: logDebug, Message: "LLM response: " + classified.RawResponse})
 	}
 
-	if err := store.BatchInsertProcessingResults(ctx, logs, history, account.ID, msg.ID); err != nil {
-		slog.Error("db write failed", "err", err)
-		// Don't return error — email is processed, don't retry
+	// LLM debug (raw Gmail message + full LLM request/response) is the fattest per-email
+	// write, so it's only built and written when DebugLogging is on — keeping normal
+	// operation to just the batched logs+history write plus the processed marker.
+	var llmDebug *db.AddLlmDebugParams
+	if debugLogging {
+		llmDebug = &db.AddLlmDebugParams{
+			AccountID:    account.ID,
+			AccountEmail: account.Email,
+			MessageID:    msg.ID,
+			Subject:      msg.Subject,
+			Sender:       msg.Sender,
+			GmailRaw:     marshalGmailDebug(msg),
+			LlmRequest:   classified.RequestJSON,
+			LlmResponse:  classified.RawResponse,
+		}
 	}
 
-	if err := store.RecordLlmDebug(ctx, db.AddLlmDebugParams{
-		AccountID:    account.ID,
-		AccountEmail: account.Email,
-		MessageID:    msg.ID,
-		Subject:      msg.Subject,
-		Sender:       msg.Sender,
-		GmailRaw:     gmailRaw,
-		LlmRequest:   classified.RequestJSON,
-		LlmResponse:  classified.RawResponse,
-	}); err != nil {
-		slog.Error("llm debug write failed", "err", err)
+	job = writeJob{
+		accountID: account.ID,
+		logs:      logs,
+		history:   history,
+		messageID: msg.ID,
+		llmDebug:  llmDebug,
 	}
 
-	return modifies, trashIDs
+	return modifies, trashIDs, job
 }
 
 func filterPrompts(prompts []db.Prompt, accountID int64) []db.Prompt {
