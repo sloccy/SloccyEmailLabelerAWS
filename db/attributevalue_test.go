@@ -199,7 +199,7 @@ func TestHistoryRoundTrip_Matched(t *testing.T) {
 		AccountID: 1, AccountEmail: "user@example.com", MessageID: "msg1",
 		Subject: "Sale", Sender: "shop@example.com",
 		PromptID: ptr(int64(101)), PromptName: ptr("Newsletter"), LabelName: ptr("Newsletters"),
-		Actions: "labeled → Newsletters", LlmResponse: `{"1":true}`,
+		Actions: "labeled → Newsletters", LlmResponse: `{"1":true}`, DurationMs: 842,
 	}
 	item := historyItem(1, "2026-07-01 12:00:00", arg)
 
@@ -210,7 +210,7 @@ func TestHistoryRoundTrip_Matched(t *testing.T) {
 	got := itemToHistory(item)
 	if got.ID != 1 || got.Timestamp != "2026-07-01 12:00:00" || got.AccountID != arg.AccountID ||
 		got.MessageID != arg.MessageID || got.Subject != arg.Subject || got.Sender != arg.Sender ||
-		got.Actions != arg.Actions || got.LlmResponse != arg.LlmResponse {
+		got.Actions != arg.Actions || got.LlmResponse != arg.LlmResponse || got.DurationMs != arg.DurationMs {
 		t.Errorf("round trip mismatch: got %+v", got)
 	}
 	if got.PromptID == nil || *got.PromptID != 101 {
