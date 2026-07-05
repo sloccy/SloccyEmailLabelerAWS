@@ -1282,6 +1282,9 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 	ch := s.llm.StreamGeneratePromptInstruction(r.Context(), description)
 	for chunk := range ch {
 		if chunk.Err != nil {
+			b, _ := json.Marshal(map[string]string{jsonKeyType: "error", "text": chunk.Err.Error()}) //nolint:errchkjson // map[string]string cannot fail
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
 			break
 		}
 		b, _ := json.Marshal(map[string]string{jsonKeyType: "content", "text": chunk.Text}) //nolint:errchkjson // map[string]string cannot fail

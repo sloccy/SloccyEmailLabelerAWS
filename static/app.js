@@ -213,15 +213,19 @@ function generatePrompt() {
   }
   resetTimeout();
 
-  es.addEventListener('content', function(e) {
-    document.getElementById('builder-instruction').value += e.data;
-    resetTimeout();
-  });
-  es.addEventListener('done', function() { _builderDone(); });
-  es.addEventListener('error', function(e) {
-    if (e.data) toast('Generation failed: ' + e.data, 'error');
-    _builderDone();
-  });
+  es.onmessage = function(e) {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'content') {
+      document.getElementById('builder-instruction').value += msg.text;
+      resetTimeout();
+    } else if (msg.type === 'done') {
+      _builderDone();
+    } else if (msg.type === 'error') {
+      if (msg.text) toast('Generation failed: ' + msg.text, 'error');
+      _builderDone();
+    }
+  };
   es.onerror = function() {
     if (es.readyState === EventSource.CLOSED) _builderDone();
   };
