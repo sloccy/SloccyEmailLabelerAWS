@@ -15,9 +15,9 @@ import (
 // matches the wire format these fields already had. sql.NullString/NullInt64 would instead
 // marshal as a nested map (two fields, String/Valid) — a silent, incompatible format change
 // for a table with existing production data — so this conversion is required, not optional.
-// AccountRetention, LabelExemption, LabelRetention, EmailCorrection, and ProcessedEmail stay
-// hand-rolled: their AccountID is derived from the partition key, not a stored attribute, so
-// they don't fit the same tag-per-field mapping.
+// AccountRetention, LabelExemption, LabelRetention, and EmailCorrection stay hand-rolled:
+// their AccountID is derived from the partition key, not a stored attribute, so they don't
+// fit the same tag-per-field mapping.
 
 type Account struct {
 	ID              int64   `dynamodbav:"id"`
@@ -97,13 +97,6 @@ type Log struct {
 	Timestamp string `dynamodbav:"ts"`
 	Level     string `dynamodbav:"level"`
 	Message   string `dynamodbav:"msg"`
-}
-
-type ProcessedEmail struct {
-	ID          int64
-	AccountID   int64
-	MessageID   string
-	ProcessedAt sql.NullString
 }
 
 type Prompt struct {

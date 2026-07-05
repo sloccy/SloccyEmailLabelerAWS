@@ -222,6 +222,13 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 		return fmt.Errorf("build label cache: %w", err)
 	}
 
+	// Same for every email in this batch, so it's built once here rather than per email
+	// inside the classify fan-out below.
+	llmPrompts := make([]llm.Prompt, len(prompts))
+	for i, p := range prompts {
+		llmPrompts[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
+	}
+
 	// Fetch and classify messages. Fetching is already concurrent (IterMessageDetails);
 	// classification is now fanned out too, capped at cfg.ClassifyConcurrency, since flex-tier
 	// Bedrock requests can queue for minutes and no longer have to be serialized one-by-one.
@@ -257,7 +264,7 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, labelCache, cfg.DebugLogging, model, tier)
+			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, llmPrompts, labelCache, cfg.DebugLogging, model, tier)
 
 			mu.Lock()
 			allModifies = append(allModifies, modifies...)
@@ -323,15 +330,11 @@ func processEmail(
 	account db.Account,
 	msg gmailpkg.Message,
 	prompts []db.Prompt,
+	llmPrompts []llm.Prompt,
 	labelCache map[string]string,
 	debugLogging bool,
 	model, tier string,
 ) (modifies []gmailpkg.Modify, trashIDs []string, job writeJob) {
-	llmPrompts := make([]llm.Prompt, len(prompts))
-	for i, p := range prompts {
-		llmPrompts[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
-	}
-
 	email := llm.Email{
 		Sender:  msg.Sender,
 		Subject: msg.Subject,
@@ -350,7 +353,7 @@ func processEmail(
 	// times per call, and buffering lets all of it flush through the single
 	// BatchInsertProcessingResults call below, alongside history, instead.
 	logger := &bufferedLogger{}
-	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier)
+	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier, debugLogging)
 	logs = append(logs, logger.entries...)
 
 	var history []db.HistoryEntry

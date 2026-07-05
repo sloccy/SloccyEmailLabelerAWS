@@ -29,6 +29,11 @@ const (
 	LabelTrash  = "TRASH"
 )
 
+// PageSize is the maxResults page size FetchEmailsOlderThan requests per page. Exported so
+// callers paging through its results (retention's "fewer than a full page came back" last-
+// page check) share the same constant instead of a duplicated magic number.
+const PageSize = 500
+
 var gmailBase = "https://gmail.googleapis.com/gmail/v1/users/me"
 
 var retryBaseBackoff = time.Second
@@ -665,6 +670,27 @@ type Modify struct {
 	RemoveLabels []string
 }
 
+// postBatchModify posts /messages/batchModify in chunks of at most 1000 ids (the API's
+// per-call limit), applying the same add/remove label sets to every chunk. Shared by
+// BatchModifyEmails and BatchTrashEmails so the chunking loop can't drift between them.
+func postBatchModify(ctx context.Context, svc *Client, ids, add, remove []string) error {
+	for len(ids) > 0 {
+		batch := ids
+		if len(batch) > 1000 {
+			batch = batch[:1000]
+		}
+		if err := svc.post(ctx, "/messages/batchModify", &apiBatchModifyRequest{
+			IDs:            batch,
+			AddLabelIDs:    add,
+			RemoveLabelIDs: remove,
+		}, nil); err != nil {
+			return err
+		}
+		ids = ids[len(batch):]
+	}
+	return nil
+}
+
 // BatchModifyEmails applies label changes, grouped by identical add/remove sets.
 func BatchModifyEmails(ctx context.Context, svc *Client, mods []Modify) error {
 	type key struct{ add, remove string }
@@ -684,19 +710,8 @@ func BatchModifyEmails(ctx context.Context, svc *Client, mods []Modify) error {
 	}
 
 	for _, req := range grouped {
-		for len(req.IDs) > 0 {
-			batch := req.IDs
-			if len(batch) > 1000 {
-				batch = batch[:1000]
-			}
-			if err := svc.post(ctx, "/messages/batchModify", &apiBatchModifyRequest{
-				IDs:            batch,
-				AddLabelIDs:    req.AddLabelIDs,
-				RemoveLabelIDs: req.RemoveLabelIDs,
-			}, nil); err != nil {
-				return err
-			}
-			req.IDs = req.IDs[len(batch):]
+		if err := postBatchModify(ctx, svc, req.IDs, req.AddLabelIDs, req.RemoveLabelIDs); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -704,21 +719,7 @@ func BatchModifyEmails(ctx context.Context, svc *Client, mods []Modify) error {
 
 // BatchTrashEmails moves messages to trash.
 func BatchTrashEmails(ctx context.Context, svc *Client, ids []string) error {
-	for len(ids) > 0 {
-		batch := ids
-		if len(batch) > 1000 {
-			batch = batch[:1000]
-		}
-		if err := svc.post(ctx, "/messages/batchModify", &apiBatchModifyRequest{
-			IDs:            batch,
-			AddLabelIDs:    []string{LabelTrash},
-			RemoveLabelIDs: []string{LabelInbox},
-		}, nil); err != nil {
-			return err
-		}
-		ids = ids[len(batch):]
-	}
-	return nil
+	return postBatchModify(ctx, svc, ids, []string{LabelTrash}, []string{LabelInbox})
 }
 
 // FetchEmailsOlderThan returns message IDs older than `days` days with the given label,
@@ -735,5 +736,5 @@ func FetchEmailsOlderThan(ctx context.Context, svc *Client, days int, label stri
 		sb.WriteString(" -label:")
 		sb.WriteString(ex)
 	}
-	return paginateMessageIDs(ctx, svc, sb.String(), 500, maxPages)
+	return paginateMessageIDs(ctx, svc, sb.String(), PageSize, maxPages)
 }
