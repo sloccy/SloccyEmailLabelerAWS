@@ -77,9 +77,13 @@ func Open() (*Store, error) {
 	return &Store{ddb: dynamodb.NewFromConfig(cfg), table: table}, nil
 }
 
+// tsLayout is the standard timestamp format used for Now() and for formatting other
+// time.Time values into the same sortable "ts" string form (e.g. a query's since bound).
+const tsLayout = "2006-01-02 15:04:05"
+
 // Now returns the current UTC time in the standard timestamp format.
 func Now() string {
-	return time.Now().UTC().Format("2006-01-02 15:04:05")
+	return time.Now().UTC().Format(tsLayout)
 }
 
 // ============================================================
@@ -180,7 +184,7 @@ func (s *Store) nextIDs(ctx context.Context, entity string, n int) (start int64,
 		},
 		UpdateExpression: aws.String("ADD seq :n"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":n": &types.AttributeValueMemberN{Value: strconv.Itoa(n)},
+			":n": nv(int64(n)),
 		},
 		ReturnValues: types.ReturnValueUpdatedNew,
 	})
@@ -254,7 +258,7 @@ func (s *Store) queryAll(ctx context.Context, input *dynamodb.QueryInput) ([]map
 	return items, nil
 }
 
-// batchDeleteByKey deletes items in batches of 25.
+// batchDelete deletes items in batches of 25.
 func (s *Store) batchDelete(ctx context.Context, keys []map[string]types.AttributeValue) error {
 	for i := 0; i < len(keys); i += 25 {
 		end := min(i+25, len(keys))
@@ -445,7 +449,7 @@ func (s *Store) GetLogs(ctx context.Context, limit int64) ([]Log, error) {
 // CountLogsByLevel returns how many logs at the given level were recorded at or after
 // since — used for the dashboard's rolling 30-day Bedrock-timeout counter.
 func (s *Store) CountLogsByLevel(ctx context.Context, level string, since time.Time) (int64, error) {
-	sinceKey := tsKey(since.UTC().Format("2006-01-02 15:04:05"), 0)
+	sinceKey := tsKey(since.UTC().Format(tsLayout), 0)
 	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
@@ -689,11 +693,7 @@ func (s *Store) ToggleAccount(ctx context.Context, id int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if a.Active == 1 {
-		a.Active = 0
-	} else {
-		a.Active = 1
-	}
+	a.Active = 1 - a.Active
 	if _, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item:      accountItem(a),
@@ -980,11 +980,7 @@ func (s *Store) TogglePrompt(ctx context.Context, id int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if p.Active == 1 {
-		p.Active = 0
-	} else {
-		p.Active = 1
-	}
+	p.Active = 1 - p.Active
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item:      promptToItem(p),
@@ -992,7 +988,7 @@ func (s *Store) TogglePrompt(ctx context.Context, id int64) (int64, error) {
 	return p.Active, err
 }
 
-func (s *Store) MaxPromptSortOrder(ctx context.Context) (any, error) {
+func (s *Store) MaxPromptSortOrder(ctx context.Context) (int64, error) {
 	all, err := s.listAllPrompts(ctx)
 	if err != nil {
 		return int64(-1), err
@@ -1248,7 +1244,7 @@ func (s *Store) GetTurnaroundSamples(ctx context.Context, since time.Time) ([]Tu
 	// SK is "ts#paddedID"; padID(0) is all zeros, so this is the smallest possible SK at
 	// or after `since`, letting DynamoDB skip older rows instead of reading the whole
 	// partition.
-	sinceKey := tsKey(since.UTC().Format("2006-01-02 15:04:05"), 0)
+	sinceKey := tsKey(since.UTC().Format(tsLayout), 0)
 
 	seen := make(map[string]bool)
 	var samples []TurnaroundSample
@@ -1628,7 +1624,6 @@ func (s *Store) AddLabelRetention(ctx context.Context, arg AddLabelRetentionPara
 			"PK":          sv(pkLabelRetention(arg.AccountID)),
 			"SK":          sv(padID(id)),
 			"id":          nv(id),
-			attrAccountID: nv(arg.AccountID),
 			attrLabelName: sv(arg.LabelName),
 			"days":        nv(arg.Days),
 		},
@@ -1649,19 +1644,6 @@ func (s *Store) DeleteLabelRetention(ctx context.Context, arg DeleteLabelRetenti
 
 func (s *Store) DeleteLabelRetentionByAccount(ctx context.Context, accountID int64) error {
 	return s.deleteAllByPK(ctx, pkLabelRetention(accountID))
-}
-
-func (s *Store) LabelRetentionExists(ctx context.Context, arg LabelRetentionExistsParams) (int64, error) {
-	items, err := s.GetLabelRetention(ctx, arg.AccountID)
-	if err != nil {
-		return 0, err
-	}
-	for _, r := range items {
-		if r.LabelName == arg.LabelName {
-			return 1, nil
-		}
-	}
-	return 0, nil
 }
 
 func (s *Store) GetLabelExemptions(ctx context.Context, accountID int64) ([]LabelExemption, error) {
@@ -1705,7 +1687,6 @@ func (s *Store) AddLabelExemption(ctx context.Context, arg AddLabelExemptionPara
 			"PK":          sv(pkLabelExemption(arg.AccountID)),
 			"SK":          sv(padID(id)),
 			"id":          nv(id),
-			attrAccountID: nv(arg.AccountID),
 			attrLabelName: sv(arg.LabelName),
 		},
 	})
@@ -1753,35 +1734,6 @@ func (s *Store) InsertEmailCorrection(ctx context.Context, arg InsertEmailCorrec
 		},
 	})
 	return id, err
-}
-
-func (s *Store) GetLatestCorrectionForMessage(ctx context.Context, messageID string) (EmailCorrection, error) {
-	out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv("CORRECTION#" + messageID),
-		},
-		ScanIndexForward: aws.Bool(false),
-		Limit:            aws.Int32(1),
-	})
-	if err != nil {
-		return EmailCorrection{}, err
-	}
-	if len(out.Items) == 0 {
-		return EmailCorrection{}, fmt.Errorf("no correction for message %s", messageID)
-	}
-	it := out.Items[0]
-	return EmailCorrection{
-		ID:               getInt64(it, "id"),
-		CreatedAt:        getStr(it, attrCreatedAt),
-		AccountID:        getInt64(it, attrAccountID),
-		MessageID:        getStr(it, attrMessageID),
-		AddedPrompts:     getStr(it, "addedPrompts"),
-		RemovedPrompts:   getStr(it, "removedPrompts"),
-		CurrentPromptIds: getStr(it, "currentPromptIds"),
-		Note:             getStr(it, "note"),
-	}, nil
 }
 
 // ============================================================
@@ -1936,7 +1888,9 @@ func (s *Store) UpdatePromptSuggestion(ctx context.Context, arg UpdatePromptSugg
 	return err
 }
 
-func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
+// setSuggestionStatus stamps a suggestion's status + updatedAt — shared by
+// ApplyPromptSuggestion and DismissPromptSuggestion, which differ only in the target status.
+func (s *Store) setSuggestionStatus(ctx context.Context, id int64, status string) error {
 	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
@@ -1948,30 +1902,19 @@ func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
 			"#s": attrStatus,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprStatus:    sv(SuggestionStatusApplied),
+			exprStatus:    sv(status),
 			exprUpdatedAt: sv(Now()),
 		},
 	})
 	return err
 }
 
+func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
+	return s.setSuggestionStatus(ctx, id, SuggestionStatusApplied)
+}
+
 func (s *Store) DismissPromptSuggestion(ctx context.Context, id int64) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("SUGGESTION"),
-			"SK": sv(padID(id)),
-		},
-		UpdateExpression: aws.String("SET #s = :st, updatedAt = :ua"),
-		ExpressionAttributeNames: map[string]string{
-			"#s": attrStatus,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprStatus:    sv(SuggestionStatusDismissed),
-			exprUpdatedAt: sv(Now()),
-		},
-	})
-	return err
+	return s.setSuggestionStatus(ctx, id, SuggestionStatusDismissed)
 }
 
 // ApplyPromptSuggestionAndUpdatePrompt applies a suggestion and updates the prompt in sequence.
@@ -2078,11 +2021,6 @@ type SetSettingParams struct {
 	Value string
 }
 
-type SeedSettingParams struct {
-	Key   string
-	Value string
-}
-
 type AddHistoryParams = HistoryEntry
 
 type AddLogParams = LogEntry
@@ -2160,16 +2098,6 @@ type GetLogsRangeParams struct {
 	Timestamp2 string
 }
 
-type GetHistoryByAccountParams struct {
-	AccountID int64
-	Limit     int64
-}
-
-type GetHistoryByPromptParams struct {
-	PromptID sql.NullInt64
-	Limit    int64
-}
-
 type InsertEmailCorrectionParams struct {
 	AccountID        int64
 	MessageID        string
@@ -2232,11 +2160,6 @@ type AddLabelExemptionParams struct {
 type DeleteLabelExemptionParams struct {
 	ID        int64
 	AccountID int64
-}
-
-type LabelRetentionExistsParams struct {
-	AccountID int64
-	LabelName string
 }
 
 type PromptExistsForAccountParams struct {

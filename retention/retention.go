@@ -47,29 +47,9 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 		if exemptSet[rule.LabelName] {
 			continue
 		}
-		for len(trashed) < maxRetentionIDs {
-			ids, err := gmailpkg.FetchEmailsOlderThan(ctx, svc, int(rule.Days), rule.LabelName, nil, maxPages)
-			if err != nil {
-				slog.Error("fetch older emails", "label", rule.LabelName, "err", err)
-				break
-			}
-			var toTrash []string
-			for _, id := range ids {
-				if !trashed[id] {
-					toTrash = append(toTrash, id)
-					trashed[id] = true
-				}
-			}
-			if len(toTrash) == 0 {
-				break
-			}
-			if err := gmailpkg.BatchTrashEmails(ctx, svc, toTrash); err != nil {
-				slog.Error("trash emails", "label", rule.LabelName, "err", err)
-			}
-			if len(ids) < 500 {
-				break // no more pages
-			}
-		}
+		trashOlderThan(ctx, svc, trashed, "label "+rule.LabelName, func() ([]string, error) {
+			return gmailpkg.FetchEmailsOlderThan(ctx, svc, int(rule.Days), rule.LabelName, nil, maxPages)
+		})
 	}
 
 	// Global retention rule
@@ -90,11 +70,24 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 		excludeLabels = append(excludeLabels, e.LabelName)
 	}
 
+	trashOlderThan(ctx, svc, trashed, "global", func() ([]string, error) {
+		return gmailpkg.FetchEmailsOlderThan(ctx, svc, int(retention.GlobalDays.Int64), "", excludeLabels, maxPages)
+	})
+	return nil
+}
+
+// trashOlderThan pages through fetch (a FetchEmailsOlderThan call bound to one label rule
+// or the global rule) and trashes newly-seen ids, deduping against trashed (shared across
+// both the per-label and global loops in cleanup, since a message can match more than one
+// rule). Stops once maxRetentionIDs total ids have been trashed this run, fetch errors, a
+// page yields nothing new, or fetch returns fewer than a full page (no more pages).
+// logLabel identifies the rule in error/log output.
+func trashOlderThan(ctx context.Context, svc *gmailpkg.Client, trashed map[string]bool, logLabel string, fetch func() ([]string, error)) {
 	for len(trashed) < maxRetentionIDs {
-		ids, err := gmailpkg.FetchEmailsOlderThan(ctx, svc, int(retention.GlobalDays.Int64), "", excludeLabels, maxPages)
+		ids, err := fetch()
 		if err != nil {
-			slog.Error("fetch older emails (global)", "err", err)
-			break
+			slog.Error("fetch older emails", "rule", logLabel, "err", err)
+			return
 		}
 		var toTrash []string
 		for _, id := range ids {
@@ -104,14 +97,13 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 			}
 		}
 		if len(toTrash) == 0 {
-			break
+			return
 		}
 		if err := gmailpkg.BatchTrashEmails(ctx, svc, toTrash); err != nil {
-			slog.Error("trash emails (global)", "err", err)
+			slog.Error("trash emails", "rule", logLabel, "err", err)
 		}
-		if len(ids) < 500 {
-			break
+		if len(ids) < gmailpkg.PageSize {
+			return // no more pages
 		}
 	}
-	return nil
 }

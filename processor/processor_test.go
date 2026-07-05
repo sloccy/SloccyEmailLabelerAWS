@@ -26,6 +26,16 @@ func newLLMServer(t *testing.T, response string) *llm.FakeClient {
 	return llm.NewFakeClient(response)
 }
 
+// toLLMPrompts mirrors the []db.Prompt -> []llm.Prompt projection processMessageIDs builds
+// once per batch in production; tests calling processEmail directly build it the same way.
+func toLLMPrompts(prompts []db.Prompt) []llm.Prompt {
+	out := make([]llm.Prompt, len(prompts))
+	for i, p := range prompts {
+		out[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
+	}
+	return out
+}
+
 // ============================================================
 // ModifyForPrompt
 // ============================================================
@@ -249,7 +259,7 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "Label_42"}
 
-	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected at least one modify")
@@ -280,7 +290,7 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
 	}
 
-	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "")
 
 	if len(modifies) != 0 {
 		t.Errorf("expected no modifies for no-match, got %v", modifies)
@@ -299,7 +309,7 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 		{ID: 5, Name: "Spam", LabelName: "spam", ActionTrash: 1, Active: 1, Instructions: "trash spam"},
 	}
 
-	_, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, map[string]string{}, false, "", "")
+	_, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), map[string]string{}, false, "", "")
 
 	if !contains(trashIDs, "trash1") {
 		t.Errorf("expected trash1 in trashIDs, got %v", trashIDs)
@@ -318,7 +328,7 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 	}
 	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "")
 
 	for _, m := range modifies {
 		if contains(m.AddLabels, "L2") {
@@ -334,7 +344,7 @@ func TestProcessEmail_LLMError(t *testing.T) {
 	msg := gmailpkg.Message{ID: "err1", Subject: "Test"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 
-	modifies, trashIDs, job := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, trashIDs, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "")
 
 	// On LLM error, processEmail returns nil and does NOT mark the message processed.
 	if len(modifies) != 0 || len(trashIDs) != 0 {
@@ -354,7 +364,7 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 		{ID: 1, Name: "Archive", LabelName: "", ActionArchive: 1, Active: 1, Instructions: "archive"},
 	}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "")
 
 	if len(modifies) == 0 {
 		t.Fatal("expected a modify for archive action")
@@ -379,7 +389,7 @@ func TestProcessEmail_MarkReadAction(t *testing.T) {
 		{ID: 1, Name: "MarkRead", LabelName: "", ActionMarkRead: 1, Active: 1, Instructions: "mark read"},
 	}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "")
 
 	found := false
 	for _, m := range modifies {
@@ -408,7 +418,7 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "L1"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "")
 	applyWriteJob(t.Context(), store, job)
 
 	// Verify history was written.
@@ -438,12 +448,12 @@ func TestProcessEmail_LlmDebugGatedOnDebugLogging(t *testing.T) {
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 	labelCache := map[string]string{"l": "L1"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "")
 	if job.llmDebug != nil {
 		t.Error("expected llmDebug to be nil when DebugLogging is false")
 	}
 
-	_, _, job = processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, true, "", "")
+	_, _, job = processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, true, "", "")
 	if job.llmDebug == nil {
 		t.Error("expected llmDebug to be populated when DebugLogging is true")
 	}
@@ -458,7 +468,7 @@ func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	msg := gmailpkg.Message{ID: "nomatch1", Subject: "No Match"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", Active: 1, Instructions: "x"}}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, nil, false, "", "")
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "")
 	applyWriteJob(t.Context(), store, job)
 
 	history, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
@@ -538,7 +548,7 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, labelCache, false, "", "")
+			modifies, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "")
 
 			mu.Lock()
 			for _, m := range modifies {

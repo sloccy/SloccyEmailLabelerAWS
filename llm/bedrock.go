@@ -147,9 +147,6 @@ func NewClient(settings Settings, defaultModel string) *Client {
 	}
 }
 
-// Model returns the default model (used by tests and the troubleshooting UI).
-func (c *Client) Model() string { return c.defaultModel }
-
 // controlPlane lazily builds the Bedrock control-plane client (ListFoundationModels/
 // ListInferenceProfiles), built on first use rather than in NewClient.
 func (c *Client) controlPlane() *bedrock.Client {
@@ -509,55 +506,40 @@ func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.Inf
 	return msgs, inf
 }
 
-// BuildClassifyRequestJSON returns the serialised Bedrock Converse payload (for Troubleshooting UI).
-func (c *Client) BuildClassifyRequestJSON(email Email, prompts []Prompt) string {
-	if len(prompts) == 0 {
-		return ""
-	}
-	model, tier := c.ResolveClassifySettings(context.Background())
-	msgs, inf := classifyPayload(email, prompts)
-	payload := map[string]any{
-		"modelId":         model,
-		"messages":        msgs,
-		"inferenceConfig": inf,
-		"toolConfig":      classifyToolConfigJSON(prompts),
-	}
-	if tier == ClassifyTierFlex {
-		payload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
-}
-
 // ClassifyEmailBatch classifies one email against prompts using the given model and
 // service tier. Callers classifying many emails in one pass should resolve model/tier
-// once via ResolveClassifySettings and reuse them across calls.
-func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string) (ClassifyResult, error) {
+// once via ResolveClassifySettings and reuse them across calls. debug gates building the
+// (comparatively expensive) serialized request JSON onto ClassifyResult.RequestJSON — it's
+// only ever read by the Troubleshooting UI's debug write, so normal operation skips it.
+func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string, debug bool) (ClassifyResult, error) {
 	if len(prompts) == 0 {
 		return ClassifyResult{}, nil
 	}
 
 	msgs, inf := classifyPayload(email, prompts)
 
-	reqPayload := map[string]any{
-		"modelId":         model,
-		"messages":        msgs,
-		"inferenceConfig": inf,
-		"toolConfig":      classifyToolConfigJSON(prompts),
-	}
 	var svcTier *types.ServiceTier
 	if tier == ClassifyTierFlex {
 		svcTier = &types.ServiceTier{Type: types.ServiceTierTypeFlex}
-		reqPayload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
 	}
-	reqJSON, marshalErr := json.Marshal(reqPayload)
-	if marshalErr != nil {
-		reqJSON = []byte("{}")
+
+	var res ClassifyResult
+	if debug {
+		reqPayload := map[string]any{
+			"modelId":         model,
+			"messages":        msgs,
+			"inferenceConfig": inf,
+			"toolConfig":      classifyToolConfigJSON(prompts),
+		}
+		if tier == ClassifyTierFlex {
+			reqPayload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
+		}
+		reqJSON, marshalErr := json.Marshal(reqPayload)
+		if marshalErr != nil {
+			reqJSON = []byte("{}")
+		}
+		res.RequestJSON = string(reqJSON)
 	}
-	res := ClassifyResult{RequestJSON: string(reqJSON)}
 
 	subject := email.Subject
 	if len(subject) > 60 {
@@ -743,6 +725,16 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	model := c.resolveModel(ctx, SettingImproveModel)
 	var msgs []types.Message
 
+	// The first-turn prompt (no prior conversation) is used twice below — once as the
+	// Bedrock message, once as the stored conversation entry — so it's built once here
+	// rather than duplicating the format string and its 6 args at both call sites.
+	firstTurnMsg := fmt.Sprintf(
+		"RULE NAME: %s\nTARGET LABEL: %s\nTRIGGER: %s\n\nCURRENT INSTRUCTIONS:\n%s\n\nMISHANDLED EMAIL:\nFrom: %s\nSubject: %s\nBody:\n%s\n\nRewrite the instructions per the system rules.",
+		req.PromptName, req.LabelName, req.TriggerKind,
+		req.OriginalInstructions,
+		req.EmailSender, req.EmailSubject, req.EmailBody,
+	)
+
 	if len(req.PriorConversation) > 0 {
 		for _, m := range req.PriorConversation {
 			role := types.ConversationRoleUser
@@ -759,15 +751,9 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: req.UserComment}},
 		})
 	} else {
-		userMsg := fmt.Sprintf(
-			"RULE NAME: %s\nTARGET LABEL: %s\nTRIGGER: %s\n\nCURRENT INSTRUCTIONS:\n%s\n\nMISHANDLED EMAIL:\nFrom: %s\nSubject: %s\nBody:\n%s\n\nRewrite the instructions per the system rules.",
-			req.PromptName, req.LabelName, req.TriggerKind,
-			req.OriginalInstructions,
-			req.EmailSender, req.EmailSubject, req.EmailBody,
-		)
 		msgs = append(msgs, types.Message{
 			Role:    types.ConversationRoleUser,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: userMsg}},
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: firstTurnMsg}},
 		})
 	}
 
@@ -791,12 +777,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	if len(req.PriorConversation) > 0 {
 		conv = append(conv, ChatMessage{Role: "user", Content: req.UserComment})
 	} else {
-		conv = append(conv, ChatMessage{Role: "user", Content: fmt.Sprintf(
-			"RULE NAME: %s\nTARGET LABEL: %s\nTRIGGER: %s\n\nCURRENT INSTRUCTIONS:\n%s\n\nMISHANDLED EMAIL:\nFrom: %s\nSubject: %s\nBody:\n%s\n\nRewrite the instructions per the system rules.",
-			req.PromptName, req.LabelName, req.TriggerKind,
-			req.OriginalInstructions,
-			req.EmailSender, req.EmailSubject, req.EmailBody,
-		)})
+		conv = append(conv, ChatMessage{Role: "user", Content: firstTurnMsg})
 	}
 	conv = append(conv, ChatMessage{Role: "assistant", Content: suggestion})
 

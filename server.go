@@ -364,11 +364,16 @@ func (s *server) getPromptViews(ctx context.Context, accountIDFilter string) ([]
 	return views, nil
 }
 
+// renderPromptsList loads the prompt views (optionally filtered by accountIDFilter) and
+// renders the shared prompts_list fragment. Shared by the list/create/update/delete
+// handlers so the template path and load-then-render sequence can't drift between them.
+func (s *server) renderPromptsList(w http.ResponseWriter, ctx context.Context, accountIDFilter, toast string) {
+	views, _ := s.getPromptViews(ctx, accountIDFilter)
+	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, toast)
+}
+
 func (s *server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	accountFilter := r.URL.Query().Get("account_id")
-	views, _ := s.getPromptViews(ctx, accountFilter)
-	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, "")
+	s.renderPromptsList(w, r.Context(), r.URL.Query().Get("account_id"), "")
 }
 
 func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
@@ -390,13 +395,7 @@ func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	maxOrderRaw, _ := s.store.MaxPromptSortOrder(ctx)
-	var maxOrder int64
-	if v, ok := maxOrderRaw.(int64); ok {
-		maxOrder = v
-	} else {
-		slog.Warn("MaxPromptSortOrder returned unexpected type", "type", fmt.Sprintf("%T", maxOrderRaw))
-	}
+	maxOrder, _ := s.store.MaxPromptSortOrder(ctx)
 	_, err := s.store.CreatePrompt(ctx, db.CreatePromptParams{
 		Name:           name,
 		Instructions:   instructions,
@@ -418,8 +417,7 @@ func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
 	// Pre-create label in background for all matching accounts
 	go s.ensureLabelForAccounts(context.Background(), labelName, accountID) //nolint:gosec // G118: must outlive request
 
-	views, _ := s.getPromptViews(ctx, "")
-	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, "Rule saved")
+	s.renderPromptsList(w, ctx, "", "Rule saved")
 }
 
 func (s *server) handleUpdatePrompt(w http.ResponseWriter, r *http.Request) {
@@ -453,16 +451,26 @@ func (s *server) handleUpdatePrompt(w http.ResponseWriter, r *http.Request) {
 
 	go s.ensureLabelForAccounts(context.Background(), labelName, accountID) //nolint:gosec // G118: must outlive request
 
-	views, _ := s.getPromptViews(ctx, "")
-	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, "Rule updated")
+	s.renderPromptsList(w, ctx, "", "Rule updated")
 }
 
 func (s *server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 	id := pathInt(r, "id")
 	ctx := r.Context()
 	_ = s.store.DeletePrompt(ctx, id)
-	views, _ := s.getPromptViews(ctx, "")
-	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, "Rule deleted")
+	s.renderPromptsList(w, ctx, "", "Rule deleted")
+}
+
+// loadPromptView loads prompt id and returns it as a promptView (with its account email
+// resolved), alongside the raw account list — the edit view needs the latter too, for its
+// account-picker dropdown. Shared preamble for the toggle/edit/view prompt-card handlers.
+func (s *server) loadPromptView(ctx context.Context, id int64) (promptView, []db.ListAccountsSafeRow, error) {
+	p, err := s.store.GetPrompt(ctx, id)
+	if err != nil {
+		return promptView{}, nil, err
+	}
+	accounts, _ := s.store.ListAccountsSafe(ctx)
+	return dbPromptToView(p, buildAccountMap(accounts)), accounts, nil
 }
 
 func (s *server) handleTogglePrompt(w http.ResponseWriter, r *http.Request) {
@@ -470,27 +478,24 @@ func (s *server) handleTogglePrompt(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_, _ = s.store.TogglePrompt(ctx, id)
 
-	p, err := s.store.GetPrompt(ctx, id)
+	pv, _, err := s.loadPromptView(ctx, id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	accounts, _ := s.store.ListAccountsSafe(ctx)
-	pv := dbPromptToView(p, buildAccountMap(accounts))
 	s.render(w, "prompt_card_view", pv)
 }
 
 func (s *server) handleEditPrompt(w http.ResponseWriter, r *http.Request) {
 	id := pathInt(r, "id")
 	ctx := r.Context()
-	p, err := s.store.GetPrompt(ctx, id)
+	pv, accounts, err := s.loadPromptView(ctx, id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	accounts, _ := s.store.ListAccountsSafe(ctx)
 	data := promptEditView{
-		Prompt:   dbPromptToView(p, buildAccountMap(accounts)),
+		Prompt:   pv,
 		Accounts: toAccountViews(accounts),
 	}
 	s.render(w, "prompt_card_edit", data)
@@ -498,14 +503,12 @@ func (s *server) handleEditPrompt(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleViewPrompt(w http.ResponseWriter, r *http.Request) {
 	id := pathInt(r, "id")
-	ctx := r.Context()
-	p, err := s.store.GetPrompt(ctx, id)
+	pv, _, err := s.loadPromptView(r.Context(), id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	accounts, _ := s.store.ListAccountsSafe(ctx)
-	s.render(w, "prompt_card_view", dbPromptToView(p, buildAccountMap(accounts)))
+	s.render(w, "prompt_card_view", pv)
 }
 
 func buildAccountMap(accounts []db.ListAccountsSafeRow) map[int64]string {
@@ -780,10 +783,8 @@ func (s *server) handleHistoryFilters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleHistoryLlmResponse(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		http.Error(w, "invalid id", http.StatusBadRequest)
+	id, ok := requireID(w, r)
+	if !ok {
 		return
 	}
 	resp, err := s.store.GetHistoryLlmResponse(r.Context(), id)
@@ -832,11 +833,28 @@ func (s *server) buildRetentionData(ctx context.Context, accountID int64) retent
 	return data
 }
 
+// renderRetentionPanel loads the retention data (with Gmail label options) for accountID
+// and renders the shared retention_panel fragment. Shared by every retention handler below
+// so the template path and build-then-render sequence can't drift between them.
+func (s *server) renderRetentionPanel(w http.ResponseWriter, ctx context.Context, accountID int64, toast string) {
+	data := s.buildRetentionDataWithGmail(ctx, accountID)
+	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, toast)
+}
+
+// daysFromForm parses the "value"/"unit" retention form fields into a day count, treating
+// unit=="years" as 365 days/year. Shared by the global- and label-retention handlers so the
+// years-to-days convention is defined once.
+func daysFromForm(r *http.Request) int64 {
+	val, _ := strconv.ParseInt(r.FormValue("value"), 10, 64)
+	if r.FormValue("unit") == retentionUnitYears {
+		return val * 365
+	}
+	return val
+}
+
 func (s *server) handleGetRetention(w http.ResponseWriter, r *http.Request) {
 	id := pathInt(r, "id")
-	ctx := r.Context()
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "")
+	s.renderRetentionPanel(w, r.Context(), id, "")
 }
 
 func (s *server) handleSetGlobalRetention(w http.ResponseWriter, r *http.Request) {
@@ -845,20 +863,14 @@ func (s *server) handleSetGlobalRetention(w http.ResponseWriter, r *http.Request
 	_ = r.ParseForm()
 
 	if r.FormValue("enabled") == "1" {
-		val, _ := strconv.ParseInt(r.FormValue("value"), 10, 64)
-		unit := r.FormValue("unit")
-		days := val
-		if unit == retentionUnitYears {
-			days = val * 365
-		}
+		days := daysFromForm(r)
 		if days > 0 {
 			_ = s.store.SetGlobalRetention(ctx, db.SetGlobalRetentionParams{AccountID: id, GlobalDays: sql.NullInt64{Int64: days, Valid: true}})
 		}
 	} else {
 		_ = s.store.ClearGlobalRetention(ctx, id)
 	}
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "Saved")
+	s.renderRetentionPanel(w, ctx, id, "Saved")
 }
 
 func (s *server) handleAddLabelRetention(w http.ResponseWriter, r *http.Request) {
@@ -866,17 +878,11 @@ func (s *server) handleAddLabelRetention(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	_ = r.ParseForm()
 	label := strings.TrimSpace(r.FormValue("label_name"))
-	val, _ := strconv.ParseInt(r.FormValue("value"), 10, 64)
-	unit := r.FormValue("unit")
-	days := val
-	if unit == retentionUnitYears {
-		days = val * 365
-	}
+	days := daysFromForm(r)
 	if label != "" && days > 0 {
 		_ = s.store.AddLabelRetention(ctx, db.AddLabelRetentionParams{AccountID: id, LabelName: label, Days: days})
 	}
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "Rule added")
+	s.renderRetentionPanel(w, ctx, id, "Rule added")
 }
 
 func (s *server) handleDeleteLabelRetention(w http.ResponseWriter, r *http.Request) {
@@ -884,8 +890,7 @@ func (s *server) handleDeleteLabelRetention(w http.ResponseWriter, r *http.Reque
 	ruleID := pathInt(r, "ruleId")
 	ctx := r.Context()
 	_ = s.store.DeleteLabelRetention(ctx, db.DeleteLabelRetentionParams{ID: ruleID, AccountID: id})
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "Rule removed")
+	s.renderRetentionPanel(w, ctx, id, "Rule removed")
 }
 
 func (s *server) handleAddExemption(w http.ResponseWriter, r *http.Request) {
@@ -896,8 +901,7 @@ func (s *server) handleAddExemption(w http.ResponseWriter, r *http.Request) {
 	if label != "" {
 		_ = s.store.AddLabelExemption(ctx, db.AddLabelExemptionParams{AccountID: id, LabelName: label})
 	}
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "Exemption added")
+	s.renderRetentionPanel(w, ctx, id, "Exemption added")
 }
 
 func (s *server) handleDeleteExemption(w http.ResponseWriter, r *http.Request) {
@@ -905,8 +909,7 @@ func (s *server) handleDeleteExemption(w http.ResponseWriter, r *http.Request) {
 	eid := pathInt(r, "eid")
 	ctx := r.Context()
 	_ = s.store.DeleteLabelExemption(ctx, db.DeleteLabelExemptionParams{ID: eid, AccountID: id})
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "Exemption removed")
+	s.renderRetentionPanel(w, ctx, id, "Exemption removed")
 }
 
 func (s *server) handleRetentionQuery(w http.ResponseWriter, r *http.Request) {
@@ -920,9 +923,7 @@ func (s *server) handleRetentionQuery(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	ctx := r.Context()
-	data := s.buildRetentionDataWithGmail(ctx, id)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, "")
+	s.renderRetentionPanel(w, r.Context(), id, "")
 }
 
 // gmailServiceFor builds an authenticated Gmail client for account, wiring credential
@@ -960,13 +961,10 @@ func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int6
 
 	for _, l := range labels {
 		lower := strings.ToLower(l.Name)
-		switch {
-		case !exemptSet[lower] && !ruleSet[lower]:
+		if !exemptSet[lower] {
 			data.AvailableLabelsForExemption = append(data.AvailableLabelsForExemption, l.Name)
-			data.AvailableLabelsForRules = append(data.AvailableLabelsForRules, l.Name)
-		case !exemptSet[lower]:
-			data.AvailableLabelsForExemption = append(data.AvailableLabelsForExemption, l.Name)
-		case !ruleSet[lower]:
+		}
+		if !ruleSet[lower] {
 			data.AvailableLabelsForRules = append(data.AvailableLabelsForRules, l.Name)
 		}
 	}
