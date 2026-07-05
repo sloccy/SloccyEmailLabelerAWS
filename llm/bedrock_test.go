@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/smithy-go"
 	"github.com/sloccy/ollamail-aws/db"
 )
 
@@ -369,5 +370,29 @@ func TestClassifyEmailBatch_FallbackParsesThinkBlockPreamble(t *testing.T) {
 	}
 	if !res.Results[101] || res.Results[102] {
 		t.Errorf("Results = %v, want {101:true, 102:false}", res.Results)
+	}
+}
+
+// TestNewBedrockRetryer_RetriesClockSkewAndThrottling checks that the retryer built by
+// newBedrockRetryer treats both the clock-skew signature error codes (added explicitly
+// because the SDK doesn't retry them by default — see the Lambda freeze/thaw scenario
+// documented on newBedrockRetryer) and a standard throttling code as retryable.
+func TestNewBedrockRetryer_RetriesClockSkewAndThrottling(t *testing.T) {
+	r := newBedrockRetryer()
+	for _, code := range []string{
+		"InvalidSignatureException",
+		"RequestExpired",
+		"RequestTimeTooSkewed",
+		"SignatureDoesNotMatch",
+		"ThrottlingException", // sanity check: preexisting adaptive-mode behavior still works
+	} {
+		err := &smithy.GenericAPIError{Code: code, Message: "boom"}
+		if !r.IsErrorRetryable(err) {
+			t.Errorf("IsErrorRetryable(%s) = false, want true", code)
+		}
+	}
+
+	if unrelated := (&smithy.GenericAPIError{Code: "ValidationException", Message: "bad input"}); r.IsErrorRetryable(unrelated) {
+		t.Errorf("IsErrorRetryable(ValidationException) = true, want false (not a transient error)")
 	}
 }

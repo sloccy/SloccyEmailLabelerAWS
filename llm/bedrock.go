@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
@@ -115,6 +116,30 @@ type Client struct {
 // DefaultModel is the Bedrock model id used when nothing else specifies one.
 const DefaultModel = "us.amazon.nova-micro-v1:0"
 
+// newBedrockRetryer builds the aws.Retryer used by NewClient: adaptive retry + client-side
+// rate limiting (classification is fanned out across goroutines — see
+// processor.ProcessConfig.ClassifyConcurrency — so concurrent requests are more likely to
+// hit on-demand throttling; back off instead of failing fast), plus retries for
+// signature/clock-skew errors. A Lambda execution environment frozen and thawed between
+// invocations can briefly sign a request with a stale wall clock, which Bedrock rejects as
+// InvalidSignatureException even though the request itself was fine — the SDK doesn't treat
+// that code as retryable by default, so it's added explicitly here. A retry a moment later
+// re-signs with the (by then re-synced) clock and succeeds. Factored out of NewClient so
+// tests can exercise the retry classification without a network round-trip.
+func newBedrockRetryer() aws.Retryer {
+	return retry.AddWithErrorCodes(
+		retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
+			o.StandardOptions = append(o.StandardOptions, func(so *retry.StandardOptions) {
+				so.MaxAttempts = 5
+			})
+		}),
+		"InvalidSignatureException",
+		"RequestExpired",
+		"RequestTimeTooSkewed",
+		"SignatureDoesNotMatch",
+	)
+}
+
 // NewClient creates a Bedrock client.
 // settings provides per-call model lookups (classify_model / improve_model keys).
 // defaultModel is the fallback when neither a setting nor BEDROCK_MODEL is set.
@@ -129,12 +154,9 @@ func NewClient(settings Settings, defaultModel string) *Client {
 		// Generous read-timeout so the HTTP layer doesn't abort a queued flex-tier request
 		// before the Lambda's own timeout does.
 		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTimeout(bedrockHTTPTimeout)),
-		// Adaptive retry + client-side rate limiting: with classification now fanned out
-		// across goroutines (see processor.ProcessConfig.ClassifyConcurrency), concurrent
-		// requests are more likely to hit on-demand throttling, so back off instead of
-		// failing fast.
-		awsconfig.WithRetryMode(aws.RetryModeAdaptive),
-		awsconfig.WithRetryMaxAttempts(5),
+		// Adaptive retry + client-side rate limiting, plus clock-skew signature errors;
+		// see newBedrockRetryer.
+		awsconfig.WithRetryer(newBedrockRetryer),
 	)
 	if err != nil {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
