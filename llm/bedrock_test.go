@@ -181,7 +181,7 @@ func TestClassifyEmailBatch_ToolUseSuccess(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestClassifyEmailBatch_FallsBackWhenNoToolUseBlock(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestClassifyEmailBatch_FallsBackWhenToolCallErrors(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestClassifyEmailBatch_BothCallsFail(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err == nil {
 		t.Fatal("expected error when both the tool-use call and the fallback fail")
 	}
@@ -302,7 +302,7 @@ func TestClassifyEmailBatch_TimeoutLoggedOnce(t *testing.T) {
 	fake := &fakeConverseAPI{errs: []error{fakeTimeoutError{}, fakeTimeoutError{}}}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
 	logger := &recordingLogger{}
-	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err == nil {
 		t.Fatal("expected error when both calls time out")
 	}
@@ -360,7 +360,7 @@ func TestClassifyEmailBatch_FallbackParsesThinkBlockPreamble(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
