@@ -26,6 +26,11 @@ type Config struct {
 	// Cloudflare Access (Zero Trust) protection for the Web UI, fronted by CloudFront.
 	CfAccessTeamDomain string // e.g. https://yourteam.cloudflareaccess.com; enables Access JWT verification
 	CfAccessAud        string // Cloudflare Access application Audience (AUD) tag
+	// AuthMode mirrors the Function URL's AuthType decision made in template.yaml
+	// ("cfaccess" when the URL is public NONE, "iam" when it's AWS_IAM). It lets runWeb
+	// refuse to start when the URL is public but the CF Access vars have drifted away —
+	// without it, missing CF vars silently disable the only auth gate.
+	AuthMode string
 
 	// ClassifyConcurrency caps how many emails are classified against Bedrock in parallel per
 	// account. Flex-tier requests can queue for minutes, so classification no longer waits on
@@ -50,6 +55,7 @@ func loadConfig() Config {
 
 		CfAccessTeamDomain: getEnv("CF_ACCESS_TEAM_DOMAIN", ""),
 		CfAccessAud:        getEnv("CF_ACCESS_AUD", ""),
+		AuthMode:           getEnv("AUTH_MODE", ""),
 
 		ClassifyConcurrency: getEnvInt("CLASSIFY_CONCURRENCY", 6),
 	}

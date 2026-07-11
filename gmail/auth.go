@@ -87,22 +87,30 @@ func (a *Auth) loadConfig() (*oauth2.Config, error) {
 	return a.cachedCfg, a.cachedErr
 }
 
-// GetAuthURL returns the Google OAuth2 consent URL for the given state.
-func (a *Auth) GetAuthURL(state string) (string, error) {
+// GenerateVerifier returns a fresh PKCE code verifier. The caller holds it between
+// GetAuthURL (which sends its S256 challenge) and ExchangeCode (which presents it) —
+// so an intercepted authorization code is useless without the verifier.
+func GenerateVerifier() string {
+	return oauth2.GenerateVerifier()
+}
+
+// GetAuthURL returns the Google OAuth2 consent URL for the given state and PKCE verifier.
+func (a *Auth) GetAuthURL(state, verifier string) (string, error) {
 	cfg, err := a.loadConfig()
 	if err != nil {
 		return "", err
 	}
-	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce), nil
+	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce, oauth2.S256ChallengeOption(verifier)), nil
 }
 
-// ExchangeCode exchanges an auth code for credentials JSON and returns (email, credentialsJSON).
-func (a *Auth) ExchangeCode(ctx context.Context, code string) (string, string, error) {
+// ExchangeCode exchanges an auth code (plus its PKCE verifier) for credentials JSON and
+// returns (email, credentialsJSON).
+func (a *Auth) ExchangeCode(ctx context.Context, code, verifier string) (string, string, error) {
 	cfg, err := a.loadConfig()
 	if err != nil {
 		return "", "", err
 	}
-	token, err := cfg.Exchange(ctx, code)
+	token, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return "", "", fmt.Errorf("exchange code: %w", err)
 	}

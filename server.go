@@ -60,9 +60,10 @@ type server struct {
 	tmpl  *template.Template
 	mux   *http.ServeMux
 
-	// OAuth state: short-lived in-memory map (single instance, no need for persistent storage)
+	// OAuth state: short-lived in-memory map (single instance, no need for persistent
+	// storage), keyed by the CSRF state token; carries the PKCE verifier for the exchange.
 	oauthMu    sync.Mutex
-	oauthState map[string]time.Time
+	oauthState map[string]oauthPending
 
 	// Cached Bedrock model list (refreshed at most once per hour)
 	modelsMu        sync.Mutex
@@ -77,7 +78,7 @@ func newServer(ctx context.Context, store *db.Store, llmClient *llm.Client, auth
 		llm:        llmClient,
 		cfg:        cfg,
 		auth:       auth,
-		oauthState: make(map[string]time.Time),
+		oauthState: make(map[string]oauthPending),
 	}
 
 	var err error
@@ -985,19 +986,27 @@ func (s *server) buildRetentionDataWithGmail(ctx context.Context, accountID int6
 // OAuth
 // ============================================================
 
+// oauthPending is an in-flight OAuth attempt: the PKCE verifier minted alongside the
+// state token, and when the attempt expires.
+type oauthPending struct {
+	verifier string
+	expires  time.Time
+}
+
 func (s *server) handleOAuthStart(w http.ResponseWriter, _ *http.Request) {
 	state := generateToken(16)
+	verifier := gmail.GenerateVerifier()
 	s.oauthMu.Lock()
 	now := time.Now()
-	for k, exp := range s.oauthState {
-		if now.After(exp) {
+	for k, p := range s.oauthState {
+		if now.After(p.expires) {
 			delete(s.oauthState, k)
 		}
 	}
-	s.oauthState[state] = now.Add(10 * time.Minute)
+	s.oauthState[state] = oauthPending{verifier: verifier, expires: now.Add(10 * time.Minute)}
 	s.oauthMu.Unlock()
 
-	authURL, err := s.auth.GetAuthURL(state)
+	authURL, err := s.auth.GetAuthURL(state, verifier)
 	if err != nil {
 		http.Error(w, "Could not generate auth URL: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1019,18 +1028,18 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 	state := parsed.Query().Get("state")
 
 	s.oauthMu.Lock()
-	exp, ok := s.oauthState[state]
+	pending, ok := s.oauthState[state]
 	if ok {
 		delete(s.oauthState, state)
 	}
 	s.oauthMu.Unlock()
 
-	if !ok || time.Now().After(exp) {
+	if !ok || time.Now().After(pending.expires) {
 		s.fragmentResponse(w, "templates/fragments/accounts_list.html", nil, "OAuth state expired — try again")
 		return
 	}
 
-	emailAddr, credJSON, err := s.auth.ExchangeCode(ctx, code)
+	emailAddr, credJSON, err := s.auth.ExchangeCode(ctx, code, pending.verifier)
 	if err != nil {
 		slog.Error("oauth exchange", "err", err)
 		s.fragmentResponse(w, "templates/fragments/accounts_list.html", nil, "OAuth failed: "+err.Error())

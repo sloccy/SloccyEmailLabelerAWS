@@ -64,11 +64,21 @@ func runWeb(cfg Config) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Fail closed: AUTH_MODE=cfaccess (set by template.yaml exactly when the Function URL
+	// is public AuthType NONE) means the in-app Cloudflare Access JWT check is the only
+	// auth gate. If the CF vars have drifted away, refuse to serve rather than serve
+	// the UI unauthenticated.
+	if cfg.AuthMode == "cfaccess" && (cfg.CfAccessTeamDomain == "" || cfg.CfAccessAud == "") {
+		log.Fatalf("AUTH_MODE=cfaccess but CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD unset — the Function URL is public and unverified; refusing to start")
+	}
+
 	// Scheduled scanning is handled by the ScanFunction (EventBridge, fixed daily 2 AM ET
 	// cron — see ScanSchedule in template.yaml); the web UI's "Scan Now" runs an on-demand
 	// pass in-process via scanOnce.
 	srv := newServer(ctx, store, llmClient, gmailAuth, &cfg)
-	handler := newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv)
+	// Security middleware outermost so headers land on every response, including the
+	// Cloudflare Access middleware's own 403s.
+	handler := newSecurityMiddleware(newCfAccessMiddleware(ctx, cfg.CfAccessTeamDomain, cfg.CfAccessAud)(srv))
 
 	serveHTTP(ctx, handler)
 }

@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OllaMail</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@latest/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Vendored third-party assets — versions pinned in package.json (Dependabot-managed),
+       fetched into static/vendor/ at build time by scripts/vendor.sh. No runtime CDN. -->
+  <link href="/static/vendor/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@latest/dist/js/bootstrap.bundle.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/htmx.org@latest/dist/htmx.min.js" defer></script>
+  <script src="/static/vendor/bootstrap.bundle.min.js" defer></script>
+  <script src="/static/vendor/htmx.min.js" defer></script>
 </head>
 <body>
 <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>

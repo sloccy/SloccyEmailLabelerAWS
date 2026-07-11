@@ -59,7 +59,7 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
 - **Two image-based Lambdas**, both built from the same `Dockerfile` (`x86_64`):
   - **WebFunction** — serves the management UI, exposed via a **Lambda Function URL** locked to `AuthType: AWS_IAM` (nothing is public; browse it via a local SigV4 proxy).
   - **ScanFunction** — triggered by **EventBridge on a fixed `rate(1 minute)` schedule**. Runs one labeling pass (`scanOnce`) per invocation. Overlapping runs are safe — processed emails are deduped in DynamoDB.
-- **DynamoDB** single-table `ollamail` (on-demand, TTL enabled) — accounts, rules, history, logs, retention, suggestions, OAuth tokens.
+- **DynamoDB** single-table `ollamail` (on-demand, TTL enabled) — accounts, rules, history, logs, retention, suggestions. Per-account Gmail OAuth tokens are **not** in the table: they live as SSM SecureStrings under `/ollamail/accounts/<id>/token`, so table read access alone can't exfiltrate mailbox credentials.
 - **Amazon Bedrock** — classification and the prompt builder (model selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured).
 - **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
 
@@ -163,6 +163,10 @@ sam deploy   # uses samconfig.toml: stack `ollamail`, region us-east-2
 
 Outputs include the **WebFunctionUrl** (the AWS_IAM-protected Function URL) and the DynamoDB table name.
 
+#### Backups
+
+There is no PITR on the DynamoDB table (deliberate — it bills per GB-month). The hard-to-recreate data (prompt rules, settings, retention rules, account list) is covered by **Settings → backup/restore** (`GET /api/config/export` / `POST /api/config/import`), which excludes credentials. Export a config snapshot before deploying storage-layer changes. Everything else in the table is expendable: logs/history are TTL'd telemetry, processed-markers rebuild, and Gmail tokens can be re-obtained by re-running OAuth for an account.
+
 ---
 
 ### 5. Open the web interface
@@ -224,7 +228,7 @@ Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-veri
 4. For each matched rule, the configured action is applied via the Gmail API (label, archive, trash, spam, mark as read). Labels are created automatically if missing.
 5. If a matched rule has **stop processing** enabled, no further rules are evaluated for that email.
 6. Processed message IDs are stored in DynamoDB (TTL-bounded) so each email is evaluated only once per account.
-7. OAuth access tokens are refreshed automatically; refreshed tokens are written back to DynamoDB.
+7. OAuth access tokens are refreshed automatically; refreshed tokens are written back to their SSM SecureString (`/ollamail/accounts/<id>/token`).
 
 ---
 
@@ -234,7 +238,10 @@ Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-veri
 git clone https://github.com/sloccy/OllaMail.git
 cd OllaMail
 
-# Frontend vendor assets (Bootstrap, htmx) are committed and embedded at compile time.
+# Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (Dependabot-managed)
+# and fetched into static/vendor/ at build time — run once before serving the UI locally:
+./scripts/vendor.sh
+
 go build ./...
 go vet ./...
 go test ./...

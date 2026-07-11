@@ -47,8 +47,17 @@ func TestAccountRoundTrip_Populated(t *testing.T) {
 		t.Errorf("SK = %v", item["SK"])
 	}
 
+	// OAuth tokens live in SSM (see hydrateAccountToken), never in the table: accountItem
+	// must strip CredentialsJSON no matter what the in-memory Account carries.
+	if creds, ok := item["creds"].(*types.AttributeValueMemberS); ok && creds.Value != "" {
+		t.Errorf("creds persisted to item: %q; accountItem must strip tokens", creds.Value)
+	}
+
 	got := itemToAccount(item)
-	if got.ID != a.ID || got.Email != a.Email || got.CredentialsJSON != a.CredentialsJSON ||
+	if got.CredentialsJSON != "" {
+		t.Errorf("CredentialsJSON = %q, want empty (tokens are hydrated from SSM, not the item)", got.CredentialsJSON)
+	}
+	if got.ID != a.ID || got.Email != a.Email ||
 		got.AddedAt != a.AddedAt || got.Active != a.Active ||
 		got.WatchHistoryID != a.WatchHistoryID || got.WatchExpiration != a.WatchExpiration {
 		t.Errorf("round trip mismatch: got %+v, want %+v", got, a)

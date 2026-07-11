@@ -125,6 +125,10 @@ Resources:
   OlamailTable:
     Type: AWS::DynamoDB::Table
     Properties:
+      # Blocks DeleteTable (console, CLI, or a bad stack operation) until this flag is
+      # flipped off. Free. Item-level restore is handled by config export/import (see
+      # README) rather than PITR, which would bill per GB-month.
+      DeletionProtectionEnabled: true
       BillingMode: PROVISIONED
       ProvisionedThroughput:
         ReadCapacityUnits: 2
@@ -201,6 +205,15 @@ Resources:
                 Action:
                   - ssm:GetParameter
                 Resource: !Ref CredentialsSsmArn
+              # Per-account Gmail OAuth tokens live as SecureStrings under
+              # /ollamail/accounts/<id>/token (see db/store.go tokenParamName) — kept out
+              # of the DynamoDB table so table read access alone can't exfiltrate them.
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ollamail/accounts/*
 
   # ----------------------------------------------------------------
   # Web function — serves the management UI via Function URL
@@ -240,6 +253,9 @@ Resources:
           AWS_LWA_PORT: "8080"
           CF_ACCESS_TEAM_DOMAIN: !Ref CfAccessTeamDomain
           CF_ACCESS_AUD: !Ref CfAccessAud
+          # Mirrors the AuthType !If above so the app can fail closed: when the URL is
+          # public (cfaccess) but the CF vars are missing, runWeb refuses to start.
+          AUTH_MODE: !If [CfAccessEnabled, cfaccess, iam]
 
   # SAM auto-generates these two public-invoke permissions only when
   # FunctionUrlConfig.AuthType is the literal string "NONE". WebFunction's AuthType
@@ -382,6 +398,39 @@ Resources:
           MODE: push
           AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
           AWS_LWA_PORT: "8080"
+
+  # ----------------------------------------------------------------
+  # CloudWatch log groups with bounded retention. Without these, Lambda implicitly
+  # creates never-expiring log groups on first invocation. RetentionInDays reuses the
+  # LogRetentionDays parameter so CloudWatch and DynamoDB-row retention stay in step.
+  #
+  # ONE-TIME MIGRATION NOTE: the implicitly-created groups already exist, and
+  # CloudFormation refuses to create over them. Before the first deploy that includes
+  # these resources, delete the old groups (their contents are 30 days of operational
+  # logs, nothing irreplaceable):
+  #   for g in $(aws logs describe-log-groups --log-group-name-prefix /aws/lambda/ollamail \
+  #     --query 'logGroups[].logGroupName' --output text); do
+  #     aws logs delete-log-group --log-group-name "$g"; done
+  # (Check for the SAM-generated Web/Push names too:
+  #   aws logs describe-log-groups --query 'logGroups[?contains(logGroupName, `Function`)].logGroupName')
+  # ----------------------------------------------------------------
+  WebFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WebFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  ScanFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ScanFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  PushFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PushFunction}
+      RetentionInDays: !Ref LogRetentionDays
 
   # ----------------------------------------------------------------
   # EventBridge Scheduler schedule that triggers the scan. Real-time labeling is handled by
