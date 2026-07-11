@@ -192,7 +192,10 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .chart-svg { width: 100%; height: auto; display: block; }
 .chart-gridline { stroke: var(--om-text-10); stroke-width: 1; }
 .chart-tick { stroke: var(--om-text-30); stroke-width: 1; }
-.chart-axis-label { font-size: 0.5rem; fill: var(--om-text-50); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/* dominant-baseline centers the text vertically on its y coordinate (rather than treating
+   y as the text baseline), so a label lines up with the middle of its gridline instead of
+   sitting below it. */
+.chart-axis-label { font-size: 0.4375rem; fill: var(--om-text-50); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; dominant-baseline: middle; }
 .chart-whisker { stroke: var(--om-text-50); stroke-width: 1.5; }
 .chart-box { fill: var(--om-primary-25); stroke: var(--om-primary-70); stroke-width: 1.5; }
 .chart-median { stroke: var(--om-primary); stroke-width: 2; }
