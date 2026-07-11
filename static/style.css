@@ -191,7 +191,8 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .chart-body { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
 .chart-svg { width: 100%; height: auto; display: block; }
 .chart-gridline { stroke: var(--om-text-10); stroke-width: 1; }
-.chart-axis-label { font-size: 0.625rem; fill: var(--om-text-50); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.chart-tick { stroke: var(--om-text-30); stroke-width: 1; }
+.chart-axis-label { font-size: 0.5625rem; fill: var(--om-text-50); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .chart-whisker { stroke: var(--om-text-50); stroke-width: 1.5; }
 .chart-box { fill: var(--om-primary-25); stroke: var(--om-primary-70); stroke-width: 1.5; }
 .chart-median { stroke: var(--om-primary); stroke-width: 2; }

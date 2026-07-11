@@ -249,8 +249,36 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y+4, a)
 	}
 
-	fmt.Fprintf(&b, `<text x="%d" y="%d" class="chart-axis-label" text-anchor="start">%s</text>`, plotLeft, chartHeight-8, first.Format("Jan 2"))
-	fmt.Fprintf(&b, `<text x="%d" y="%d" class="chart-axis-label" text-anchor="end">%s</text>`, plotRight, chartHeight-8, last.Format("Jan 2"))
+	// X-axis ticks: up to 5, evenly spaced by time across [first, last] (matching the
+	// Y-axis's "at most 5" gridlines for visual consistency). If every sample falls in the
+	// same hour there's only one instant to label, so skip spreading fake ticks across it.
+	const xTicks = 5
+	n := xTicks
+	if last.Equal(first) {
+		n = 1
+	}
+	// A span under a day means multiple ticks could land on the same calendar date, so
+	// include the hour in the label to keep them distinguishable.
+	xLabelFormat := "Jan 2"
+	if span < 24 {
+		xLabelFormat = "Jan 2 15:04"
+	}
+	for i := 0; i < n; i++ {
+		frac := 0.0
+		if n > 1 {
+			frac = float64(i) / float64(n-1)
+		}
+		t := first.Add(time.Duration(frac * span * float64(time.Hour)))
+		x := xFor(t)
+		fmt.Fprintf(&b, `<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" class="chart-tick"/>`, x, plotBottom, x, plotBottom+4)
+		anchor := "middle"
+		if i == 0 {
+			anchor = "start"
+		} else if i == n-1 {
+			anchor = "end"
+		}
+		fmt.Fprintf(&b, `<text x="%.1f" y="%d" class="chart-axis-label" text-anchor="%s">%s</text>`, x, chartHeight-8, anchor, t.Format(xLabelFormat))
+	}
 
 	coords := make([]string, 0, len(points))
 	for _, p := range points {
