@@ -537,11 +537,10 @@ func (s *Store) TrimLogs(_ context.Context, _ int) error {
 // Account OAuth tokens (SSM SecureString side-channel)
 //
 // Gmail refresh tokens are the crown jewel — durable gmail.modify access to the
-// whole mailbox — so they never touch the DynamoDB table: accountItem strips the
-// creds field on every write, and reads hydrate Account.CredentialsJSON from an
-// SSM SecureString at /ollamail/accounts/<id>/token (encrypted with the AWS-managed
-// aws/ssm key; IAM scoped in template.yaml). Rows written before this scheme carry
-// a legacy creds attribute, which reads migrate to SSM lazily and then clear.
+// whole mailbox — so they never touch the DynamoDB table: Account.CredentialsJSON
+// is tagged dynamodbav:"-" (never marshaled), and reads hydrate it from an SSM
+// SecureString at /ollamail/accounts/<id>/token (encrypted with the AWS-managed
+// aws/ssm key; IAM scoped in template.yaml).
 // ============================================================
 
 func tokenParamName(id int64) string {
@@ -595,26 +594,11 @@ func (s *Store) deleteAccountToken(ctx context.Context, id int64) error {
 	return nil
 }
 
-// hydrateAccountToken fills a.CredentialsJSON from SSM. If the row still carries a
-// legacy plaintext creds attribute (written before the SSM scheme), it is migrated:
-// copied to SSM, then removed from the item so the table no longer holds the token.
+// hydrateAccountToken fills a.CredentialsJSON from SSM. (Rows written before the SSM
+// scheme carried a plaintext creds attribute; those were lazily migrated in July 2026
+// and the attribute is additionally excluded from (un)marshaling via the model's
+// dynamodbav:"-" tag, so any stray copy is inert.)
 func (s *Store) hydrateAccountToken(ctx context.Context, a *Account) error {
-	if a.CredentialsJSON != "" { // legacy row — migrate
-		legacy := a.CredentialsJSON
-		if err := s.putAccountToken(ctx, a.ID, legacy); err != nil {
-			return err
-		}
-		if _, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName:        aws.String(s.table),
-			Key:              map[string]types.AttributeValue{"PK": sv("ACCOUNT"), "SK": sv(padID(a.ID))},
-			UpdateExpression: aws.String("REMOVE creds"),
-		}); err != nil {
-			// Token is safe in SSM; the leftover attribute just re-migrates (same
-			// value, idempotent) on the next read.
-			slog.Warn("clear legacy creds attribute", "account", a.ID, "err", err)
-		}
-		return nil
-	}
 	token, err := s.getAccountToken(ctx, a.ID)
 	if err != nil {
 		return err
@@ -624,9 +608,8 @@ func (s *Store) hydrateAccountToken(ctx context.Context, a *Account) error {
 }
 
 func accountItem(a Account) map[string]types.AttributeValue {
-	// Tokens live in SSM (see hydrateAccountToken) — never persist them to the table,
-	// regardless of what a hydrated Account value carries.
-	a.CredentialsJSON = ""
+	// Tokens live in SSM (see hydrateAccountToken); CredentialsJSON carries
+	// dynamodbav:"-" so it can never be persisted to the table.
 	return keyedItem(a, "ACCOUNT", padID(a.ID), 0)
 }
 
@@ -714,10 +697,7 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 	// Try to get existing ID first
 	existing, err := s.GetAccountByEmail(ctx, arg.Email)
 	if err == nil {
-		// Update existing. GetAccount's hydration may lazily migrate a legacy in-table
-		// token, and the PutItem below rewrites the row without a creds attribute — so
-		// the fresh token must be written to SSM last, or the legacy migration would
-		// resurrect the old token over it.
+		// Update existing.
 		a, err2 := s.GetAccount(ctx, existing)
 		if err2 != nil {
 			return 0, err2
@@ -789,21 +769,7 @@ func (s *Store) CreateAccountPlaceholder(ctx context.Context, email string) (int
 }
 
 func (s *Store) UpdateAccountCredentials(ctx context.Context, arg UpdateAccountCredentialsParams) error {
-	if err := s.putAccountToken(ctx, arg.ID, arg.CredentialsJSON); err != nil {
-		return err
-	}
-	// Also clear any legacy plaintext creds attribute: a stale copy left in the table
-	// would be lazily re-migrated on a later read, resurrecting the OLD token over the
-	// fresh one just written to SSM.
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("ACCOUNT"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("REMOVE creds"),
-	})
-	return err
+	return s.putAccountToken(ctx, arg.ID, arg.CredentialsJSON)
 }
 
 func (s *Store) UpdateLastScan(ctx context.Context, id int64) error {
