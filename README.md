@@ -9,7 +9,7 @@
 
 ---
 
-OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a schedule, and runs each email through rules you define in plain English. An LLM on **Amazon Bedrock** (Nova Micro by default) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, marking as spam, or marking as read.
+OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a schedule, and runs each email through rules you define in plain English. An LLM on **Amazon Bedrock** (model selectable in Settings) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, marking as spam, or marking as read.
 
 > **Migrated from local Ollama:** this app began as a self-hosted Ollama + SQLite + Docker project. It now runs entirely on AWS — Lambda for compute, DynamoDB for storage, and Bedrock for inference. The name is retained for continuity.
 
@@ -49,7 +49,7 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
              ▼                      ▼                     ▼
       ┌─────────────┐       ┌───────────────┐     ┌──────────────┐
       │  DynamoDB   │       │    Bedrock    │     │  Gmail API   │
-      │  `ollamail` │       │  Nova Micro   │     │  (OAuth 2.0) │
+      │  `ollamail` │       │  Converse API │     │  (OAuth 2.0) │
       └─────────────┘       └───────────────┘     └──────────────┘
                                     ▲
                         SSM SecureString /ollamail/credentials
@@ -60,7 +60,7 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
   - **WebFunction** — serves the management UI, exposed via a **Lambda Function URL** locked to `AuthType: AWS_IAM` (nothing is public; browse it via a local SigV4 proxy).
   - **ScanFunction** — triggered by **EventBridge on a fixed `rate(1 minute)` schedule**. Runs one labeling pass (`scanOnce`) per invocation. Overlapping runs are safe — processed emails are deduped in DynamoDB.
 - **DynamoDB** single-table `ollamail` (on-demand, TTL enabled) — accounts, rules, history, logs, retention, suggestions, OAuth tokens.
-- **Amazon Bedrock** — classification and the prompt builder (`us.amazon.nova-micro-v1:0` by default; selectable in Settings).
+- **Amazon Bedrock** — classification and the prompt builder (model selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured).
 - **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
 
 > **Scan cadence is fixed in the template** (`template.yaml`, `cron(0 2 * * ? *)` at `America/New_York`, i.e. 2 AM Eastern — off-peak for Bedrock flex-tier traffic). There is no user-configurable poll interval — to change cadence, edit the `ScanSchedule` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
@@ -114,7 +114,7 @@ The parameter ARN is referenced by `samconfig.toml` (`CredentialsSsmArn`). The L
 
 ### 3. Enable Bedrock model access
 
-In the Bedrock console (**Model access**), request/enable access to the classification model — by default **Amazon Nova Micro** (`us.amazon.nova-micro-v1:0`) in `us-east-2`. The Lambda role grants `bedrock:InvokeModel*` and the list APIs used to populate the Settings model picker.
+In the Bedrock console (**Model access**), request/enable access to whichever classification model you plan to use (falls back to **Amazon Nova Micro**, `us.amazon.nova-micro-v1:0`, until one is picked in Settings) in `us-east-2`. The Lambda role grants `bedrock:InvokeModel*` and the list APIs used to populate the Settings model picker.
 
 ---
 
@@ -260,7 +260,7 @@ go run .        # serves on :5000 (or $AWS_LWA_PORT)
 | Backend | Go 1.25, net/http (stdlib) |
 | UI | Bootstrap 5.3 (dark mode) + HTMX 2.0 |
 | Database | DynamoDB (single-table, on-demand, TTL) |
-| LLM runtime | Amazon Bedrock (Nova Micro) |
+| LLM runtime | Amazon Bedrock (model selectable in Settings) |
 | Gmail integration | Google OAuth 2.0 + Gmail REST API |
 | Secrets | SSM Parameter Store (SecureString) |
 | Deployment | AWS SAM + GitHub Actions (OIDC) |

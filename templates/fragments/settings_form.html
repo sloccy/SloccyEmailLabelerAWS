@@ -20,7 +20,7 @@
           {{end}}{{end}}
         </select>
       </div>
-      <div class="py-3 px-4 setting-row">
+      <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Prompt improver model</div>
         <div class="small text-muted mt-1">Bedrock model used for "Generate instruction" and "Improve rule". A smarter model here is fine since it runs infrequently.</div>
         <select class="form-select form-select-sm mt-2" name="improve_model" style="min-width:300px;">
@@ -28,6 +28,11 @@
           <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .InputCostPer1M}}/1M in</option>
           {{end}}{{end}}
         </select>
+      </div>
+      <div class="py-3 px-4 setting-row">
+        <div class="fw-medium">Reasoning suppression override</div>
+        <div class="small text-muted mt-1">Reasoning-capable classification models (Qwen3, Nemotron, etc.) are told to skip chain-of-thought automatically, based on the selected model's family — this costs nothing to leave blank. Only set this if your model isn't recognized yet: enter its "reasoning off" soft-switch text (e.g. <code>/no_think</code>) and it overrides the automatic choice. Check the logs after a classify run for a "reasoning: suppressed=true/false" line to confirm it's working.</div>
+        <input type="text" class="form-control form-control-sm mt-2" name="classify_reasoning_directive" value="{{.ReasoningDirective}}" placeholder="Leave blank to auto-detect from the model" style="max-width:400px;">
       </div>
     </div>
   </div>

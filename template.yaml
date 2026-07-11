@@ -1,9 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 
-Description: SloccyEmailLabelerAWS — Gmail labeler on Lambda + DynamoDB + Bedrock Nova Micro
+Description: SloccyEmailLabelerAWS — Gmail labeler on Lambda + DynamoDB + Amazon Bedrock
 
 Parameters:
+  # Fallback model id used only until a classify_model setting is configured (see
+  # llm.DefaultModel) — the model actually used for classification is whatever's set
+  # in the app's Settings UI.
   BedrockModel:
     Type: String
     Default: us.amazon.nova-micro-v1:0

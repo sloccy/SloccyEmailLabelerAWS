@@ -206,9 +206,10 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 	}
 	store.Log(logInfo, fmt.Sprintf("[%s] Processing %d new email(s) against %d rule(s).", account.Email, len(unprocessed), len(prompts)))
 
-	// Resolve the classify model/tier once for the whole batch instead of per email —
-	// they don't change mid-pass, and re-resolving is a DynamoDB GetSetting round trip.
-	model, tier := llmClient.ResolveClassifySettings(ctx)
+	// Resolve the classify model/tier/reasoning-override once for the whole batch
+	// instead of per email — they don't change mid-pass, and re-resolving is a
+	// DynamoDB GetSetting round trip.
+	model, tier, reasoningOverride := llmClient.ResolveClassifySettings(ctx)
 
 	// Build label cache for all needed labels
 	var neededLabels []string
@@ -264,7 +265,7 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, llmPrompts, labelCache, cfg.DebugLogging, model, tier)
+			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, llmPrompts, labelCache, cfg.DebugLogging, model, tier, reasoningOverride)
 
 			mu.Lock()
 			allModifies = append(allModifies, modifies...)
@@ -333,7 +334,7 @@ func processEmail(
 	llmPrompts []llm.Prompt,
 	labelCache map[string]string,
 	debugLogging bool,
-	model, tier string,
+	model, tier, reasoningOverride string,
 ) (modifies []gmailpkg.Modify, trashIDs []string, job writeJob) {
 	email := llm.Email{
 		Sender:  msg.Sender,
@@ -353,7 +354,7 @@ func processEmail(
 	// times per call, and buffering lets all of it flush through the single
 	// BatchInsertProcessingResults call below, alongside history, instead.
 	logger := &bufferedLogger{}
-	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier, debugLogging)
+	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier, reasoningOverride, debugLogging)
 	logs = append(logs, logger.entries...)
 
 	var history []db.HistoryEntry
