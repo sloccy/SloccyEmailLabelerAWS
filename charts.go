@@ -151,7 +151,7 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 			}
 			labeledY = append(labeledY, y)
 			fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, plotLeft, y, plotRight, y)
-			fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="chart-axis-label" text-anchor="%s">%dms</text>`, x, y+4, anchor, v)
+			fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="chart-axis-label" text-anchor="%s">%dms</text>`, x, y, anchor, v)
 		}
 	}
 	labelGroup(float64(plotLeft-6), "end", []int64{hi, lo, med})
@@ -256,7 +256,7 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 	for a := 0.0; a <= niceMax+step/2; a += step {
 		y := yFor(a)
 		fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, plotLeft, y, plotRight, y)
-		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y+4, a)
+		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y, a)
 	}
 
 	// X-axis ticks: up to 5, each snapped to a real data point's hour bucket (rather than
