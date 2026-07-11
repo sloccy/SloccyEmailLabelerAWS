@@ -20,9 +20,12 @@ import (
 // fit the same tag-per-field mapping.
 
 type Account struct {
-	ID              int64   `dynamodbav:"id"`
-	Email           string  `dynamodbav:"email"`
-	CredentialsJSON string  `dynamodbav:"creds"`
+	ID    int64  `dynamodbav:"id"`
+	Email string `dynamodbav:"email"`
+	// CredentialsJSON is the Gmail OAuth token, held in memory only: it lives in an SSM
+	// SecureString (db/store.go tokenParamName), never in the table, so the "-" tag
+	// excludes it from item (un)marshaling entirely.
+	CredentialsJSON string  `dynamodbav:"-"`
 	AddedAt         string  `dynamodbav:"addedAt"`
 	LastScanAt      *string `dynamodbav:"lastScan"`
 	Active          int64   `dynamodbav:"active"`
