@@ -233,6 +233,10 @@ Resources:
       # this layer's /opt/bootstrap wrapper script.
       Layers:
         - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:${LambdaWebAdapterLayerVersion}
+      # Log to the retention-bounded custom group (see WebFunctionLogGroup) instead of
+      # the implicit never-expiring /aws/lambda/* default.
+      LoggingConfig:
+        LogGroup: !Ref WebFunctionLogGroup
       FunctionUrlConfig:
         # AWS_IAM when Cloudflare Access is off (CfAccessAud unset): only requests
         # signed with your AWS credentials can reach it — browse locally with the
@@ -364,6 +368,8 @@ Resources:
       # quota is too low to reserve (would drop unreserved below the required minimum of 10).
       # Overlap is safe: scans dedupe processed emails in DynamoDB. Re-add `ReservedConcurrentExecutions: 1`
       # after requesting a concurrency-limit increase via Service Quotas.
+      LoggingConfig:
+        LogGroup: !Ref ScanFunctionLogGroup
       Environment:
         Variables:
           MODE: scan
@@ -390,6 +396,8 @@ Resources:
       # Lambda Web Adapter layer — see WebFunction above for why this is needed.
       Layers:
         - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:${LambdaWebAdapterLayerVersion}
+      LoggingConfig:
+        LogGroup: !Ref PushFunctionLogGroup
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
@@ -404,32 +412,29 @@ Resources:
   # creates never-expiring log groups on first invocation. RetentionInDays reuses the
   # LogRetentionDays parameter so CloudWatch and DynamoDB-row retention stay in step.
   #
-  # ONE-TIME MIGRATION NOTE: the implicitly-created groups already exist, and
-  # CloudFormation refuses to create over them. Before the first deploy that includes
-  # these resources, delete the old groups (their contents are 30 days of operational
-  # logs, nothing irreplaceable):
-  #   for g in $(aws logs describe-log-groups --log-group-name-prefix /aws/lambda/ollamail \
-  #     --query 'logGroups[].logGroupName' --output text); do
-  #     aws logs delete-log-group --log-group-name "$g"; done
-  # (Check for the SAM-generated Web/Push names too:
-  #   aws logs describe-log-groups --query 'logGroups[?contains(logGroupName, `Function`)].logGroupName')
+  # Deliberately NOT named /aws/lambda/<function>: those groups were already
+  # implicitly created by past invocations, and CloudFormation refuses to create
+  # over an existing group. Fresh /ollamail/* names + each function's LoggingConfig
+  # pointing here sidestep the conflict with no deletion/import migration. The old
+  # /aws/lambda/ollamail-* groups stop receiving logs after this deploy and can be
+  # deleted whenever (they hold only pre-migration operational logs).
   # ----------------------------------------------------------------
   WebFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${WebFunction}
+      LogGroupName: /ollamail/web
       RetentionInDays: !Ref LogRetentionDays
 
   ScanFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${ScanFunction}
+      LogGroupName: /ollamail/scan
       RetentionInDays: !Ref LogRetentionDays
 
   PushFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${PushFunction}
+      LogGroupName: /ollamail/push
       RetentionInDays: !Ref LogRetentionDays
 
   # ----------------------------------------------------------------
