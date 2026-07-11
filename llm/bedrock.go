@@ -536,12 +536,11 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		AdditionalModelRequestFields: fields,
 	})
 	res.LatencyMs = time.Since(start).Milliseconds()
-	store.Log("INFO", fmt.Sprintf("LLM classify latency: %dms (tier: %s)", res.LatencyMs, tierLabel))
 	if err != nil {
 		if isBedrockTimeout(err) {
 			store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call exceeded the %s client timeout (tier: %s): %v", bedrockHTTPTimeout, tierLabel, err))
 		}
-		store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
+		store.Log("ERROR", fmt.Sprintf("LLM request failed after %dms (tier: %s): %v", res.LatencyMs, tierLabel, err))
 		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
 	}
 	logUsage(store, &res, out.Usage, tierLabel)
@@ -549,14 +548,15 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	raw := extractText(out.Output)
 	res.ReasoningDetected = detectReasoning(out.Output, raw)
 	store.Log("INFO", fmt.Sprintf("LLM classify reasoning: suppressed=%v", !res.ReasoningDetected))
-	store.Log("INFO", fmt.Sprintf("LLM classify response: content=%d chars", len(raw)))
+	combined := fmt.Sprintf("LLM classify: %dms (tier: %s), content=%d chars", res.LatencyMs, tierLabel, len(raw))
 	if len(raw) > 0 {
 		preview := raw
 		if len(preview) > 500 {
 			preview = preview[:500]
 		}
-		store.Log("INFO", "LLM raw content: "+preview)
+		combined += " | " + preview
 	}
+	store.Log("INFO", combined)
 	res.RawResponse = raw
 
 	cleaned := extractJSONObject(raw)
