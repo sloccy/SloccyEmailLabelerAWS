@@ -119,35 +119,43 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 		return float64(plotBottom) - (float64(v-lo)/float64(hi-lo))*plotH
 	}
 
-	cx := (chartPadL + (boxChartWidth - chartPadR)) / 2
-	const boxHalf = 24 // narrower box to fit boxChartWidth=160's tighter plot area
+	// boxPadR reserves extra right-side space (beyond the shared chartPadR) for the q1/q3
+	// labels below, so they sit in their own gutter opposite hi/lo/med instead of sharing
+	// a column with them.
+	const boxPadR = 40
+	plotLeft, plotRight := chartPadL, boxChartWidth-boxPadR
+	cx := (plotLeft + plotRight) / 2
+	const boxHalf = 20 // narrower box so it still fits the plot track alongside boxPadR
 
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="LLM latency distribution over the last 30 days">`, boxChartWidth, chartHeight)
 
-	// Label every quartile boundary (hi/lo/med/q3/q1), skipping any that would land within
-	// minLabelGap px of an already-drawn label (e.g. a tight IQR) to avoid overlapping
-	// text. Order matters: hi/lo (the whisker extremes) and med (the median, the most
-	// useful single number in the plot) are checked first so they're never the ones
-	// dropped — if anything has to collapse for space, it's a quartile (q3/q1).
+	// Label hi/lo/median on the left and q1/q3 on the right, in independent gutters, so a
+	// quartile can never crowd the median (or vice versa) out of the plot: within each
+	// gutter, a label is skipped only if it would land within minLabelGap px of another
+	// label already drawn in that same gutter.
 	const minLabelGap = 14.0
-	var labeledY []float64
-	for _, v := range []int64{hi, lo, med, q3, q1} {
-		y := scale(v)
-		tooClose := false
-		for _, py := range labeledY {
-			if d := y - py; d > -minLabelGap && d < minLabelGap {
-				tooClose = true
-				break
+	labelGroup := func(x float64, anchor string, vals []int64) {
+		var labeledY []float64
+		for _, v := range vals {
+			y := scale(v)
+			tooClose := false
+			for _, py := range labeledY {
+				if d := y - py; d > -minLabelGap && d < minLabelGap {
+					tooClose = true
+					break
+				}
 			}
+			if tooClose {
+				continue
+			}
+			labeledY = append(labeledY, y)
+			fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, plotLeft, y, plotRight, y)
+			fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="chart-axis-label" text-anchor="%s">%dms</text>`, x, y+4, anchor, v)
 		}
-		if tooClose {
-			continue
-		}
-		labeledY = append(labeledY, y)
-		fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, chartPadL, y, boxChartWidth-chartPadR, y)
-		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%dms</text>`, chartPadL-6, y+4, v)
 	}
+	labelGroup(float64(plotLeft-6), "end", []int64{hi, lo, med})
+	labelGroup(float64(plotRight+6), "start", []int64{q3, q1})
 
 	// Whisker: min-to-max vertical line plus caps at each end.
 	fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-whisker"/>`, cx, scale(hi), cx, scale(lo))
