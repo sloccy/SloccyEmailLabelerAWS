@@ -340,11 +340,10 @@ func ttlDays(days int) int64 {
 }
 
 // logHistoryTTLDays is the item-level TTL for logs, history, and LLM-debug rows —
-// DynamoDB's own TTL sweep enforces the retention policy directly instead of needing a
-// separate scan+delete pass (see TrimLogs/TrimHistory below, now no-ops). Initialized
-// from the same LOG_RETENTION_DAYS env template.yaml feeds the app config, so a
-// retention override at deploy time propagates here instead of drifting from a
-// hardcoded copy of its default.
+// DynamoDB's own TTL sweep enforces the retention policy directly, no scan+delete
+// pass needed. Initialized from the same LOG_RETENTION_DAYS env template.yaml feeds
+// the app config, so a retention override at deploy time propagates here instead of
+// drifting from a hardcoded copy of its default.
 var logHistoryTTLDays = envDaysOr("LOG_RETENTION_DAYS", 30)
 
 // suggestionTTLDays bounds prompt-suggestion items, which snapshot a full email body
@@ -520,13 +519,6 @@ func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log
 		logs = append(logs, itemToLog(it))
 	}
 	return logs, nil
-}
-
-// TrimLogs is a no-op: log items carry logHistoryTTLDays as their item-level TTL, which
-// matches the deployed LogRetentionDays default, so DynamoDB's own TTL sweep now enforces
-// retention directly instead of this scan+delete pass.
-func (s *Store) TrimLogs(_ context.Context, _ int) error {
-	return nil
 }
 
 // ============================================================
@@ -1403,13 +1395,6 @@ func (s *Store) DeleteHistoryByAccount(ctx context.Context, accountID int64) err
 	return s.deleteAllByPK(ctx, pkHistory(accountID))
 }
 
-// TrimHistory is a no-op: history items carry logHistoryTTLDays as their item-level TTL,
-// which matches the deployed LogRetentionDays default, so DynamoDB's own TTL sweep now
-// enforces retention directly instead of this per-account scan+delete fan-out.
-func (s *Store) TrimHistory(_ context.Context, _ int) error {
-	return nil
-}
-
 // GetPromptIDsByMessageID returns the distinct prompt ids recorded in history for one
 // message, scoped to the message's own account partition (the caller already knows the
 // account, e.g. from a prior GetHistoryRow) rather than fanning out across every account.
@@ -1584,11 +1569,6 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 
 func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID int64) error {
 	return s.deleteAllByPK(ctx, pkProcessed(accountID))
-}
-
-func (s *Store) TrimProcessedEmails(ctx context.Context, lookbackHours int) error {
-	// DynamoDB TTL handles cleanup; this is a no-op.
-	return nil
 }
 
 // BatchInsertProcessingResults persists logs, history, and marks the email processed.

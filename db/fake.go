@@ -55,10 +55,6 @@ func (s *FakeStore) GetSetting(_ context.Context, key string) (string, error) {
 	return v, nil
 }
 
-func (s *FakeStore) TrimLogs(_ context.Context, _ int) error            { return nil }
-func (s *FakeStore) TrimProcessedEmails(_ context.Context, _ int) error { return nil }
-func (s *FakeStore) TrimHistory(_ context.Context, _ int) error         { return nil }
-
 func (s *FakeStore) ListAccounts(_ context.Context) ([]Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
