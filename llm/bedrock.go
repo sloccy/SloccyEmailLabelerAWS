@@ -9,7 +9,6 @@ import (
 	"os"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +67,12 @@ const (
 	// SettingClassifyTier holds the Bedrock service tier ("standard" or "flex") used for
 	// classification requests. Flex trades latency for lower cost; see resolveClassifyTier.
 	SettingClassifyTier = "classify_tier"
+	// SettingClassifyReasoningDirective holds an optional override for the
+	// reasoning-suppression system-prompt switch reasoningOff would otherwise pick from
+	// reasoningRegistry (reasoning.go) based on the classify model's id. Only needed for
+	// a model family the registry doesn't recognize yet; empty (the default) means "use
+	// the registry, or no-op if the model isn't in it."
+	SettingClassifyReasoningDirective = "classify_reasoning_directive"
 )
 
 // Values for SettingClassifyTier.
@@ -113,7 +118,12 @@ type Client struct {
 	settings     Settings
 }
 
-// DefaultModel is the Bedrock model id used when nothing else specifies one.
+// DefaultModel is the fallback Bedrock model id used only when nothing else specifies
+// one (no classify_model setting and no BEDROCK_MODEL env var) — e.g. on a fresh
+// install before Settings has been configured. The model actually used for
+// classification at runtime is whatever's configured there; nothing elsewhere in this
+// package should assume this specific model's behavior (see reasoningRegistry in
+// reasoning.go for why that assumption bit us before).
 const DefaultModel = "us.amazon.nova-micro-v1:0"
 
 // newBedrockRetryer builds the aws.Retryer used by NewClient: adaptive retry + client-side
@@ -207,12 +217,12 @@ func (c *Client) resolveClassifyTier(ctx context.Context) string {
 	return c.resolveSetting(ctx, SettingClassifyTier, ClassifyTierStandard)
 }
 
-// ResolveClassifySettings resolves the classify model and service tier once. Callers
-// classifying many emails in one pass (e.g. a scan) should call this once up front and
-// pass the result into each ClassifyEmailBatch call, instead of re-resolving (a
-// GetSetting DynamoDB read) per email.
-func (c *Client) ResolveClassifySettings(ctx context.Context) (model, tier string) {
-	return c.resolveModel(ctx, SettingClassifyModel), c.resolveClassifyTier(ctx)
+// ResolveClassifySettings resolves the classify model, service tier, and reasoning-
+// directive override once. Callers classifying many emails in one pass (e.g. a scan)
+// should call this once up front and pass the result into each ClassifyEmailBatch call,
+// instead of re-resolving (a GetSetting DynamoDB read) per email.
+func (c *Client) ResolveClassifySettings(ctx context.Context) (model, tier, reasoningOverride string) {
+	return c.resolveModel(ctx, SettingClassifyModel), c.resolveClassifyTier(ctx), c.resolveSetting(ctx, SettingClassifyReasoningDirective, "")
 }
 
 // ============================================================
@@ -240,7 +250,20 @@ type ClassifyResult struct {
 	Results     map[int64]bool
 	RequestJSON string
 	RawResponse string
-	LatencyMs   int64 // wall time of the Bedrock Converse call(s), in milliseconds
+	LatencyMs   int64 // wall time of the Bedrock Converse call, in milliseconds
+
+	// Token usage from the Converse call's Usage block, populated on a best-effort basis
+	// (Bedrock's Usage field is optional in the SDK response) so ad-hoc token-cost
+	// investigations don't need a debug build. See ClassifyEmailBatch and logUsage.
+	InputTokens  int32
+	OutputTokens int32
+	TotalTokens  int32
+
+	// ReasoningDetected is true if the model produced chain-of-thought/reasoning
+	// content despite the reasoning-suppression directive (see reasoningOff in
+	// reasoning.go) — the signal that suppression is or isn't actually working, since
+	// no Bedrock API reports this directly.
+	ReasoningDetected bool
 }
 
 type StreamChunk struct {
@@ -276,10 +299,11 @@ func buildBody(email Email, prompts []Prompt) string {
 	}
 	rulesText := sb.String()
 
-	// The example covers every rule number, not just the first couple — when a
-	// classification falls back to plain-text parsing (see ClassifyEmailBatch), the
-	// model only has this prompt to go on, and a partial example leaves it guessing
-	// whether to include keys for the rules it omitted.
+	// The example covers every rule number, not just the first couple — this prompt is
+	// the model's only signal for the expected output shape (Converse tool-use isn't
+	// attempted; see reasoning.go for why several model families this project has run
+	// don't support it there), so a partial example would leave it guessing whether to
+	// include keys for the rules it omitted.
 	exampleParts := make([]string, len(prompts))
 	for i := range exampleParts {
 		exampleParts[i] = fmt.Sprintf(`"%d": false`, i+1)
@@ -308,115 +332,9 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
-// classifyToolName is the forced tool that gets Bedrock to return classification
-// results as schema-validated JSON instead of free text (see classifyToolConfig).
-const classifyToolName = "record_labels"
-
-// classifyToolDescription documents the forced tool to the model.
-const classifyToolDescription = "Record true/false for each numbered classification rule."
-
-// classifyToolSchema returns the JSON schema requiring a boolean for every rule
-// number (1-based, matching buildBody's numbering). Shared by classifyToolConfig
-// (the real SDK request) and classifyToolConfigJSON (the human-readable debug/preview
-// request), so the two never drift.
-// jsonTypeKey is the JSON Schema / Bedrock serviceTier "type" field name, factored out
-// because it recurs across the schema, the wire-shaped preview, and serviceTier maps.
+// jsonTypeKey is the JSON field name "type", used by the debug request preview's
+// serviceTier payload (see ClassifyEmailBatch).
 const jsonTypeKey = "type"
-
-func classifyToolSchema(prompts []Prompt) map[string]any {
-	properties := make(map[string]any, len(prompts))
-	required := make([]string, len(prompts))
-	for i := range prompts {
-		key := strconv.Itoa(i + 1)
-		properties[key] = map[string]any{jsonTypeKey: "boolean"}
-		required[i] = key
-	}
-	// additionalProperties is deliberately omitted: AWS's Nova tool-use troubleshooting
-	// guide lists it as an unsupported top-level schema field for Nova ("Common
-	// unsupported fields at the top level are: $schema, description, title, and
-	// additionalProperties"), and required already lists every rule key, so it wasn't
-	// adding real enforcement anyway.
-	return map[string]any{
-		jsonTypeKey:  "object",
-		"properties": properties,
-		"required":   required,
-	}
-}
-
-// classifyToolConfig builds the forced-tool-use configuration for structured
-// classification output: one tool whose input schema requires a boolean for every
-// rule number. ToolChoice forces the model to call it — this is Bedrock's native
-// structured-output mechanism, replacing the prompt-coaxed "respond with only JSON"
-// text approach. If a model rejects the tool-use call outright, ClassifyEmailBatch
-// falls back to text parsing.
-func classifyToolConfig(prompts []Prompt) *types.ToolConfiguration {
-	schema := classifyToolSchema(prompts)
-	return &types.ToolConfiguration{
-		Tools: []types.Tool{
-			&types.ToolMemberToolSpec{
-				Value: types.ToolSpecification{
-					Name:        aws.String(classifyToolName),
-					Description: aws.String(classifyToolDescription),
-					InputSchema: &types.ToolInputSchemaMemberJson{Value: document.NewLazyDocument(schema)},
-				},
-			},
-		},
-		ToolChoice: &types.ToolChoiceMemberTool{Value: types.SpecificToolChoice{Name: aws.String(classifyToolName)}},
-	}
-}
-
-// classifyToolConfigJSON returns the wire-shaped (Bedrock REST field names, not Go SDK
-// field names) representation of classifyToolConfig for the request-preview/debug JSON.
-// The real SDK ToolConfiguration can't be passed to encoding/json directly: its schema
-// is wrapped in an opaque document.Interface with no MarshalJSON, so it would render as
-// "{}" in the preview.
-func classifyToolConfigJSON(prompts []Prompt) map[string]any {
-	return map[string]any{
-		"tools": []map[string]any{
-			{
-				"toolSpec": map[string]any{
-					"name":        classifyToolName,
-					"description": classifyToolDescription,
-					"inputSchema": map[string]any{"json": classifyToolSchema(prompts)},
-				},
-			},
-		},
-		"toolChoice": map[string]any{"tool": map[string]any{"name": classifyToolName}},
-	}
-}
-
-// extractToolUse pulls the forced tool call's input out of a Converse response. ok is
-// false when the model didn't call the tool — the model may have ignored the forced
-// ToolChoice, signalling ClassifyEmailBatch to fall back to text parsing.
-func extractToolUse(output types.ConverseOutput, toolName string) (parsed map[string]any, rawJSON string, ok bool) {
-	msg, isMsg := output.(*types.ConverseOutputMemberMessage)
-	if !isMsg {
-		return nil, "", false
-	}
-	for _, block := range msg.Value.Content {
-		tu, isToolUse := block.(*types.ContentBlockMemberToolUse)
-		if !isToolUse || aws.ToString(tu.Value.Name) != toolName || tu.Value.Input == nil {
-			continue
-		}
-		var m map[string]any
-		// SDK quirk: a document.Interface built via document.NewLazyDocument (the
-		// send-side marshaler; used by tests to fake a response) populates m via the
-		// same pointer indirection the real receive-side unmarshaler uses, but then
-		// spuriously errors on internal double-processing of the already-populated
-		// value. Real Bedrock responses decode via the receive-side unmarshaler and
-		// never hit this, so len(m)==0 distinguishes a genuine decode failure from
-		// this cosmetic error.
-		if err := tu.Value.Input.UnmarshalSmithyDocument(&m); err != nil && len(m) == 0 {
-			continue
-		}
-		b, err := json.Marshal(m)
-		if err != nil {
-			continue
-		}
-		return m, string(b), true
-	}
-	return nil, "", false
-}
 
 // mapKeysToResults converts a {"1": true, "2": false, ...} map (1-based rule index →
 // verdict) into the prompt-ID-keyed result map ClassifyEmailBatch returns. Shared by
@@ -500,17 +418,31 @@ func balancedBraceEnd(s string, start int) (end int, ok bool) {
 	return 0, false
 }
 
-// classifyPayload returns the request pieces plus the service tier ("flex" or "" for
-// standard) selected for classification.
-func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.InferenceConfiguration) {
+// logUsage records the Converse call's token usage onto res and logs it. Usage is
+// populated best-effort: the SDK response's Usage field isn't guaranteed non-nil, so a
+// nil usage is skipped quietly rather than logged as misleading zeros.
+func logUsage(store StoreLogger, res *ClassifyResult, usage *types.TokenUsage, tierLabel string) {
+	if usage == nil {
+		return
+	}
+	res.InputTokens = aws.ToInt32(usage.InputTokens)
+	res.OutputTokens = aws.ToInt32(usage.OutputTokens)
+	res.TotalTokens = aws.ToInt32(usage.TotalTokens)
+	store.Log("INFO", fmt.Sprintf("LLM classify tokens: input=%d output=%d total=%d (tier: %s)",
+		res.InputTokens, res.OutputTokens, res.TotalTokens, tierLabel))
+}
+
+// classifyPayload returns the request pieces for a classify Converse call: the user
+// message, inference config, and — when modelID's family is in reasoningRegistry, or
+// reasoningOverride is set — the system content block and/or additional model request
+// fields that suppress that model's chain-of-thought output (see reasoning.go).
+func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride string) ([]types.Message, *types.InferenceConfiguration, []types.SystemContentBlock, document.Interface) {
 	body := buildBody(email, prompts)
-	// Nova emits <thinking> chain-of-thought content as ordinary output tokens even
-	// under forced ToolChoice (AWS's Nova tool-use troubleshooting guide: "Amazon Nova
-	// uses chain-of-thought reasoning when calling a tool. You will see this output in
-	// the response in <thinking> tags."). Too small a MaxTokens truncates that mid-stream,
-	// which Bedrock reports as ModelErrorException "invalid sequence as part of ToolUse".
-	// 3000 is AWS's documented starting point for this error; it's a ceiling, not a
-	// target, so it costs nothing when the model finishes well under it.
+	// Reasoning-capable models can emit chain-of-thought as ordinary output tokens even
+	// when asked to suppress it (see reasoning.go) — some don't honor the suppression
+	// directive on every call. MaxTokens is sized to absorb that rather than truncate a
+	// response mid-stream; it's a ceiling, not a target, so it costs nothing when the
+	// model finishes well under it.
 	maxTokens := int32(3000)
 	if n := len(prompts) * 12; n > 3000 {
 		maxTokens = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
@@ -525,20 +457,34 @@ func classifyPayload(email Email, prompts []Prompt) ([]types.Message, *types.Inf
 		MaxTokens:   aws.Int32(maxTokens),
 		Temperature: aws.Float32(0),
 	}
-	return msgs, inf
+
+	var sys []types.SystemContentBlock
+	var fields document.Interface
+	if d := reasoningOff(modelID, reasoningOverride); !d.isZero() {
+		if d.system != "" {
+			sys = []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: d.system}}
+		}
+		if d.fields != nil {
+			fields = document.NewLazyDocument(d.fields)
+		}
+	}
+	return msgs, inf, sys, fields
 }
 
 // ClassifyEmailBatch classifies one email against prompts using the given model and
-// service tier. Callers classifying many emails in one pass should resolve model/tier
-// once via ResolveClassifySettings and reuse them across calls. debug gates building the
-// (comparatively expensive) serialized request JSON onto ClassifyResult.RequestJSON — it's
-// only ever read by the Troubleshooting UI's debug write, so normal operation skips it.
-func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string, debug bool) (ClassifyResult, error) {
+// service tier. Callers classifying many emails in one pass should resolve
+// model/tier/reasoningOverride once via ResolveClassifySettings and reuse them across
+// calls. reasoningOverride overrides reasoningRegistry's suppression directive for a
+// model the registry doesn't know about yet (see SettingClassifyReasoningDirective);
+// pass "" to use the registry as-is. debug gates building the (comparatively expensive)
+// serialized request JSON onto ClassifyResult.RequestJSON — it's only ever read by the
+// Troubleshooting UI's debug write, so normal operation skips it.
+func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier, reasoningOverride string, debug bool) (ClassifyResult, error) {
 	if len(prompts) == 0 {
 		return ClassifyResult{}, nil
 	}
 
-	msgs, inf := classifyPayload(email, prompts)
+	msgs, inf, sys, fields := classifyPayload(email, prompts, model, reasoningOverride)
 
 	var svcTier *types.ServiceTier
 	if tier == ClassifyTierFlex {
@@ -551,7 +497,11 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 			"modelId":         model,
 			"messages":        msgs,
 			"inferenceConfig": inf,
-			"toolConfig":      classifyToolConfigJSON(prompts),
+		}
+		if len(sys) > 0 {
+			if t, ok := sys[0].(*types.SystemContentBlockMemberText); ok {
+				reqPayload["system"] = []map[string]string{{"text": t.Value}}
+			}
 		}
 		if tier == ClassifyTierFlex {
 			reqPayload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
@@ -573,70 +523,32 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	}
 	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s, tier: %s)", subject, len(prompts), model, tierLabel))
 
-	// The Lambda invoking this has a hard 900s (15min) ceiling; bedrockHTTPTimeout aborts a
-	// stuck Converse call ~1min before that so the error below can still be logged rather
-	// than the whole invocation being silently killed. recordTimeout is checked against both
-	// the primary and retry calls but only logs once per ClassifyEmailBatch call.
-	timeoutLogged := false
-	recordTimeout := func(callErr error) {
-		if timeoutLogged || !isBedrockTimeout(callErr) {
-			return
-		}
-		timeoutLogged = true
-		store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call exceeded the %s client timeout (tier: %s): %v", bedrockHTTPTimeout, tierLabel, callErr))
-	}
-
-	plainConverse := func() (*bedrockruntime.ConverseOutput, error) {
-		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-			ModelId:         aws.String(model),
-			Messages:        msgs,
-			InferenceConfig: inf,
-			ServiceTier:     svcTier,
-		})
-	}
-
-	// Preferred path: force tool use so Bedrock returns schema-validated JSON
-	// directly (see classifyToolConfig). If the model rejects the tool-use call
-	// outright, retry once without ToolConfig below. When the call succeeds but the
-	// model didn't call the tool anyway, fall through to the same text-parsing logic
-	// used by the retry, applied to this response.
+	// The Lambda invoking this has a hard 900s (15min) ceiling; bedrockHTTPTimeout aborts
+	// a stuck Converse call ~1min before that so the error below can still be logged
+	// rather than the whole invocation being silently killed.
 	start := time.Now()
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:         aws.String(model),
-		Messages:        msgs,
-		InferenceConfig: inf,
-		ServiceTier:     svcTier,
-		ToolConfig:      classifyToolConfig(prompts),
+		ModelId:                      aws.String(model),
+		Messages:                     msgs,
+		System:                       sys,
+		InferenceConfig:              inf,
+		ServiceTier:                  svcTier,
+		AdditionalModelRequestFields: fields,
 	})
-	if err == nil {
-		if parsed, rawJSON, ok := extractToolUse(out.Output, classifyToolName); ok {
-			res.LatencyMs = time.Since(start).Milliseconds()
-			store.Log("INFO", fmt.Sprintf("LLM classify response via tool-use: %d field(s)", len(parsed)))
-			store.Log("INFO", fmt.Sprintf("LLM classify latency: %dms (tier: %s)", res.LatencyMs, tierLabel))
-			res.RawResponse = rawJSON
-			res.Results = mapKeysToResults(parsed, prompts)
-			return res, nil
-		}
-		store.Log("INFO", "LLM response had no tool-use block; falling back to text parsing")
-	} else {
-		recordTimeout(err)
-		store.Log("INFO", fmt.Sprintf("LLM tool-use call failed (%v); retrying without tool use", err))
-		out, err = plainConverse()
-		if err != nil {
-			recordTimeout(err)
-			res.LatencyMs = time.Since(start).Milliseconds()
-			store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
-			return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
-		}
-	}
-
-	// Total wall time across the tool-use attempt and (if it fell through) the
-	// plain-Converse retry; time.Since is cumulative from start regardless of
-	// which branch above ran.
 	res.LatencyMs = time.Since(start).Milliseconds()
 	store.Log("INFO", fmt.Sprintf("LLM classify latency: %dms (tier: %s)", res.LatencyMs, tierLabel))
+	if err != nil {
+		if isBedrockTimeout(err) {
+			store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call exceeded the %s client timeout (tier: %s): %v", bedrockHTTPTimeout, tierLabel, err))
+		}
+		store.Log("ERROR", fmt.Sprintf("LLM request failed: %v", err))
+		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
+	}
+	logUsage(store, &res, out.Usage, tierLabel)
 
 	raw := extractText(out.Output)
+	res.ReasoningDetected = detectReasoning(out.Output, raw)
+	store.Log("INFO", fmt.Sprintf("LLM classify reasoning: suppressed=%v", !res.ReasoningDetected))
 	store.Log("INFO", fmt.Sprintf("LLM classify response: content=%d chars", len(raw)))
 	if len(raw) > 0 {
 		preview := raw

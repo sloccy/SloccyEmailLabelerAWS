@@ -595,12 +595,13 @@ func classifyModelAllowed(m llm.ModelOption, tier string) bool {
 	return m.ProfileRegion == "" || m.ProfileRegion == "us" || m.ProfileRegion == "global"
 }
 
-func settingsTemplateData(classifyModel, improveModel, classifyTier string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
-		"ClassifyModel": classifyModel,
-		"ImproveModel":  improveModel,
-		"ClassifyTier":  classifyTier,
-		"Models":        models,
+		"ClassifyModel":      classifyModel,
+		"ImproveModel":       improveModel,
+		"ClassifyTier":       classifyTier,
+		"ReasoningDirective": reasoningDirective,
+		"Models":             models,
 	}
 }
 
@@ -630,9 +631,10 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
 	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.ClassifyTierStandard)
+	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, models), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective, models), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -675,7 +677,14 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
 	}
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, models)
+	// Reasoning-suppression override: free text, no validation beyond trimming — it's an
+	// escape hatch for a model family reasoningRegistry (llm/reasoning.go) doesn't know
+	// about yet, so any soft-switch string the model expects is valid. Empty clears the
+	// override and falls back to the registry (see resolveSetting).
+	reasoningDirective := strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
+
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective, models)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
 }
 

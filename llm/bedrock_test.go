@@ -7,9 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
-	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
 	"github.com/sloccy/ollamail-aws/db"
@@ -106,10 +104,14 @@ func (m *multiSettings) GetSetting(_ context.Context, key string) (string, error
 
 var errNotFound = errors.New("not found")
 
-// ---- ClassifyEmailBatch: tool-use / text-fallback tests ----
+// ---- ClassifyEmailBatch: text-parse classification tests ----
+//
+// Converse is called once per email, no tool-use — see reasoning.go and the removal of
+// classifyToolConfig for why (the Converse API doesn't support tool use on the model
+// families this project runs, so every response is parsed as text regardless).
 
 // fakeConverseAPI stubs converseAPI. It returns one canned (output, err) pair per call,
-// indexed by call order, so tests can script "tool-use call fails, retry succeeds" etc.
+// indexed by call order.
 type fakeConverseAPI struct {
 	outputs []*bedrockruntime.ConverseOutput
 	errs    []error
@@ -136,23 +138,6 @@ func (f *fakeConverseAPI) ConverseStream(_ context.Context, _ *bedrockruntime.Co
 	return nil, errors.New("fakeConverseAPI: ConverseStream not implemented")
 }
 
-func toolUseOutput(name string, input map[string]any) *bedrockruntime.ConverseOutput {
-	return &bedrockruntime.ConverseOutput{
-		Output: &types.ConverseOutputMemberMessage{
-			Value: types.Message{
-				Role: types.ConversationRoleAssistant,
-				Content: []types.ContentBlock{
-					&types.ContentBlockMemberToolUse{Value: types.ToolUseBlock{
-						Name:      aws.String(name),
-						ToolUseId: aws.String("t1"),
-						Input:     document.NewLazyDocument(input),
-					}},
-				},
-			},
-		},
-	}
-}
-
 func textOutput(text string) *bedrockruntime.ConverseOutput {
 	return &bedrockruntime.ConverseOutput{
 		Output: &types.ConverseOutputMemberMessage{
@@ -175,89 +160,92 @@ func testEmail() Email {
 	return Email{Sender: "a@example.com", Subject: "hello", Body: "world"}
 }
 
-func TestClassifyEmailBatch_ToolUseSuccess(t *testing.T) {
-	fake := &fakeConverseAPI{
-		outputs: []*bedrockruntime.ConverseOutput{
-			toolUseOutput(classifyToolName, map[string]any{"1": true, "2": false}),
-		},
-	}
-	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
-	if err != nil {
-		t.Fatalf("ClassifyEmailBatch error: %v", err)
-	}
-	if len(fake.calls) != 1 {
-		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
-	}
-	if !res.Results[101] || res.Results[102] {
-		t.Errorf("Results = %v, want {101:true, 102:false}", res.Results)
-	}
-	if res.LatencyMs < 0 {
-		t.Errorf("LatencyMs = %d, want >= 0", res.LatencyMs)
-	}
-}
-
-func TestClassifyEmailBatch_FallsBackWhenNoToolUseBlock(t *testing.T) {
-	// Converse succeeds but the model ignored the forced ToolChoice and replied with
-	// plain text instead — must not trigger a second network call, just parse the text.
+func TestClassifyEmailBatch_ParsesTextResponse(t *testing.T) {
 	fake := &fakeConverseAPI{
 		outputs: []*bedrockruntime.ConverseOutput{
 			textOutput(`{"1": false, "2": true}`),
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
 	if len(fake.calls) != 1 {
 		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
 	}
+	if fake.calls[0].ToolConfig != nil {
+		t.Errorf("classify call should not set ToolConfig (unsupported on Converse for the models this project runs)")
+	}
 	if res.Results[101] || !res.Results[102] {
 		t.Errorf("Results = %v, want {101:false, 102:true}", res.Results)
 	}
+	if res.LatencyMs < 0 {
+		t.Errorf("LatencyMs = %d, want >= 0", res.LatencyMs)
+	}
 }
 
-func TestClassifyEmailBatch_FallsBackWhenToolCallErrors(t *testing.T) {
-	// First call (forced tool use) fails as if the model doesn't support tool use;
-	// the retry (no ToolConfig) must fire and succeed via text parsing.
+func TestClassifyEmailBatch_CallFails(t *testing.T) {
 	fake := &fakeConverseAPI{
-		errs: []error{errors.New("ValidationException: tool use not supported by this model")},
-		outputs: []*bedrockruntime.ConverseOutput{
-			nil, // consumed by the error above
-			textOutput("```json\n{\"1\": true, \"2\": true}\n```"),
-		},
+		errs: []error{errors.New("ThrottlingException: rate exceeded")},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	if err == nil {
+		t.Fatal("expected error when the Converse call fails")
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+	}
+}
+
+func TestClassifyEmailBatch_AppliesReasoningDirectiveFromRegistry(t *testing.T) {
+	// Model id matches the "qwen" registry entry (reasoning.go) — the system block
+	// should carry the soft-switch automatically, with no setting required.
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
+	}
+	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
-	if len(fake.calls) != 2 {
-		t.Fatalf("expected two Converse calls (tool-use then fallback), got %d", len(fake.calls))
+	sys := fake.calls[0].System
+	if len(sys) != 1 {
+		t.Fatalf("expected one system content block, got %d", len(sys))
 	}
-	if fake.calls[0].ToolConfig == nil {
-		t.Errorf("first call should set ToolConfig")
-	}
-	if fake.calls[1].ToolConfig != nil {
-		t.Errorf("retry call should not set ToolConfig")
-	}
-	if !res.Results[101] || !res.Results[102] {
-		t.Errorf("Results = %v, want {101:true, 102:true}", res.Results)
+	block, ok := sys[0].(*types.SystemContentBlockMemberText)
+	if !ok || block.Value != "/no_think" {
+		t.Errorf("System = %#v, want /no_think text block", sys[0])
 	}
 }
 
-func TestClassifyEmailBatch_BothCallsFail(t *testing.T) {
+func TestClassifyEmailBatch_ReasoningOverrideBeatsRegistry(t *testing.T) {
 	fake := &fakeConverseAPI{
-		errs: []error{
-			errors.New("ValidationException: tool use not supported"),
-			errors.New("ThrottlingException: rate exceeded"),
-		},
+		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
 	}
-	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
-	if err == nil {
-		t.Fatal("expected error when both the tool-use call and the fallback fail")
+	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "/custom_switch", false)
+	if err != nil {
+		t.Fatalf("ClassifyEmailBatch error: %v", err)
+	}
+	block, ok := fake.calls[0].System[0].(*types.SystemContentBlockMemberText)
+	if !ok || block.Value != "/custom_switch" {
+		t.Errorf("System = %#v, want override text block", fake.calls[0].System[0])
+	}
+}
+
+func TestClassifyEmailBatch_NoDirectiveForUnknownModel(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
+	}
+	c := &Client{br: fake, defaultModel: "meta.llama3-1-70b-instruct-v1:0"}
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	if err != nil {
+		t.Fatalf("ClassifyEmailBatch error: %v", err)
+	}
+	if fake.calls[0].System != nil {
+		t.Errorf("System = %#v, want nil for a model not in reasoningRegistry with no override", fake.calls[0].System)
 	}
 }
 
@@ -298,14 +286,14 @@ func TestIsBedrockTimeout(t *testing.T) {
 }
 
 func TestClassifyEmailBatch_TimeoutLoggedOnce(t *testing.T) {
-	// Both the primary tool-use call and the plain-Converse retry time out; only one
-	// TIMEOUT log entry should be recorded per ClassifyEmailBatch call.
-	fake := &fakeConverseAPI{errs: []error{fakeTimeoutError{}, fakeTimeoutError{}}}
+	// The single Converse call times out; exactly one TIMEOUT log entry should be
+	// recorded per ClassifyEmailBatch call.
+	fake := &fakeConverseAPI{errs: []error{fakeTimeoutError{}}}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
 	logger := &recordingLogger{}
-	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
+	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
 	if err == nil {
-		t.Fatal("expected error when both calls time out")
+		t.Fatal("expected error when the call times out")
 	}
 	var timeoutLogs int
 	for _, e := range logger.entries {
@@ -352,16 +340,17 @@ func TestExtractJSONObject(t *testing.T) {
 	}
 }
 
-func TestClassifyEmailBatch_FallbackParsesThinkBlockPreamble(t *testing.T) {
+func TestClassifyEmailBatch_ParsesThinkBlockPreamble(t *testing.T) {
 	// Reasoning models (e.g. Qwen3 32B) can prepend a <think>...</think> block even
-	// when they don't call the forced tool and just answer in text.
+	// when a reasoning-suppression directive was sent — detectReasoning (reasoning.go)
+	// is what surfaces that as ReasoningDetected, but the JSON must still parse.
 	fake := &fakeConverseAPI{
 		outputs: []*bedrockruntime.ConverseOutput{
 			textOutput("<think>\nRule 1: this looks promotional, so true. Rule 2: no receipt language, so false.\n</think>\n{\"1\": true, \"2\": false}"),
 		},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, false)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -370,6 +359,9 @@ func TestClassifyEmailBatch_FallbackParsesThinkBlockPreamble(t *testing.T) {
 	}
 	if !res.Results[101] || res.Results[102] {
 		t.Errorf("Results = %v, want {101:true, 102:false}", res.Results)
+	}
+	if !res.ReasoningDetected {
+		t.Errorf("ReasoningDetected = false, want true (response contains a <think> block)")
 	}
 }
 
