@@ -1,15 +1,19 @@
 version: 2
-# Note: transitive Go dep security bumps are handled by vuln-autofix.yml — Dependabot does not bump transitives.
+# Policy: dependencies move ONLY for known security issues, at the minimum fixed
+# version — never routine version bumps. Enforcement:
+#  - Go code paths: vuln-autofix.yml (govulncheck, weekly) opens PRs only for
+#    vulnerabilities in CALLED symbols (exercised code paths) and bumps each module
+#    to govulncheck's fixed_version, which is the minimum fix.
+#  - Everything else (and Go advisories Dependabot notices first): Dependabot
+#    SECURITY updates (repo setting), which bump to the minimum patched version.
+#    The entries below exist only so ecosystems stay registered; version updates
+#    are disabled via open-pull-requests-limit: 0.
 updates:
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: daily
-    open-pull-requests-limit: 10
-    groups:
-      go-deps:
-        patterns:
-          - "*"
+    open-pull-requests-limit: 0
 
   # Front-end vendor deps: package.json is the version source of truth;
   # scripts/vendor.sh fetches those versions into static/vendor/ at build time.
@@ -17,13 +21,10 @@ updates:
     directory: /
     schedule:
       interval: daily
-    open-pull-requests-limit: 10
-    groups:
-      npm-deps:
-        patterns:
-          - "*"
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: daily
+    open-pull-requests-limit: 0
