@@ -17,7 +17,7 @@ import (
 // build small, dependency-free inline SVGs from precomputed stats.
 
 const (
-	chartHeight = 220
+	chartHeight = 165 // 220 * 0.75: ~25% shorter row (charts scale to their column width, so height is proportional to this)
 	// boxChartWidth is lineChartWidth/3, matching the dashboard's 1fr:3fr chart-row grid
 	// (box plot : line graph) so both SVGs render at the same on-screen height and scale
 	// factor at any page width — see .chart-row in static/style.css.
