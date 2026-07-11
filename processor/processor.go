@@ -371,12 +371,6 @@ func processEmail(
 			matched = append(matched, p.Name)
 		}
 	}
-	if len(matched) > 0 {
-		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Classification done: %d match(es): %v", account.Email, len(matched), matched)})
-	} else {
-		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Classification done: 0 match(es): none", account.Email)})
-	}
-
 	stop := false
 	for _, p := range prompts {
 		if stop {
@@ -453,7 +447,11 @@ func processEmail(
 		})
 	}
 
-	logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("Processed %q", msg.Subject)})
+	if len(matched) > 0 {
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: %d match(es): %v", account.Email, msg.Subject, len(matched), matched)})
+	} else {
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: 0 match(es): none", account.Email, msg.Subject)})
+	}
 	if debugLogging {
 		logs = append(logs, db.LogEntry{Level: logDebug, Message: "LLM response: " + classified.RawResponse})
 	}
