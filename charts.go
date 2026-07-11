@@ -125,12 +125,14 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="LLM latency distribution over the last 30 days">`, boxChartWidth, chartHeight)
 
-	// Label every quartile boundary (hi/q3/med/q1/lo), skipping any that would land
-	// within minLabelGap px of an already-drawn label (e.g. a tight IQR) to avoid
-	// overlapping text.
+	// Label every quartile boundary (hi/lo/med/q3/q1), skipping any that would land within
+	// minLabelGap px of an already-drawn label (e.g. a tight IQR) to avoid overlapping
+	// text. Order matters: hi/lo (the whisker extremes) and med (the median, the most
+	// useful single number in the plot) are checked first so they're never the ones
+	// dropped — if anything has to collapse for space, it's a quartile (q3/q1).
 	const minLabelGap = 14.0
 	var labeledY []float64
-	for _, v := range []int64{hi, q3, med, q1, lo} {
+	for _, v := range []int64{hi, lo, med, q3, q1} {
 		y := scale(v)
 		tooClose := false
 		for _, py := range labeledY {
@@ -249,35 +251,57 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y+4, a)
 	}
 
-	// X-axis ticks: up to 5, evenly spaced by time across [first, last] (matching the
-	// Y-axis's "at most 5" gridlines for visual consistency). If every sample falls in the
-	// same hour there's only one instant to label, so skip spreading fake ticks across it.
+	// X-axis ticks: up to 5, each snapped to a real data point's hour bucket (rather than
+	// an evenly time-spaced instant) so a tick directly under a point always shows the same
+	// time as that point's hover tooltip. The first and last points are always shown; up to
+	// 3 more are chosen as the points nearest each evenly time-spaced target between them,
+	// then dropped if they'd land within minTickGapPx of a neighbor — samples can cluster
+	// unevenly in time (e.g. business hours vs. overnight gaps), so nearest-to-target alone
+	// doesn't guarantee even pixel spacing.
 	const xTicks = 5
-	n := xTicks
-	if last.Equal(first) {
-		n = 1
-	}
+	const minTickGapPx = 48.0
 	// A span under a day means multiple ticks could land on the same calendar date, so
 	// include the hour in the label to keep them distinguishable.
 	xLabelFormat := "Jan 2"
 	if span < 24 {
 		xLabelFormat = "Jan 2 15:04"
 	}
-	for i := 0; i < n; i++ {
-		frac := 0.0
-		if n > 1 {
-			frac = float64(i) / float64(n-1)
+	type xTick struct {
+		x     float64
+		label string
+	}
+	labelFor := func(idx int) xTick {
+		t := points[idx].hour
+		return xTick{xFor(t), t.Format(xLabelFormat)}
+	}
+	ticks := []xTick{labelFor(0)}
+	lastTick := labelFor(len(points) - 1)
+	for i := 1; i < xTicks-1; i++ {
+		target := float64(i) / float64(xTicks-1) * span
+		best, bestDiff := 0, math.Inf(1)
+		for j, p := range points {
+			if d := math.Abs(p.hour.Sub(first).Hours() - target); d < bestDiff {
+				best, bestDiff = j, d
+			}
 		}
-		t := first.Add(time.Duration(frac * span * float64(time.Hour)))
-		x := xFor(t)
-		fmt.Fprintf(&b, `<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" class="chart-tick"/>`, x, plotBottom, x, plotBottom+4)
+		tk := labelFor(best)
+		if tk.x-ticks[len(ticks)-1].x < minTickGapPx || lastTick.x-tk.x < minTickGapPx {
+			continue
+		}
+		ticks = append(ticks, tk)
+	}
+	if len(points) > 1 {
+		ticks = append(ticks, lastTick)
+	}
+	for i, tk := range ticks {
+		fmt.Fprintf(&b, `<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" class="chart-tick"/>`, tk.x, plotBottom, tk.x, plotBottom+4)
 		anchor := "middle"
 		if i == 0 {
 			anchor = "start"
-		} else if i == n-1 {
+		} else if i == len(ticks)-1 {
 			anchor = "end"
 		}
-		fmt.Fprintf(&b, `<text x="%.1f" y="%d" class="chart-axis-label" text-anchor="%s">%s</text>`, x, chartHeight-8, anchor, t.Format(xLabelFormat))
+		fmt.Fprintf(&b, `<text x="%.1f" y="%d" class="chart-axis-label" text-anchor="%s">%s</text>`, tk.x, chartHeight-8, anchor, tk.label)
 	}
 
 	coords := make([]string, 0, len(points))
