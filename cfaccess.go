@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,7 +21,14 @@ import (
 // tag, otherwise it is rejected with 403. This prevents bypassing Cloudflare by hitting
 // the raw Lambda Function URL directly.
 func newCfAccessMiddleware(ctx context.Context, teamDomain, aud string) func(http.Handler) http.Handler {
-	if teamDomain == "" || aud == "" {
+	// Partial config is always a misconfiguration (both values come from the same
+	// CfAccessAud-gated template branch) — fail closed instead of silently disabling
+	// verification. runWeb additionally cross-checks AUTH_MODE so a fully-absent pair
+	// can't slip through while the Function URL is public.
+	if (teamDomain == "") != (aud == "") {
+		log.Fatalf("Cloudflare Access misconfigured: exactly one of CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD is set — set both or neither; refusing to start")
+	}
+	if teamDomain == "" && aud == "" {
 		slog.Warn("Cloudflare Access verification disabled (CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD unset); Function URL must stay AWS_IAM-protected")
 		return func(next http.Handler) http.Handler { return next }
 	}

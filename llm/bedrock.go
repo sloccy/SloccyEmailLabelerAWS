@@ -355,6 +355,16 @@ func mapKeysToResults(parsed map[string]any, prompts []Prompt) map[int64]bool {
 	return results
 }
 
+// rawDump renders a raw LLM response for a log message, but only under DEBUG_LOGGING —
+// the response can quote email content back, which shouldn't be persisted to the log
+// rows during normal operation. Returns "" when debug is off.
+func rawDump(debug bool, raw string) string {
+	if !debug {
+		return ""
+	}
+	return " | raw: " + raw
+}
+
 // extractJSONObject scans s for the first top-level {...} span that is itself valid
 // JSON, and returns it, or "" if none is found. Used to pull classification JSON out of
 // a text-fallback response (see ClassifyEmailBatch) that may be wrapped in prose,
@@ -549,7 +559,9 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	res.ReasoningDetected = detectReasoning(out.Output, raw)
 	store.Log("INFO", fmt.Sprintf("LLM classify reasoning: suppressed=%v", !res.ReasoningDetected))
 	combined := fmt.Sprintf("LLM classify: %dms (tier: %s), content=%d chars", res.LatencyMs, tierLabel, len(raw))
-	if len(raw) > 0 {
+	// Response previews/dumps can quote email content back, so they're persisted to the
+	// (auth-gated, TTL'd) log rows only under DEBUG_LOGGING — defense in depth.
+	if debug && len(raw) > 0 {
 		preview := raw
 		if len(preview) > 500 {
 			preview = preview[:500]
@@ -561,12 +573,12 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 
 	cleaned := extractJSONObject(raw)
 	if cleaned == "" {
-		store.Log("ERROR", "LLM parse error: no JSON object found | raw: "+raw)
+		store.Log("ERROR", "LLM parse error: no JSON object found"+rawDump(debug, raw))
 		return res, &Error{Msg: "LLM parse error: no JSON object found in response"}
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
-		store.Log("ERROR", fmt.Sprintf("LLM parse error: %v | raw: %s", err, raw))
+		store.Log("ERROR", fmt.Sprintf("LLM parse error: %v%s", err, rawDump(debug, raw)))
 		return res, &Error{Msg: fmt.Sprintf("LLM parse error: %v", err)}
 	}
 

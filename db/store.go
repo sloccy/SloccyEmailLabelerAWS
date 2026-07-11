@@ -19,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 // mustMarshalMap marshals v (a model struct with dynamodbav tags — string/int64/pointer
@@ -58,10 +60,23 @@ func unmarshalItem[T any](it map[string]types.AttributeValue) T {
 	return v
 }
 
+// ssmAPI is the subset of the SSM client used for per-account OAuth token storage —
+// an interface so tests can substitute an in-memory implementation.
+type ssmAPI interface {
+	GetParameter(ctx context.Context, in *ssm.GetParameterInput, opts ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
+	PutParameter(ctx context.Context, in *ssm.PutParameterInput, opts ...func(*ssm.Options)) (*ssm.PutParameterOutput, error)
+	DeleteParameter(ctx context.Context, in *ssm.DeleteParameterInput, opts ...func(*ssm.Options)) (*ssm.DeleteParameterOutput, error)
+}
+
 // Store wraps a DynamoDB client. All methods are safe for concurrent use.
 type Store struct {
 	ddb   *dynamodb.Client
 	table string
+	// ssm holds per-account Gmail OAuth tokens as SecureString parameters (see
+	// tokenParamName). Tokens deliberately live outside the DynamoDB table so that
+	// table read access, exports, and backups never expose them — decrypting a token
+	// additionally requires ssm:GetParameter on /ollamail/accounts/*.
+	ssm ssmAPI
 }
 
 // Open constructs a Store.
@@ -74,7 +89,7 @@ func Open() (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
-	return &Store{ddb: dynamodb.NewFromConfig(cfg), table: table}, nil
+	return &Store{ddb: dynamodb.NewFromConfig(cfg), table: table, ssm: ssm.NewFromConfig(cfg)}, nil
 }
 
 // tsLayout is the standard timestamp format used for Now() and for formatting other
@@ -324,12 +339,28 @@ func ttlDays(days int) int64 {
 	return time.Now().UTC().AddDate(0, 0, days).Unix()
 }
 
-// logHistoryTTLDays is the item-level TTL for logs and history — matches the deployed
-// default of LogRetentionDays (template.yaml), so DynamoDB's own TTL sweep now enforces
-// the real retention policy directly instead of needing a separate scan+delete pass (see
-// TrimLogs/TrimHistory below, now no-ops). If LogRetentionDays is ever overridden away
-// from 30 at deploy time, bump this to match.
-const logHistoryTTLDays = 30
+// logHistoryTTLDays is the item-level TTL for logs, history, and LLM-debug rows —
+// DynamoDB's own TTL sweep enforces the retention policy directly instead of needing a
+// separate scan+delete pass (see TrimLogs/TrimHistory below, now no-ops). Initialized
+// from the same LOG_RETENTION_DAYS env template.yaml feeds the app config, so a
+// retention override at deploy time propagates here instead of drifting from a
+// hardcoded copy of its default.
+var logHistoryTTLDays = envDaysOr("LOG_RETENTION_DAYS", 30)
+
+// suggestionTTLDays bounds prompt-suggestion items, which snapshot a full email body
+// (EmailBodySnapshot). Longer than log retention because pending suggestions are
+// user-facing action items — but a suggestion unactioned for this long is stale, and
+// email content shouldn't outlive it.
+const suggestionTTLDays = 90
+
+func envDaysOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // ============================================================
 // Settings
@@ -502,7 +533,100 @@ func (s *Store) TrimLogs(_ context.Context, _ int) error {
 // Accounts
 // ============================================================
 
+// ============================================================
+// Account OAuth tokens (SSM SecureString side-channel)
+//
+// Gmail refresh tokens are the crown jewel — durable gmail.modify access to the
+// whole mailbox — so they never touch the DynamoDB table: accountItem strips the
+// creds field on every write, and reads hydrate Account.CredentialsJSON from an
+// SSM SecureString at /ollamail/accounts/<id>/token (encrypted with the AWS-managed
+// aws/ssm key; IAM scoped in template.yaml). Rows written before this scheme carry
+// a legacy creds attribute, which reads migrate to SSM lazily and then clear.
+// ============================================================
+
+func tokenParamName(id int64) string {
+	return "/ollamail/accounts/" + strconv.FormatInt(id, 10) + "/token"
+}
+
+// getAccountToken returns the account's OAuth token JSON, or "" when no token has
+// been stored (e.g. a placeholder account awaiting OAuth).
+func (s *Store) getAccountToken(ctx context.Context, id int64) (string, error) {
+	out, err := s.ssm.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(tokenParamName(id)),
+		WithDecryption: aws.Bool(true),
+	})
+	if err != nil {
+		var notFound *ssmtypes.ParameterNotFound
+		if errors.As(err, &notFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get account token %d: %w", id, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", nil
+	}
+	return *out.Parameter.Value, nil
+}
+
+func (s *Store) putAccountToken(ctx context.Context, id int64, tokenJSON string) error {
+	_, err := s.ssm.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(tokenParamName(id)),
+		Type:      ssmtypes.ParameterTypeSecureString,
+		Value:     aws.String(tokenJSON),
+		Overwrite: aws.Bool(true),
+	})
+	if err != nil {
+		return fmt.Errorf("put account token %d: %w", id, err)
+	}
+	return nil
+}
+
+func (s *Store) deleteAccountToken(ctx context.Context, id int64) error {
+	_, err := s.ssm.DeleteParameter(ctx, &ssm.DeleteParameterInput{
+		Name: aws.String(tokenParamName(id)),
+	})
+	if err != nil {
+		var notFound *ssmtypes.ParameterNotFound
+		if errors.As(err, &notFound) {
+			return nil
+		}
+		return fmt.Errorf("delete account token %d: %w", id, err)
+	}
+	return nil
+}
+
+// hydrateAccountToken fills a.CredentialsJSON from SSM. If the row still carries a
+// legacy plaintext creds attribute (written before the SSM scheme), it is migrated:
+// copied to SSM, then removed from the item so the table no longer holds the token.
+func (s *Store) hydrateAccountToken(ctx context.Context, a *Account) error {
+	if a.CredentialsJSON != "" { // legacy row — migrate
+		legacy := a.CredentialsJSON
+		if err := s.putAccountToken(ctx, a.ID, legacy); err != nil {
+			return err
+		}
+		if _, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:        aws.String(s.table),
+			Key:              map[string]types.AttributeValue{"PK": sv("ACCOUNT"), "SK": sv(padID(a.ID))},
+			UpdateExpression: aws.String("REMOVE creds"),
+		}); err != nil {
+			// Token is safe in SSM; the leftover attribute just re-migrates (same
+			// value, idempotent) on the next read.
+			slog.Warn("clear legacy creds attribute", "account", a.ID, "err", err)
+		}
+		return nil
+	}
+	token, err := s.getAccountToken(ctx, a.ID)
+	if err != nil {
+		return err
+	}
+	a.CredentialsJSON = token
+	return nil
+}
+
 func accountItem(a Account) map[string]types.AttributeValue {
+	// Tokens live in SSM (see hydrateAccountToken) — never persist them to the table,
+	// regardless of what a hydrated Account value carries.
+	a.CredentialsJSON = ""
 	return keyedItem(a, "ACCOUNT", padID(a.ID), 0)
 }
 
@@ -522,6 +646,9 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	accs := make([]Account, len(items))
 	for i, it := range items {
 		accs[i] = itemToAccount(it)
+		if err := s.hydrateAccountToken(ctx, &accs[i]); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(accs, func(i, j int) bool { return accs[i].AddedAt > accs[j].AddedAt })
 	return accs, nil
@@ -559,7 +686,11 @@ func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
 	if out.Item == nil {
 		return Account{}, fmt.Errorf("account not found: %d", id)
 	}
-	return itemToAccount(out.Item), nil
+	a := itemToAccount(out.Item)
+	if err := s.hydrateAccountToken(ctx, &a); err != nil {
+		return Account{}, err
+	}
+	return a, nil
 }
 
 func (s *Store) GetAccountByEmail(ctx context.Context, email string) (int64, error) {
@@ -583,18 +714,27 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 	// Try to get existing ID first
 	existing, err := s.GetAccountByEmail(ctx, arg.Email)
 	if err == nil {
-		// Update existing
+		// Update existing. GetAccount's hydration may lazily migrate a legacy in-table
+		// token, and the PutItem below rewrites the row without a creds attribute — so
+		// the fresh token must be written to SSM last, or the legacy migration would
+		// resurrect the old token over it.
 		a, err2 := s.GetAccount(ctx, existing)
 		if err2 != nil {
 			return 0, err2
 		}
-		a.CredentialsJSON = arg.CredentialsJSON
 		a.Active = 1
 		if _, err3 := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(s.table),
 			Item:      accountItem(a),
 		}); err3 != nil {
 			return 0, err3
+		}
+		// Empty credentials (e.g. CreateAccountPlaceholder re-upserting an existing
+		// email) must not clobber a stored token.
+		if arg.CredentialsJSON != "" {
+			if err3 := s.putAccountToken(ctx, existing, arg.CredentialsJSON); err3 != nil {
+				return 0, err3
+			}
 		}
 		return existing, nil
 	}
@@ -604,11 +744,10 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 		return 0, err
 	}
 	a := Account{
-		ID:              id,
-		Email:           arg.Email,
-		CredentialsJSON: arg.CredentialsJSON,
-		AddedAt:         Now(),
-		Active:          1,
+		ID:      id,
+		Email:   arg.Email,
+		AddedAt: Now(),
+		Active:  1,
 	}
 	// Write account item + email guard in a transaction
 	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -631,6 +770,13 @@ func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int
 	if err != nil {
 		return 0, err
 	}
+	// Token written only after the account row exists — a failed transaction (e.g.
+	// losing the email-guard race) must not leave an orphaned SSM secret behind.
+	if arg.CredentialsJSON != "" {
+		if err := s.putAccountToken(ctx, id, arg.CredentialsJSON); err != nil {
+			return 0, err
+		}
+	}
 	return id, nil
 }
 
@@ -643,16 +789,19 @@ func (s *Store) CreateAccountPlaceholder(ctx context.Context, email string) (int
 }
 
 func (s *Store) UpdateAccountCredentials(ctx context.Context, arg UpdateAccountCredentialsParams) error {
+	if err := s.putAccountToken(ctx, arg.ID, arg.CredentialsJSON); err != nil {
+		return err
+	}
+	// Also clear any legacy plaintext creds attribute: a stale copy left in the table
+	// would be lazily re-migrated on a later read, resurrecting the OLD token over the
+	// fresh one just written to SSM.
 	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
 			"PK": sv("ACCOUNT"),
 			"SK": sv(padID(arg.ID)),
 		},
-		UpdateExpression: aws.String("SET creds = :c"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":c": sv(arg.CredentialsJSON),
-		},
+		UpdateExpression: aws.String("REMOVE creds"),
 	})
 	return err
 }
@@ -706,6 +855,9 @@ func (s *Store) ToggleAccount(ctx context.Context, id int64) (int64, error) {
 func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
 	a, err := s.GetAccount(ctx, id)
 	if err != nil {
+		return err
+	}
+	if err := s.deleteAccountToken(ctx, id); err != nil {
 		return err
 	}
 	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -1761,7 +1913,7 @@ func suggestionItem(id int64, ts string, arg InsertPromptSuggestionParams) map[s
 		ConversationJSON:      arg.ConversationJSON,
 		UserComment:           "",
 		Status:                arg.Status,
-	}, "SUGGESTION", padID(id), 0)
+	}, "SUGGESTION", padID(id), ttlDays(suggestionTTLDays))
 }
 
 func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSuggestionParams) (int64, error) {
@@ -1943,7 +2095,9 @@ func llmDebugItem(id int64, ts string, arg AddLlmDebugParams) map[string]types.A
 		GmailRaw:     arg.GmailRaw,
 		LlmRequest:   arg.LlmRequest,
 		LlmResponse:  arg.LlmResponse,
-	}, "LLM_DEBUG", padID(id), 0)
+		// TTL: LLM-debug rows hold the raw Gmail message; TrimLlmDebug only keeps the
+		// newest 3, but without a TTL the final 3 would linger forever once debugging ends.
+	}, "LLM_DEBUG", padID(id), ttlDays(logHistoryTTLDays))
 }
 
 func (s *Store) AddLlmDebug(ctx context.Context, arg AddLlmDebugParams) error {
