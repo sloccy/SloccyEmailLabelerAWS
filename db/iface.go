@@ -9,10 +9,6 @@ type StoreIface interface {
 
 	GetSetting(ctx context.Context, key string) (string, error)
 
-	TrimLogs(ctx context.Context, retentionDays int) error
-	TrimProcessedEmails(ctx context.Context, lookbackHours int) error
-	TrimHistory(ctx context.Context, retentionDays int) error
-
 	ListAccounts(ctx context.Context) ([]Account, error)
 	ListActivePrompts(ctx context.Context) ([]Prompt, error)
 
