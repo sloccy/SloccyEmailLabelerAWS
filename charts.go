@@ -17,8 +17,11 @@ import (
 // build small, dependency-free inline SVGs from precomputed stats.
 
 const (
-	chartHeight    = 220
-	boxChartWidth  = 300
+	chartHeight = 220
+	// boxChartWidth is lineChartWidth/3, matching the dashboard's 1fr:3fr chart-row grid
+	// (box plot : line graph) so both SVGs render at the same on-screen height and scale
+	// factor at any page width — see .chart-row in static/style.css.
+	boxChartWidth  = 160
 	lineChartWidth = 480
 	chartPadL      = 54
 	chartPadR      = 16
@@ -117,7 +120,7 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 	}
 
 	cx := (chartPadL + (boxChartWidth - chartPadR)) / 2
-	const boxHalf = 40
+	const boxHalf = 24 // narrower box to fit boxChartWidth=160's tighter plot area
 
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="LLM latency distribution over the last 30 days">`, boxChartWidth, chartHeight)
