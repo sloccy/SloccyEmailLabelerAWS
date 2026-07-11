@@ -14,8 +14,8 @@ type StoreLogger interface {
 // ClientIface is the LLM client contract used by processor, poller, and server.
 // *Client satisfies this; *FakeClient satisfies it for tests.
 type ClientIface interface {
-	ResolveClassifySettings(ctx context.Context) (model, tier string)
-	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier string, debug bool) (ClassifyResult, error)
+	ResolveClassifySettings(ctx context.Context) (model, tier, reasoningOverride string)
+	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier, reasoningOverride string, debug bool) (ClassifyResult, error)
 	StreamGeneratePromptInstruction(ctx context.Context, description string) <-chan StreamChunk
 	ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error)
 	ListAvailableModels(ctx context.Context) ([]ModelOption, error)
@@ -41,11 +41,11 @@ func NewFakeErrorClient() *FakeClient {
 	return &FakeClient{callErr: &Error{Msg: "fake LLM error"}, model: fakeModelID}
 }
 
-func (c *FakeClient) ResolveClassifySettings(_ context.Context) (model, tier string) {
-	return c.model, ClassifyTierStandard
+func (c *FakeClient) ResolveClassifySettings(_ context.Context) (model, tier, reasoningOverride string) {
+	return c.model, ClassifyTierStandard, ""
 }
 
-func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt, _, _ string, _ bool) (ClassifyResult, error) {
+func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt, _, _, _ string, _ bool) (ClassifyResult, error) {
 	if c.callErr != nil {
 		return ClassifyResult{}, c.callErr
 	}
