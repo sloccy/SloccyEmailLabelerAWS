@@ -84,6 +84,19 @@ func niceNum(x float64, round bool) float64 {
 	return nf * math.Pow(10, exp)
 }
 
+// niceTimeStepHours picks a step, in hours, from a fixed list of common calendar
+// intervals (all divisors or multiples of 24h, so ticks land on a clean hour-of-day or
+// midnight boundary) such that the span divides into at most 4 steps — capping the X-axis
+// at 5 ticks, the same rule niceNum applies to the Y-axis.
+func niceTimeStepHours(spanHours float64) float64 {
+	for _, step := range []float64{1, 2, 3, 4, 6, 8, 12, 24, 48, 72, 120, 168, 240, 336, 504, 720, 1440} {
+		if spanHours/step <= 4 {
+			return step
+		}
+	}
+	return 1440
+}
+
 // emptyTextBasePx is the "no data yet" font size, in the box chart's own coordinate
 // space (boxChartWidth). The browser scales each chart's differently-sized viewBox to fill
 // an (approximately) equal-width card, so a chart wider than boxChartWidth needs a
@@ -259,14 +272,13 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y, a)
 	}
 
-	// X-axis ticks: up to 5, each snapped to a real data point's hour bucket (rather than
-	// an evenly time-spaced instant) so a tick directly under a point always shows the same
-	// time as that point's hover tooltip. The first and last points are always shown; up to
-	// 3 more are chosen as the points nearest each evenly time-spaced target between them,
-	// then dropped if they'd land within minTickGapPx of a neighbor — samples can cluster
-	// unevenly in time (e.g. business hours vs. overnight gaps), so nearest-to-target alone
-	// doesn't guarantee even pixel spacing.
-	const xTicks = 5
+	// X-axis ticks: the first and last are the real data points' own hour buckets, so
+	// those two always match their point's hover tooltip exactly. Interior ticks, though,
+	// land on genuine calendar boundaries (midnight UTC, or a clean hour-of-day) rather
+	// than on whatever sample happens to be nearby — snapping them to real data points
+	// instead made them look unevenly spaced, since e.g. one day's first sample might be
+	// at 08:00 and the next day's at 23:00. This mirrors the Y-axis: gridlines sit at nice
+	// round values, independent of where the actual data falls.
 	const minTickGapPx = 48.0
 	// A span under a day means multiple ticks could land on the same calendar date, so
 	// include the hour in the label to keep them distinguishable.
@@ -278,27 +290,24 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		x     float64
 		label string
 	}
-	labelFor := func(idx int) xTick {
-		t := points[idx].hour
+	labelFor := func(t time.Time) xTick {
 		return xTick{xFor(t), t.Format(xLabelFormat)}
 	}
-	ticks := []xTick{labelFor(0)}
-	lastTick := labelFor(len(points) - 1)
-	for i := 1; i < xTicks-1; i++ {
-		target := float64(i) / float64(xTicks-1) * span
-		best, bestDiff := 0, math.Inf(1)
-		for j, p := range points {
-			if d := math.Abs(p.hour.Sub(first).Hours() - target); d < bestDiff {
-				best, bestDiff = j, d
-			}
-		}
-		tk := labelFor(best)
-		if tk.x-ticks[len(ticks)-1].x < minTickGapPx || lastTick.x-tk.x < minTickGapPx {
-			continue
-		}
-		ticks = append(ticks, tk)
-	}
+	ticks := []xTick{labelFor(points[0].hour)}
+	lastTick := labelFor(points[len(points)-1].hour)
 	if len(points) > 1 {
+		step := time.Duration(niceTimeStepHours(span) * float64(time.Hour))
+		dayStart := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, time.UTC)
+		for t := dayStart; !t.After(last); t = t.Add(step) {
+			if !t.After(first) {
+				continue
+			}
+			tk := labelFor(t)
+			if tk.x-ticks[len(ticks)-1].x < minTickGapPx || lastTick.x-tk.x < minTickGapPx {
+				continue
+			}
+			ticks = append(ticks, tk)
+		}
 		ticks = append(ticks, lastTick)
 	}
 	for i, tk := range ticks {
