@@ -32,7 +32,7 @@ func TestSecurityMiddleware(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, nil)
 			if tc.fetchSite != "" {
 				req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
 			}
@@ -45,7 +45,7 @@ func TestSecurityMiddleware(t *testing.T) {
 	}
 
 	// Headers land on every response, including rejections.
-	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", nil)
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
