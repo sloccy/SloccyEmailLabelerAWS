@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"html/template"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -47,6 +48,37 @@ func quartiles(vals []int64) (lo, q1, med, q3, hi int64) {
 		return vals[loIdx] + int64(frac*float64(vals[hiIdx]-vals[loIdx]))
 	}
 	return vals[0], pct(0.25), pct(0.5), pct(0.75), vals[n-1]
+}
+
+// niceNum rounds x to a "nice" number (1, 2, 5, or 10 × a power of ten). When round is
+// true it rounds to the nearest nice number; otherwise it rounds up. Used to pick clean,
+// evenly-divisible Y-axis tick steps.
+func niceNum(x float64, round bool) float64 {
+	if x <= 0 {
+		return 1
+	}
+	exp := math.Floor(math.Log10(x))
+	f := x / math.Pow(10, exp)
+	var nf float64
+	switch {
+	case round && f < 1.5:
+		nf = 1
+	case round && f < 3:
+		nf = 2
+	case round && f < 7:
+		nf = 5
+	case round:
+		nf = 10
+	case f <= 1:
+		nf = 1
+	case f <= 2:
+		nf = 2
+	case f <= 5:
+		nf = 5
+	default:
+		nf = 10
+	}
+	return nf * math.Pow(10, exp)
 }
 
 // emptyTextBasePx is the "no data yet" font size, in the box chart's own coordinate
@@ -173,17 +205,20 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 	}
 	sort.Slice(points, func(i, j int) bool { return points[i].hour.Before(points[j].hour) })
 
-	minAvg, maxAvg := points[0].avg(), points[0].avg()
+	maxAvg := points[0].avg()
 	for _, p := range points {
-		if a := p.avg(); a < minAvg {
-			minAvg = a
-		} else if a > maxAvg {
+		if a := p.avg(); a > maxAvg {
 			maxAvg = a
 		}
 	}
-	if minAvg == maxAvg {
-		maxAvg = minAvg + 1 // avoid a divide-by-zero flat line
+	if maxAvg <= 0 {
+		maxAvg = 1 // avoid a degenerate flat axis
 	}
+	// Round the step *up* (round=false) toward a nice number so step >= maxAvg/4. This
+	// guarantees niceMax/step <= 4, i.e. never more than 5 gridlines (0 + up to 4 steps),
+	// while keeping ticks on clean 1/2/5×10ⁿ increments.
+	step := niceNum(maxAvg/4, false)
+	niceMax := math.Ceil(maxAvg/step) * step
 
 	first, last := points[0].hour, points[len(points)-1].hour
 	span := last.Sub(first).Hours()
@@ -199,14 +234,13 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		return float64(plotLeft) + (t.Sub(first).Hours()/span)*plotW
 	}
 	yFor := func(a float64) float64 {
-		return float64(plotBottom) - ((a-minAvg)/(maxAvg-minAvg))*plotH
+		return float64(plotBottom) - (a/niceMax)*plotH
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="Average LLM latency per hour">`, lineChartWidth, chartHeight)
 
-	mid := (minAvg + maxAvg) / 2
-	for _, a := range []float64{maxAvg, mid, minAvg} {
+	for a := 0.0; a <= niceMax+step/2; a += step {
 		y := yFor(a)
 		fmt.Fprintf(&b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" class="chart-gridline"/>`, plotLeft, y, plotRight, y)
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y+4, a)
@@ -221,7 +255,13 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 	}
 	fmt.Fprintf(&b, `<polyline points="%s" class="chart-line"/>`, strings.Join(coords, " "))
 	for _, p := range points {
-		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="2.5" class="chart-point"/>`, xFor(p.hour), yFor(p.avg()))
+		x, y := xFor(p.hour), yFor(p.avg())
+		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="2.5" class="chart-point"/>`, x, y)
+		// Invisible, larger hover target carrying the tooltip. fill="transparent" is
+		// painted (unlike fill:none) so it still receives pointer events for the native
+		// <title>, which shows the exact UTC hour and average on hover.
+		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="9" fill="transparent"><title>%s UTC &#183; %.0fms avg</title></circle>`,
+			x, y, p.hour.Format("Jan 2 15:04"), p.avg())
 	}
 
 	b.WriteString(`</svg>`)
