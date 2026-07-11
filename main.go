@@ -59,18 +59,19 @@ func buildDeps(cfg Config) (*db.Store, *llm.Client, *gmail.Auth) {
 }
 
 func runWeb(cfg Config) {
+	// Fail closed: AUTH_MODE=cfaccess (set by template.yaml exactly when the Function URL
+	// is public AuthType NONE) means the in-app Cloudflare Access JWT check is the only
+	// auth gate. If the CF vars have drifted away, refuse to serve rather than serve
+	// the UI unauthenticated. Checked before any defer is registered (log.Fatalf skips
+	// deferred calls) and before touching AWS.
+	if cfg.AuthMode == "cfaccess" && (cfg.CfAccessTeamDomain == "" || cfg.CfAccessAud == "") {
+		log.Fatalf("AUTH_MODE=cfaccess but CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD unset — the Function URL is public and unverified; refusing to start")
+	}
+
 	store, llmClient, gmailAuth := buildDeps(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	// Fail closed: AUTH_MODE=cfaccess (set by template.yaml exactly when the Function URL
-	// is public AuthType NONE) means the in-app Cloudflare Access JWT check is the only
-	// auth gate. If the CF vars have drifted away, refuse to serve rather than serve
-	// the UI unauthenticated.
-	if cfg.AuthMode == "cfaccess" && (cfg.CfAccessTeamDomain == "" || cfg.CfAccessAud == "") {
-		log.Fatalf("AUTH_MODE=cfaccess but CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD unset — the Function URL is public and unverified; refusing to start")
-	}
 
 	// Scheduled scanning is handled by the ScanFunction (EventBridge, fixed daily 2 AM ET
 	// cron — see ScanSchedule in template.yaml); the web UI's "Scan Now" runs an on-demand
