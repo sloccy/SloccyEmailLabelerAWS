@@ -7,7 +7,7 @@ ollamail
 # Node (vendor deps only)
 node_modules/
 
-# Frontend third-party deps are loaded from jsDelivr (see templates/index.html), not vendored
+# Build artifacts (fetched by scripts/vendor.sh from versions pinned in package.json)
 static/vendor/
 
 # Local dev helper binary (source: tools/sigv4proxy/main.go)

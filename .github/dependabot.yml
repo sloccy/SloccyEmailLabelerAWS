@@ -11,6 +11,18 @@ updates:
         patterns:
           - "*"
 
+  # Front-end vendor deps: package.json is the version source of truth;
+  # scripts/vendor.sh fetches those versions into static/vendor/ at build time.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    groups:
+      npm-deps:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
