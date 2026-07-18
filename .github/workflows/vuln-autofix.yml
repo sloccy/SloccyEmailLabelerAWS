@@ -12,6 +12,9 @@ permissions:
 jobs:
   vuln-autofix:
     uses: sloccy/shared-ci/.github/workflows/vuln-autofix.yml@main
-    # Optional: pass a PAT to skip the close/reopen CI-trigger workaround.
-    # secrets:
-    #   pr_token: ${{ secrets.WORKFLOW_TOKEN }}
+    # A PAT (not GITHUB_TOKEN) is required for the full hands-free chain: GITHUB_TOKEN
+    # events can't trigger other workflows, so a bot-authored PR never runs CI, and a
+    # bot-enabled auto-merge never triggers deploy.yml on the merge push. Falls back to
+    # the old manual-intervention behavior if the secret is missing/expired.
+    secrets:
+      pr_token: ${{ secrets.WORKFLOW_TOKEN }}

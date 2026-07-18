@@ -10,3 +10,8 @@ permissions:
 jobs:
   auto-merge:
     uses: sloccy/shared-ci/.github/workflows/dependabot-auto-merge.yml@main
+    # PAT so auto-merge is enabled as a real user — a GITHUB_TOKEN-enabled auto-merge
+    # produces a merge push that can't trigger deploy.yml. Optional; falls back to
+    # GITHUB_TOKEN (merge works, deploy needs a manual dispatch).
+    secrets:
+      merge_token: ${{ secrets.WORKFLOW_TOKEN }}
