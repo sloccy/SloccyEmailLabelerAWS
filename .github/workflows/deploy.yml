@@ -3,6 +3,9 @@ name: Deploy
 on:
   push:
     branches: [main]
+  # Manual escape hatch: a merge pushed by GITHUB_TOKEN (bot-enabled auto-merge) can't
+  # trigger this workflow, so allow deploying main by hand from the Actions tab.
+  workflow_dispatch:
 
 # Required for GitHub OIDC -> AWS role assumption (no long-lived keys).
 permissions:
