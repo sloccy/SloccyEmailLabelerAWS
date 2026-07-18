@@ -67,6 +67,9 @@ const (
 	// SettingClassifyTier holds the Bedrock service tier ("standard" or "flex") used for
 	// classification requests. Flex trades latency for lower cost; see resolveClassifyTier.
 	SettingClassifyTier = "classify_tier"
+	// SettingImproveTier is the same standard/flex choice for the prompt-improver model
+	// (Generate instruction + Improve rule); see resolveImproveTier.
+	SettingImproveTier = "improve_tier"
 	// SettingClassifyReasoningDirective holds an optional override for the
 	// reasoning-suppression system-prompt switch reasoningOff would otherwise pick from
 	// reasoningRegistry (reasoning.go) based on the classify model's id. Only needed for
@@ -75,10 +78,10 @@ const (
 	SettingClassifyReasoningDirective = "classify_reasoning_directive"
 )
 
-// Values for SettingClassifyTier.
+// Values for SettingClassifyTier and SettingImproveTier.
 const (
-	ClassifyTierStandard = "standard"
-	ClassifyTierFlex     = "flex"
+	TierStandard = "standard"
+	TierFlex     = "flex"
 )
 
 // ModelOption is one entry in the model-selection dropdown.
@@ -214,7 +217,21 @@ func (c *Client) resolveModel(ctx context.Context, key string) string {
 
 // resolveClassifyTier looks up the classification service tier; defaults to "standard".
 func (c *Client) resolveClassifyTier(ctx context.Context) string {
-	return c.resolveSetting(ctx, SettingClassifyTier, ClassifyTierStandard)
+	return c.resolveSetting(ctx, SettingClassifyTier, TierStandard)
+}
+
+// resolveImproveTier looks up the prompt-improver service tier; defaults to "standard".
+func (c *Client) resolveImproveTier(ctx context.Context) string {
+	return c.resolveSetting(ctx, SettingImproveTier, TierStandard)
+}
+
+// serviceTierFor converts a tier setting value into the Converse ServiceTier parameter:
+// the flex tier when selected, nil (Bedrock's implicit standard) otherwise.
+func serviceTierFor(tier string) *types.ServiceTier {
+	if tier == TierFlex {
+		return &types.ServiceTier{Type: types.ServiceTierTypeFlex}
+	}
+	return nil
 }
 
 // ResolveClassifySettings resolves the classify model, service tier, and reasoning-
@@ -428,18 +445,19 @@ func balancedBraceEnd(s string, start int) (end int, ok bool) {
 	return 0, false
 }
 
-// logUsage records the Converse call's token usage onto res and logs it. Usage is
-// populated best-effort: the SDK response's Usage field isn't guaranteed non-nil, so a
-// nil usage is skipped quietly rather than logged as misleading zeros.
-func logUsage(store StoreLogger, res *ClassifyResult, usage *types.TokenUsage, tierLabel string) {
+// recordUsage records the Converse call's token usage onto res and returns the token
+// fragment for the classify summary log line. Usage is populated best-effort: the SDK
+// response's Usage field isn't guaranteed non-nil, so a nil usage returns "" rather than
+// reporting misleading zeros.
+func recordUsage(res *ClassifyResult, usage *types.TokenUsage) string {
 	if usage == nil {
-		return
+		return ""
 	}
 	res.InputTokens = aws.ToInt32(usage.InputTokens)
 	res.OutputTokens = aws.ToInt32(usage.OutputTokens)
 	res.TotalTokens = aws.ToInt32(usage.TotalTokens)
-	store.Log("INFO", fmt.Sprintf("LLM classify tokens: input=%d output=%d total=%d (tier: %s)",
-		res.InputTokens, res.OutputTokens, res.TotalTokens, tierLabel))
+	return fmt.Sprintf("tokens input=%d output=%d total=%d",
+		res.InputTokens, res.OutputTokens, res.TotalTokens)
 }
 
 // classifyPayload returns the request pieces for a classify Converse call: the user
@@ -496,10 +514,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 
 	msgs, inf, sys, fields := classifyPayload(email, prompts, model, reasoningOverride)
 
-	var svcTier *types.ServiceTier
-	if tier == ClassifyTierFlex {
-		svcTier = &types.ServiceTier{Type: types.ServiceTierTypeFlex}
-	}
+	svcTier := serviceTierFor(tier)
 
 	var res ClassifyResult
 	if debug {
@@ -513,8 +528,8 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 				reqPayload["system"] = []map[string]string{{"text": t.Value}}
 			}
 		}
-		if tier == ClassifyTierFlex {
-			reqPayload["serviceTier"] = map[string]string{jsonTypeKey: ClassifyTierFlex}
+		if tier == TierFlex {
+			reqPayload["serviceTier"] = map[string]string{jsonTypeKey: TierFlex}
 		}
 		reqJSON, marshalErr := json.Marshal(reqPayload)
 		if marshalErr != nil {
@@ -523,15 +538,10 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		res.RequestJSON = string(reqJSON)
 	}
 
-	subject := email.Subject
-	if len(subject) > 60 {
-		subject = subject[:60]
-	}
 	tierLabel := tier
 	if tierLabel == "" {
-		tierLabel = ClassifyTierStandard
+		tierLabel = TierStandard
 	}
-	store.Log("INFO", fmt.Sprintf("LLM classifying '%s' against %d rule(s) (model: %s, tier: %s)", subject, len(prompts), model, tierLabel))
 
 	// The Lambda invoking this has a hard 900s (15min) ceiling; bedrockHTTPTimeout aborts
 	// a stuck Converse call ~1min before that so the error below can still be logged
@@ -553,12 +563,18 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		store.Log("ERROR", fmt.Sprintf("LLM request failed after %dms (tier: %s): %v", res.LatencyMs, tierLabel, err))
 		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
 	}
-	logUsage(store, &res, out.Usage, tierLabel)
+	tokenFragment := recordUsage(&res, out.Usage)
 
 	raw := extractText(out.Output)
 	res.ReasoningDetected = detectReasoning(out.Output, raw)
-	store.Log("INFO", fmt.Sprintf("LLM classify reasoning: suppressed=%v", !res.ReasoningDetected))
-	combined := fmt.Sprintf("LLM classify: %dms (tier: %s), content=%d chars", res.LatencyMs, tierLabel, len(raw))
+	// One summary line per call. The "reasoning: suppressed=true/false" phrasing is
+	// load-bearing: the settings page's reasoning-override help text tells the user to
+	// look for exactly that in the logs.
+	combined := fmt.Sprintf("LLM classify: %dms", res.LatencyMs)
+	if tokenFragment != "" {
+		combined += ", " + tokenFragment
+	}
+	combined += fmt.Sprintf(", reasoning: suppressed=%v, content=%d chars (tier: %s)", !res.ReasoningDetected, len(raw), tierLabel)
 	// Response previews/dumps can quote email content back, so they're persisted to the
 	// (auth-gated, TTL'd) log rows only under DEBUG_LOGGING — defense in depth.
 	if debug && len(raw) > 0 {
@@ -628,6 +644,7 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 			MaxTokens:   aws.Int32(2048),
 			Temperature: aws.Float32(0.7),
 		},
+		ServiceTier: serviceTierFor(c.resolveImproveTier(ctx)),
 	})
 	if err != nil {
 		return err
@@ -711,6 +728,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			MaxTokens:   aws.Int32(16384),
 			Temperature: aws.Float32(0.4),
 		},
+		ServiceTier: serviceTierFor(c.resolveImproveTier(ctx)),
 	})
 	if err != nil {
 		return "", nil, err

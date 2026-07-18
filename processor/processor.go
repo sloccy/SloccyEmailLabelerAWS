@@ -345,8 +345,9 @@ func processEmail(
 
 	logs := []db.LogEntry{{
 		Level: logInfo,
-		Message: fmt.Sprintf("[%s] Classifying: '%s' from %s",
-			account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60)),
+		Message: fmt.Sprintf("[%s] Classifying: '%s' from %s against %d rule(s) (model: %s, tier: %s)",
+			account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60),
+			len(llmPrompts), model, tier),
 	}}
 
 	// Buffer the classify call's own log lines instead of writing each one straight to

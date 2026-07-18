@@ -42,7 +42,7 @@ func NewFakeErrorClient() *FakeClient {
 }
 
 func (c *FakeClient) ResolveClassifySettings(_ context.Context) (model, tier, reasoningOverride string) {
-	return c.model, ClassifyTierStandard, ""
+	return c.model, TierStandard, ""
 }
 
 func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Email, prompts []Prompt, _, _, _ string, _ bool) (ClassifyResult, error) {
