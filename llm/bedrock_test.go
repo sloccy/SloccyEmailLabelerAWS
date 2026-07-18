@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
@@ -167,7 +168,7 @@ func TestClassifyEmailBatch_ParsesTextResponse(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestClassifyEmailBatch_CallFails(t *testing.T) {
 		errs: []error{errors.New("ThrottlingException: rate exceeded")},
 	}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err == nil {
 		t.Fatal("expected error when the Converse call fails")
 	}
@@ -206,7 +207,7 @@ func TestClassifyEmailBatch_AppliesReasoningDirectiveFromRegistry(t *testing.T) 
 		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -225,7 +226,7 @@ func TestClassifyEmailBatch_ReasoningOverrideBeatsRegistry(t *testing.T) {
 		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "/custom_switch", false)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "/custom_switch", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -240,7 +241,7 @@ func TestClassifyEmailBatch_NoDirectiveForUnknownModel(t *testing.T) {
 		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
 	}
 	c := &Client{br: fake, defaultModel: "meta.llama3-1-70b-instruct-v1:0"}
-	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	_, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -291,7 +292,7 @@ func TestClassifyEmailBatch_TimeoutLoggedOnce(t *testing.T) {
 	fake := &fakeConverseAPI{errs: []error{fakeTimeoutError{}}}
 	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
 	logger := &recordingLogger{}
-	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err == nil {
 		t.Fatal("expected error when the call times out")
 	}
@@ -303,6 +304,42 @@ func TestClassifyEmailBatch_TimeoutLoggedOnce(t *testing.T) {
 	}
 	if timeoutLogs != 1 {
 		t.Errorf("expected exactly 1 TIMEOUT log entry, got %d: %v", timeoutLogs, logger.entries)
+	}
+}
+
+func TestClassifyEmailBatch_SingleSummaryLogLine(t *testing.T) {
+	// A successful classify emits exactly one INFO line — the merged summary carrying
+	// latency, tokens, reasoning suppression, and tier. "reasoning: suppressed=" must
+	// appear verbatim: the settings page tells the user to grep the logs for it.
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{
+			textOutput(`{"1": false, "2": true}`),
+		},
+	}
+	fake.outputs[0].Usage = &types.TokenUsage{
+		InputTokens:  aws.Int32(965),
+		OutputTokens: aws.Int32(31),
+		TotalTokens:  aws.Int32(996),
+	}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	logger := &recordingLogger{}
+	_, err := c.ClassifyEmailBatch(context.Background(), logger, testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
+	if err != nil {
+		t.Fatalf("ClassifyEmailBatch error: %v", err)
+	}
+	var infoLines []string
+	for _, e := range logger.entries {
+		if strings.HasPrefix(e, "INFO: ") {
+			infoLines = append(infoLines, e)
+		}
+	}
+	if len(infoLines) != 1 {
+		t.Fatalf("expected exactly 1 INFO log entry, got %d: %v", len(infoLines), logger.entries)
+	}
+	for _, want := range []string{"tokens input=965 output=31 total=996", "reasoning: suppressed=", "(tier: standard)"} {
+		if !strings.Contains(infoLines[0], want) {
+			t.Errorf("summary line missing %q: %s", want, infoLines[0])
+		}
 	}
 }
 
@@ -350,7 +387,7 @@ func TestClassifyEmailBatch_ParsesThinkBlockPreamble(t *testing.T) {
 		},
 	}
 	c := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0"}
-	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, ClassifyTierStandard, "", false)
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
@@ -362,6 +399,43 @@ func TestClassifyEmailBatch_ParsesThinkBlockPreamble(t *testing.T) {
 	}
 	if !res.ReasoningDetected {
 		t.Errorf("ReasoningDetected = false, want true (response contains a <think> block)")
+	}
+}
+
+func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testing.T) {
+	cases := []struct {
+		name     string
+		settings Settings
+		wantFlex bool
+	}{
+		{"default (unset) is standard", &fixedSettings{}, false},
+		{"improve_tier=flex sends flex service tier", &multiSettings{vals: map[string]string{SettingImproveTier: TierFlex}}, true},
+		{"improve_tier=standard sends no service tier", &multiSettings{vals: map[string]string{SettingImproveTier: TierStandard}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+			cl := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0", settings: c.settings}
+			_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+				PromptName: "newsletter", LabelName: "News", TriggerKind: "false_negative",
+				OriginalInstructions: "matches newsletters",
+				EmailSender:          "a@example.com", EmailSubject: "hello", EmailBody: "world",
+			})
+			if err != nil {
+				t.Fatalf("ImprovePromptInstructions error: %v", err)
+			}
+			if len(fake.calls) != 1 {
+				t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+			}
+			got := fake.calls[0].ServiceTier
+			if c.wantFlex {
+				if got == nil || got.Type != types.ServiceTierTypeFlex {
+					t.Errorf("ServiceTier = %+v, want flex", got)
+				}
+			} else if got != nil {
+				t.Errorf("ServiceTier = %+v, want nil (implicit standard)", got)
+			}
+		})
 	}
 }
 

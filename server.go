@@ -586,21 +586,23 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	return models
 }
 
-// classifyModelAllowed mirrors the geo/tier policy rendered into the two <select>s in
-// settings_form.html: Standard is limited to single-datacenter, US-, or Global-routed
-// models; Flex accepts any flex-capable model regardless of routing region.
-func classifyModelAllowed(m llm.ModelOption, tier string) bool {
-	if tier == llm.ClassifyTierFlex {
+// modelAllowedForTier mirrors the geo/tier policy rendered into the per-tier <select>s in
+// settings_form.html (classify and improve alike): Standard is limited to
+// single-datacenter, US-, or Global-routed models; Flex accepts any flex-capable model
+// regardless of routing region.
+func modelAllowedForTier(m llm.ModelOption, tier string) bool {
+	if tier == llm.TierFlex {
 		return m.Flex
 	}
 	return m.ProfileRegion == "" || m.ProfileRegion == "us" || m.ProfileRegion == "global"
 }
 
-func settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
 		"ClassifyModel":      classifyModel,
 		"ImproveModel":       improveModel,
 		"ClassifyTier":       classifyTier,
+		"ImproveTier":        improveTier,
 		"ReasoningDirective": reasoningDirective,
 		"Models":             models,
 	}
@@ -631,11 +633,12 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings := s.loadSettings(ctx)
 	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
-	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.ClassifyTierStandard)
+	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
+	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
 	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective, models), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models), "")
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -653,29 +656,37 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}
-	validID := func(id string) bool { return findModel(id) != nil }
 
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
 	// classify_model choice: the two tiers have different eligible-model policies (see
-	// classifyModelAllowed) enforced below.
-	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.ClassifyTierStandard)
-	if v := r.FormValue("classify_tier"); v == llm.ClassifyTierStandard || v == llm.ClassifyTierFlex {
+	// modelAllowedForTier) enforced below.
+	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
+	if v := r.FormValue("classify_tier"); v == llm.TierStandard || v == llm.TierFlex {
 		classifyTier = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyTier, Value: v})
 	}
 
 	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	if v := r.FormValue("classify_model"); v != "" {
-		if m := findModel(v); m != nil && classifyModelAllowed(*m, classifyTier) {
+		if m := findModel(v); m != nil && modelAllowedForTier(*m, classifyTier) {
 			classifyModel = v
 			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
 		}
 	}
 
+	// Prompt-improver tier + model — same standard/flex policy as classification above.
+	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
+	if v := r.FormValue("improve_tier"); v == llm.TierStandard || v == llm.TierFlex {
+		improveTier = v
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveTier, Value: v})
+	}
+
 	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
-	if v := r.FormValue("improve_model"); v != "" && validID(v) {
-		improveModel = v
-		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
+	if v := r.FormValue("improve_model"); v != "" {
+		if m := findModel(v); m != nil && modelAllowedForTier(*m, improveTier) {
+			improveModel = v
+			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
+		}
 	}
 
 	// Reasoning-suppression override: free text, no validation beyond trimming — it's an
@@ -685,7 +696,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	reasoningDirective := strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, reasoningDirective, models)
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models)
 	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
 }
 

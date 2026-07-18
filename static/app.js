@@ -312,26 +312,28 @@ function handleConfigImport(input) {
     });
 }
 
-// ---- Classification model: Standard/Flex tier toggle ----
+// ---- Classification / prompt-improver models: Standard/Flex tier toggles ----
 // The settings form is HTMX-swapped, so this is a document-level delegated handler rather
-// than one bound to the (re-rendered) button elements directly.
+// than one bound to the (re-rendered) button elements directly. The toggle's id prefix
+// ("classify" or "improve") selects which hidden input and dropdown pair it drives.
 document.addEventListener('click', function(e) {
-  const btn = e.target.closest('#classify-tier-toggle button[data-tier]');
+  const btn = e.target.closest('#classify-tier-toggle button[data-tier], #improve-tier-toggle button[data-tier]');
   if (!btn) return;
   const tier = btn.dataset.tier;
   const form = btn.closest('form');
   if (!form) return;
+  const prefix = btn.closest('.btn-group').id.replace('-tier-toggle', '');
 
   // Resolve everything relative to the clicked button's own form, rather than via
   // document-wide getElementById — that's what makes this robust to any duplicate/stale
   // copy of these ids elsewhere in the DOM (the prior global lookup could silently mutate
   // the wrong instance, making the button appear to do nothing).
   btn.closest('.btn-group').querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
-  const tierInput = form.querySelector('[name="classify_tier"]');
+  const tierInput = form.querySelector('[name="' + prefix + '_tier"]');
   if (tierInput) tierInput.value = tier;
 
-  const standardSel = form.querySelector('#classify-model-standard');
-  const flexSel = form.querySelector('#classify-model-flex');
+  const standardSel = form.querySelector('#' + prefix + '-model-standard');
+  const flexSel = form.querySelector('#' + prefix + '-model-flex');
   const showFlex = tier === 'flex';
   standardSel.classList.toggle('d-none', showFlex);
   standardSel.disabled = showFlex;

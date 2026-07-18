@@ -22,10 +22,20 @@
       </div>
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Prompt improver model</div>
-        <div class="small text-muted mt-1">Bedrock model used for "Generate instruction" and "Improve rule". A smarter model here is fine since it runs infrequently.</div>
-        <select class="form-select form-select-sm mt-2" name="improve_model" style="min-width:300px;">
-          {{range .Models}}{{if ge .InputCostPer1M 0.0}}
+        <div class="small text-muted mt-1">Bedrock model used for "Generate instruction" and "Improve rule". A smarter model here is fine since it runs infrequently. Same <strong>Standard</strong>/<strong>Flex</strong> tiers as classification — flex is discounted but lower-priority, which is fine for these occasional interactive calls.</div>
+        <input type="hidden" name="improve_tier" id="improve-tier-input" value="{{.ImproveTier}}">
+        <div class="btn-group btn-group-sm mt-2 mb-2" role="group" aria-label="Prompt improver tier" id="improve-tier-toggle">
+          <button type="button" class="btn btn-outline-primary{{if ne .ImproveTier "flex"}} active{{end}}" data-tier="standard">Standard</button>
+          <button type="button" class="btn btn-outline-primary{{if eq .ImproveTier "flex"}} active{{end}}" data-tier="flex">Flex</button>
+        </div>
+        <select class="form-select form-select-sm{{if eq .ImproveTier "flex"}} d-none{{end}}" name="improve_model" id="improve-model-standard" style="min-width:300px;"{{if eq .ImproveTier "flex"}} disabled{{end}}>
+          {{range .Models}}{{if and (or (eq .ProfileRegion "") (eq .ProfileRegion "us") (eq .ProfileRegion "global")) (ge .InputCostPer1M 0.0)}}
           <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .InputCostPer1M}}/1M in</option>
+          {{end}}{{end}}
+        </select>
+        <select class="form-select form-select-sm{{if ne .ImproveTier "flex"}} d-none{{end}}" name="improve_model" id="improve-model-flex" style="min-width:300px;"{{if ne .ImproveTier "flex"}} disabled{{end}}>
+          {{range .Models}}{{if and .Flex (ge .FlexCostPer1M 0.0)}}
+          <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — ${{printf "%.3f" .FlexCostPer1M}}/1M in (flex)</option>
           {{end}}{{end}}
         </select>
       </div>

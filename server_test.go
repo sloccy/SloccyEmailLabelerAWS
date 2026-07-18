@@ -175,7 +175,7 @@ func TestGenerateToken(t *testing.T) {
 	})
 }
 
-func TestClassifyModelAllowed(t *testing.T) {
+func TestModelAllowedForTier(t *testing.T) {
 	bare := llm.ModelOption{ID: "google.gemma-3-4b-it", Flex: true}                                   // single-datacenter, flex-capable
 	usProfile := llm.ModelOption{ID: "us.amazon.nova-pro-v1:0", ProfileRegion: "us"}                  // US-routed, not flex
 	globalProfile := llm.ModelOption{ID: "global.anthropic.claude-opus-4-8", ProfileRegion: "global"} // Global-routed, not flex
@@ -188,22 +188,77 @@ func TestClassifyModelAllowed(t *testing.T) {
 		tier  string
 		want  bool
 	}{
-		{"standard: bare model allowed", bare, llm.ClassifyTierStandard, true},
-		{"standard: us profile allowed", usProfile, llm.ClassifyTierStandard, true},
-		{"standard: global profile allowed", globalProfile, llm.ClassifyTierStandard, true},
-		{"standard: eu profile rejected", euProfile, llm.ClassifyTierStandard, false},
-		{"standard: apac profile rejected", apacNonFlex, llm.ClassifyTierStandard, false},
-		{"flex: flex-capable bare model allowed regardless of (lack of) profile", bare, llm.ClassifyTierFlex, true},
-		{"flex: non-flex us profile rejected", usProfile, llm.ClassifyTierFlex, false},
-		{"flex: non-flex global profile rejected", globalProfile, llm.ClassifyTierFlex, false},
-		{"flex: flex-capable eu profile allowed — any geo eligible for flex", euProfile, llm.ClassifyTierFlex, true},
-		{"flex: non-flex apac profile rejected", apacNonFlex, llm.ClassifyTierFlex, false},
+		{"standard: bare model allowed", bare, llm.TierStandard, true},
+		{"standard: us profile allowed", usProfile, llm.TierStandard, true},
+		{"standard: global profile allowed", globalProfile, llm.TierStandard, true},
+		{"standard: eu profile rejected", euProfile, llm.TierStandard, false},
+		{"standard: apac profile rejected", apacNonFlex, llm.TierStandard, false},
+		{"flex: flex-capable bare model allowed regardless of (lack of) profile", bare, llm.TierFlex, true},
+		{"flex: non-flex us profile rejected", usProfile, llm.TierFlex, false},
+		{"flex: non-flex global profile rejected", globalProfile, llm.TierFlex, false},
+		{"flex: flex-capable eu profile allowed — any geo eligible for flex", euProfile, llm.TierFlex, true},
+		{"flex: non-flex apac profile rejected", apacNonFlex, llm.TierFlex, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyModelAllowed(c.model, c.tier); got != c.want {
-				t.Errorf("classifyModelAllowed(%+v, %q) = %v, want %v", c.model, c.tier, got, c.want)
+			if got := modelAllowedForTier(c.model, c.tier); got != c.want {
+				t.Errorf("modelAllowedForTier(%+v, %q) = %v, want %v", c.model, c.tier, got, c.want)
 			}
 		})
 	}
+}
+
+// TestSettingsFormRendersTierControls executes the real settings_form.html fragment with
+// settingsTemplateData and checks both models' Standard/Flex controls come out wired the
+// way app.js and handleUpdateSettings expect (hidden tier inputs, per-tier selects with
+// the inactive one disabled).
+func TestSettingsFormRendersTierControls(t *testing.T) {
+	tmpl, err := loadTemplates()
+	if err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+	models := []llm.ModelOption{
+		{ID: "us.amazon.nova-micro-v1:0", Label: "Nova Micro", ProfileRegion: "us", InputCostPer1M: 0.035, FlexCostPer1M: 0.017, Flex: true},
+		{ID: "eu.some.model", Label: "EU Model", ProfileRegion: "eu", InputCostPer1M: 0.5, FlexCostPer1M: 0.25, Flex: true},
+	}
+
+	render := func(classifyTier, improveTier string) string {
+		var sb strings.Builder
+		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", models)
+		if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
+			t.Fatalf("ExecuteTemplate: %v", err)
+		}
+		return sb.String()
+	}
+
+	t.Run("both standard", func(t *testing.T) {
+		out := render(llm.TierStandard, llm.TierStandard)
+		for _, want := range []string{
+			`name="classify_tier"`, `name="improve_tier"`,
+			`id="classify-tier-toggle"`, `id="improve-tier-toggle"`,
+			`id="improve-model-standard"`, `id="improve-model-flex"`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered form missing %s", want)
+			}
+		}
+		// Standard tier: the flex select is the hidden/disabled one.
+		if !strings.Contains(out, `id="improve-model-flex" style="min-width:300px;" disabled`) {
+			t.Error("improve flex select should be disabled when improve tier is standard")
+		}
+		// EU model must not appear in the standard improve dropdown (policy mirror of classify).
+		if strings.Count(out, "eu.some.model") != 2 { // once per flex select (classify + improve)
+			t.Errorf("eu model should appear only in the two flex selects, found %d occurrences", strings.Count(out, "eu.some.model"))
+		}
+	})
+
+	t.Run("improve flex", func(t *testing.T) {
+		out := render(llm.TierStandard, llm.TierFlex)
+		if !strings.Contains(out, `id="improve-model-standard" style="min-width:300px;" disabled`) {
+			t.Error("improve standard select should be disabled when improve tier is flex")
+		}
+		if strings.Contains(out, `id="improve-model-flex" style="min-width:300px;" disabled`) {
+			t.Error("improve flex select should be enabled when improve tier is flex")
+		}
+	})
 }
