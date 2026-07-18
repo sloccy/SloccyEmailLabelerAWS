@@ -9,7 +9,7 @@
 
 ---
 
-OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a schedule, and runs each email through rules you define in plain English. An LLM on **Amazon Bedrock** (model selectable in Settings) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, marking as spam, or marking as read.
+OllaMail connects to your Gmail accounts via OAuth, processes new mail the moment it arrives (Gmail push via Pub/Sub, with a daily catch-up scan as a safety net), and runs each email through rules you define in plain English. An LLM on **Amazon Bedrock** (model selectable in Settings) decides whether each rule applies and performs the matching action automatically — applying Gmail labels, archiving, trashing, marking as spam, or marking as read.
 
 > **Migrated from local Ollama:** this app began as a self-hosted Ollama + SQLite + Docker project. It now runs entirely on AWS — Lambda for compute, DynamoDB for storage, and Bedrock for inference. The name is retained for continuity.
 
@@ -21,7 +21,11 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
 - **Drag-and-drop rule ordering** — control the order in which rules are evaluated
 - **Per-account or global rules** — scope a rule to a specific account or apply it across all accounts
 - **AI prompt builder** — describe what you want to catch in plain English; the LLM writes the classifier instruction for you (streaming output)
+- **AI rule improvement** — flag a mislabeled email from History and the LLM proposes a rewritten rule; review, comment, and apply from the Prompt Updates page
+- **Real-time labeling** — optional Gmail push (Pub/Sub → Lambda webhook) processes mail seconds after arrival
 - **Batch classification** — all rules for an email are evaluated in a single Bedrock call for efficiency
+- **Standard/Flex Bedrock tiers** — run classification and the prompt improver on Bedrock's discounted flex tier, selectable per model in Settings
+- **Reasoning suppression** — chain-of-thought models (Qwen3, Nemotron, …) are automatically told to skip reasoning output, with a manual override for unrecognized model families
 - **Multiple accounts** — add as many Gmail accounts as you like via OAuth
 - **Web UI** — manage accounts, rules, retention, settings, and logs from a browser
 - **Auto-label creation** — labels are created in Gmail automatically if they don't exist
@@ -36,31 +40,35 @@ OllaMail connects to your Gmail accounts via OAuth, scans recent emails on a sch
 ## Architecture
 
 ```
-                Function URL (AWS_IAM)          EventBridge Scheduler
-                        │                          rate(1 minute)
-                        ▼                                 │
-                ┌───────────────┐               ┌─────────▼─────────┐
-                │  WebFunction  │               │   ScanFunction    │
-                │  (MODE=web)   │               │   (MODE=scan)     │
-                │  HTMX web UI  │               │  scanOnce() pass  │
-                └───────┬───────┘               └─────────┬─────────┘
-                        │                                 │
-             ┌──────────┴───────────┬─────────────────────┤
-             ▼                      ▼                     ▼
-      ┌─────────────┐       ┌───────────────┐     ┌──────────────┐
-      │  DynamoDB   │       │    Bedrock    │     │  Gmail API   │
-      │  `ollamail` │       │  Converse API │     │  (OAuth 2.0) │
-      └─────────────┘       └───────────────┘     └──────────────┘
-                                    ▲
-                        SSM SecureString /ollamail/credentials
-                          (Google OAuth client JSON)
+   Function URL                EventBridge Scheduler      Gmail push → Pub/Sub
+   (AWS_IAM, or CloudFront      cron(0 2 * * ? *)         (OIDC-verified POST)
+    + Cloudflare Access)        America/New_York                  │
+           │                           │                          │
+           ▼                           ▼                          ▼
+   ┌───────────────┐          ┌─────────────────┐        ┌─────────────────┐
+   │  WebFunction  │          │  ScanFunction   │        │  PushFunction   │
+   │  (MODE=web)   │          │  (MODE=scan)    │        │  (MODE=push)    │
+   │  HTMX web UI  │          │ daily catch-up  │        │ per-message,    │
+   │               │          │ + watch renewal │        │ real-time       │
+   └───────┬───────┘          └────────┬────────┘        └────────┬────────┘
+           │                           │                          │
+           └──────────┬────────────────┴──────────┬───────────────┘
+                      ▼                           ▼
+        ┌─────────────┬───────────────┬──────────────┐
+        │  DynamoDB   │    Bedrock    │  Gmail API   │
+        │  `ollamail` │  Converse API │  (OAuth 2.0) │
+        └─────────────┴───────────────┴──────────────┘
+                              ▲
+                  SSM SecureStrings: /ollamail/credentials (client JSON)
+                     + /ollamail/accounts/<id>/token (per-account)
 ```
 
-- **Two image-based Lambdas**, both built from the same `Dockerfile` (`x86_64`):
-  - **WebFunction** — serves the management UI, exposed via a **Lambda Function URL** locked to `AuthType: AWS_IAM` (nothing is public; browse it via a local SigV4 proxy).
-  - **ScanFunction** — triggered by **EventBridge on a fixed `rate(1 minute)` schedule**. Runs one labeling pass (`scanOnce`) per invocation. Overlapping runs are safe — processed emails are deduped in DynamoDB.
-- **DynamoDB** single-table `ollamail` (on-demand, TTL enabled) — accounts, rules, history, logs, retention, suggestions. Per-account Gmail OAuth tokens are **not** in the table: they live as SSM SecureStrings under `/ollamail/accounts/<id>/token`, so table read access alone can't exfiltrate mailbox credentials.
-- **Amazon Bedrock** — classification and the prompt builder (model selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured).
+- **Three image-based Lambdas**, all built from the same `Dockerfile` (`x86_64`):
+  - **WebFunction** — serves the management UI via a **Lambda Function URL**. Two auth modes (see [Open the web interface](#5-open-the-web-interface)): `AWS_IAM` (default; browse via a local SigV4 proxy) or, when the `CfAccessAud` stack parameter is set, a **CloudFront distribution behind Cloudflare Access** with the app verifying the Access JWT on every request.
+  - **ScanFunction** — triggered by **EventBridge daily at 2 AM Eastern**. Runs one catch-up labeling pass (`scanOnce`) per invocation and renews Gmail `watch()` registrations. Overlapping runs are safe — processed emails are deduped in DynamoDB.
+  - **PushFunction** — public Function URL that receives Gmail push notifications from Pub/Sub (OIDC-verified) and processes just the affected account immediately. This is the primary labeling path when push is configured (step 3b).
+- **DynamoDB** single-table `ollamail` (provisioned 2 RCU / 2 WCU — inside the always-free tier; TTL enabled) — accounts, rules, history, logs, retention, suggestions. Per-account Gmail OAuth tokens are **not** in the table: they live as SSM SecureStrings under `/ollamail/accounts/<id>/token`, so table read access alone can't exfiltrate mailbox credentials.
+- **Amazon Bedrock** — classification, the prompt builder, and rule improvement (models and Standard/Flex service tier selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured).
 - **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
 
 > **Scan cadence is fixed in the template** (`template.yaml`, `cron(0 2 * * ? *)` at `America/New_York`, i.e. 2 AM Eastern — off-peak for Bedrock flex-tier traffic). There is no user-configurable poll interval — to change cadence, edit the `ScanSchedule` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
@@ -154,14 +162,18 @@ Once set, each account registers a Gmail `watch()` on OAuth connect (and the dai
 
 ### 4. Deploy
 
-Deploys happen automatically via GitHub Actions (`.github/workflows/deploy.yml`) on push to `main`, using OIDC role assumption (no stored keys). To deploy manually:
+Deploys happen automatically via GitHub Actions (`.github/workflows/deploy.yml`) on push to `main`, using OIDC role assumption (no stored keys); the workflow can also be run manually from the Actions tab (`workflow_dispatch`). To deploy manually:
 
 ```bash
 sam build
 sam deploy   # uses samconfig.toml: stack `ollamail`, region us-east-2
 ```
 
-Outputs include the **WebFunctionUrl** (the AWS_IAM-protected Function URL) and the DynamoDB table name.
+Outputs include the **WebFunctionUrl** (Function URL), **WebDistributionDomain** (CloudFront, only when Cloudflare Access is enabled), **PushFunctionUrl**, and the DynamoDB table name.
+
+#### Dependency updates (security-only)
+
+Routine version bumps are disabled. Dependencies move only for security reasons: a weekly `govulncheck` workflow (shared from `sloccy/shared-ci`) bumps modules with *called* vulnerable code to the minimum fixed version and opens an auto-merging PR, and Dependabot handles advisory-driven security updates. Both flows need the `WORKFLOW_TOKEN` repo secret (a fine-grained PAT with Contents + Pull requests read/write) — bot-created events can't trigger CI or the deploy workflow, so without it the PRs stall until a human intervenes.
 
 #### Backups
 
@@ -171,7 +183,9 @@ There is no PITR on the DynamoDB table (deliberate — it bills per GB-month). T
 
 ### 5. Open the web interface
 
-The Function URL is locked to `AWS_IAM`, so it can only be reached with SigV4-signed requests. Use the bundled signing proxy:
+Two access modes, chosen by the `CfAccessAud` stack parameter:
+
+**Default (`AWS_IAM`)** — the Function URL only accepts SigV4-signed requests. Use the bundled signing proxy:
 
 ```bash
 # Ensure your AWS CLI credentials are available, then:
@@ -181,14 +195,17 @@ go run ./tools/sigv4proxy
 
 Flags let you override `-target` (Function URL), `-region`, and `-listen`.
 
+**Cloudflare Access (Zero Trust)** — set the `CfAccessTeamDomain` and `CfAccessAud` stack parameters and redeploy. The template then creates a CloudFront distribution (OAC-signed to the Function URL) and the app verifies the Cloudflare Access JWT on every request (fails closed: with the URL public but the CF vars missing, the server refuses to start). Point a Cloudflare-proxied CNAME at the **WebDistributionDomain** stack output and put a Cloudflare Access application in front of that hostname — the UI is then reachable from any browser after the Access login, no local proxy needed.
+
 | Page | Description |
 |---|---|
 | **Dashboard** | Account/rule counts, scan cadence, recent activity, **Scan Now** |
 | **Accounts** | Add Gmail accounts via OAuth; enable/disable/delete |
 | **Prompts** | Define labeling rules in plain English; drag to reorder |
 | **Builder** | AI prompt builder — describe what to catch, let Bedrock write the classifier |
+| **Prompt Updates** | AI-suggested rule rewrites triggered by recategorized emails; review, comment, regenerate, apply |
 | **History** | Searchable log of every labeling decision; recategorize |
-| **Settings** | Choose Bedrock models; backup/restore config |
+| **Settings** | Choose Bedrock models and Standard/Flex tier per model; reasoning-suppression override; backup/restore config |
 | **Logs** | Per-account processing history; CSV export |
 | **Retention** | Per-label and global email retention rules; label exemptions |
 | **Troubleshooting** | Test rules against sample emails and inspect raw LLM responses |
@@ -213,6 +230,9 @@ Configuration is set via Lambda environment variables (see `template.yaml`).
 | `PUBSUB_TOPIC` | _(empty)_ | `projects/<proj>/topics/<name>`; enables Gmail `watch()` registration/renewal |
 | `PUSH_OIDC_AUDIENCE` | _(empty)_ | Expected OIDC audience on the Pub/Sub push token (the PushFunction URL) |
 | `PUSH_OIDC_SA_EMAIL` | _(empty)_ | Service-account email the push token must be issued by |
+| `CF_ACCESS_TEAM_DOMAIN` | _(empty)_ | Cloudflare Access team domain (`https://<team>.cloudflareaccess.com`); set by the template from `CfAccessTeamDomain` |
+| `CF_ACCESS_AUD` | _(empty)_ | Cloudflare Access application audience (AUD) tag; set by the template from `CfAccessAud` |
+| `AUTH_MODE` | _(set by template)_ | `iam` or `cfaccess` — mirrors the Function URL auth decision so the app can fail closed if the CF vars drift |
 | `CLASSIFY_CONCURRENCY` | `6` | Max emails classified against Bedrock in parallel per account |
 | `DEBUG_LOGGING` | `0` | Set to `1` for verbose logging |
 
@@ -235,8 +255,8 @@ Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-veri
 ## Development Setup
 
 ```bash
-git clone https://github.com/sloccy/OllaMail.git
-cd OllaMail
+git clone https://github.com/sloccy/SloccyEmailLabelerAWS.git
+cd SloccyEmailLabelerAWS
 
 # Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (Dependabot-managed)
 # and fetched into static/vendor/ at build time — run once before serving the UI locally:
@@ -263,10 +283,12 @@ go run .        # serves on :5000 (or $AWS_LWA_PORT)
 | Component | Technology |
 |---|---|
 | Compute | AWS Lambda (container images, `x86_64`) + Lambda Web Adapter |
-| Scheduling | EventBridge Scheduler (`rate(1 minute)`) |
+| Real-time trigger | Gmail `watch()` → Cloud Pub/Sub → PushFunction (OIDC-verified) |
+| Scheduling | EventBridge Scheduler (daily `cron(0 2 * * ? *)` America/New_York) |
 | Backend | Go 1.25, net/http (stdlib) |
 | UI | Bootstrap 5.3 (dark mode) + HTMX 2.0 |
-| Database | DynamoDB (single-table, on-demand, TTL) |
+| Web UI access | SigV4 proxy (AWS_IAM), or CloudFront + Cloudflare Access (optional) |
+| Database | DynamoDB (single-table, provisioned 2 RCU/2 WCU free-tier, TTL) |
 | LLM runtime | Amazon Bedrock (model selectable in Settings) |
 | Gmail integration | Google OAuth 2.0 + Gmail REST API |
 | Secrets | SSM Parameter Store (SecureString) |
