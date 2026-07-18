@@ -63,7 +63,7 @@ OllaMail connects to your Gmail accounts via OAuth, processes new mail the momen
                      + /ollamail/accounts/<id>/token (per-account)
 ```
 
-- **Three image-based Lambdas**, all built from the same `Dockerfile` (`x86_64`):
+- **Three zip-packaged Lambdas** (`provided.al2023` custom runtime on **arm64/Graviton** — ~20% cheaper per GB-second than x86), all built from the same Go binary (`Makefile` cross-compiles `GOARCH=arm64`; the `MODE` env var selects behavior at runtime):
   - **WebFunction** — serves the management UI via a **Lambda Function URL**. Two auth modes (see [Open the web interface](#5-open-the-web-interface)): `AWS_IAM` (default; browse via a local SigV4 proxy) or, when the `CfAccessAud` stack parameter is set, a **CloudFront distribution behind Cloudflare Access** with the app verifying the Access JWT on every request.
   - **ScanFunction** — triggered by **EventBridge daily at 2 AM Eastern**. Runs one catch-up labeling pass (`scanOnce`) per invocation and renews Gmail `watch()` registrations. Overlapping runs are safe — processed emails are deduped in DynamoDB.
   - **PushFunction** — public Function URL that receives Gmail push notifications from Pub/Sub (OIDC-verified) and processes just the affected account immediately. This is the primary labeling path when push is configured (step 3b).
@@ -79,7 +79,7 @@ OllaMail connects to your Gmail accounts via OAuth, processes new mail the momen
 
 - An AWS account with Bedrock model access enabled for the chosen model (see step 3).
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and AWS credentials configured.
-- Docker (SAM builds the Lambda container images locally).
+- Go 1.25+ (`sam build` cross-compiles the Lambda binary via the `Makefile` — no Docker needed).
 - A Google Cloud project (free tier is fine).
 
 ---
@@ -282,7 +282,7 @@ go run .        # serves on :5000 (or $AWS_LWA_PORT)
 
 | Component | Technology |
 |---|---|
-| Compute | AWS Lambda (container images, `x86_64`) + Lambda Web Adapter |
+| Compute | AWS Lambda (zip, `provided.al2023`, `arm64`/Graviton) + Lambda Web Adapter layer |
 | Real-time trigger | Gmail `watch()` → Cloud Pub/Sub → PushFunction (OIDC-verified) |
 | Scheduling | EventBridge Scheduler (daily `cron(0 2 * * ? *)` America/New_York) |
 | Backend | Go 1.25, net/http (stdlib) |
