@@ -164,3 +164,23 @@ func TestCleanup_GlobalRetention(t *testing.T) {
 		t.Error("expected trash call for global retention rule")
 	}
 }
+
+func TestClampDays(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want int
+	}{
+		{-5, 1}, // negative would build a future before: date matching all mail
+		{0, 1},
+		{1, 1},
+		{30, 30},
+		{maxRetentionDays, maxRetentionDays},
+		{maxRetentionDays + 1, maxRetentionDays},
+		{1 << 40, maxRetentionDays}, // would truncate on 32-bit int without the clamp
+	}
+	for _, c := range cases {
+		if got := clampDays(c.in); got != c.want {
+			t.Errorf("clampDays(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}

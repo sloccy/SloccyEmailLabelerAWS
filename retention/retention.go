@@ -12,6 +12,24 @@ import (
 const maxRetentionIDs = 2500
 const maxPages = 5
 
+// maxRetentionDays caps a rule's day count at 100 years — far beyond any real mailbox.
+const maxRetentionDays = 36500
+
+// clampDays bounds a stored retention day-count to [1, maxRetentionDays] before the
+// int64->int conversion. The write path validates days > 0, but rows also arrive via
+// config import, and DynamoDB stores int64: an unchecked conversion truncates on 32-bit
+// platforms (CodeQL go/incorrect-integer-conversion), and a negative value would make
+// FetchEmailsOlderThan's before: date land in the future — a query matching every email.
+func clampDays(d int64) int {
+	if d < 1 {
+		return 1
+	}
+	if d > maxRetentionDays {
+		return maxRetentionDays
+	}
+	return int(d)
+}
+
 // Cleanup trashes emails that exceed retention rules for the given account.
 func Cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, accountID int64) {
 	defer func() {
@@ -48,7 +66,7 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 			continue
 		}
 		trashOlderThan(ctx, svc, trashed, "label "+rule.LabelName, func() ([]string, error) {
-			return gmailpkg.FetchEmailsOlderThan(ctx, svc, int(rule.Days), rule.LabelName, nil, maxPages)
+			return gmailpkg.FetchEmailsOlderThan(ctx, svc, clampDays(rule.Days), rule.LabelName, nil, maxPages)
 		})
 	}
 
@@ -71,7 +89,7 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 	}
 
 	trashOlderThan(ctx, svc, trashed, "global", func() ([]string, error) {
-		return gmailpkg.FetchEmailsOlderThan(ctx, svc, int(retention.GlobalDays.Int64), "", excludeLabels, maxPages)
+		return gmailpkg.FetchEmailsOlderThan(ctx, svc, clampDays(retention.GlobalDays.Int64), "", excludeLabels, maxPages)
 	})
 	return nil
 }
