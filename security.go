@@ -10,7 +10,12 @@ import (
 // HTMX templates rely on inline onclick handlers and Bootstrap sets style attributes;
 // html/template's contextual escaping is the primary injection defense, this is the
 // backstop that cuts off external exfiltration and injected <script src> vectors.
-const contentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+// 'unsafe-eval' is also required: htmx compiles every hx-on handler with the Function()
+// constructor, which browsers gate under 'unsafe-eval' regardless of 'unsafe-inline' —
+// without it every hx-on attribute throws EvalError and silently no-ops (e.g. the
+// Recategorize modal never opening). It adds negligible risk on top of 'unsafe-inline',
+// which already lets injected markup run arbitrary script without needing eval.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
 	"style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; " +
 	"object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
