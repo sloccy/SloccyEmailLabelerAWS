@@ -191,8 +191,8 @@ func TestModelAllowedForTier(t *testing.T) {
 		{"standard: bare model allowed", bare, llm.TierStandard, true},
 		{"standard: us profile allowed", usProfile, llm.TierStandard, true},
 		{"standard: global profile allowed", globalProfile, llm.TierStandard, true},
-		{"standard: eu profile rejected", euProfile, llm.TierStandard, false},
-		{"standard: apac profile rejected", apacNonFlex, llm.TierStandard, false},
+		{"standard: eu profile allowed — no geo restriction on standard", euProfile, llm.TierStandard, true},
+		{"standard: apac profile allowed — no geo restriction on standard", apacNonFlex, llm.TierStandard, true},
 		{"flex: flex-capable bare model allowed regardless of (lack of) profile", bare, llm.TierFlex, true},
 		{"flex: non-flex us profile rejected", usProfile, llm.TierFlex, false},
 		{"flex: non-flex global profile rejected", globalProfile, llm.TierFlex, false},
@@ -220,6 +220,7 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 	models := []llm.ModelOption{
 		{ID: "us.amazon.nova-micro-v1:0", Label: "Nova Micro", ProfileRegion: "us", InputCostPer1M: 0.035, FlexCostPer1M: 0.017, Flex: true},
 		{ID: "eu.some.model", Label: "EU Model", ProfileRegion: "eu", InputCostPer1M: 0.5, FlexCostPer1M: 0.25, Flex: true},
+		{ID: "anthropic.claude-unpriced", Label: "Unpriced Model", InputCostPer1M: llm.CostUnknown, FlexCostPer1M: llm.CostUnknown},
 	}
 
 	render := func(classifyTier, improveTier string) string {
@@ -246,9 +247,19 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 		if !strings.Contains(out, `id="improve-model-flex" style="min-width:300px;" disabled`) {
 			t.Error("improve flex select should be disabled when improve tier is standard")
 		}
-		// EU model must not appear in the standard improve dropdown (policy mirror of classify).
-		if strings.Count(out, "eu.some.model") != 2 { // once per flex select (classify + improve)
-			t.Errorf("eu model should appear only in the two flex selects, found %d occurrences", strings.Count(out, "eu.some.model"))
+		// EU model has no geo restriction anymore: it appears in all four selects (classify
+		// standard/flex, improve standard/flex).
+		if strings.Count(out, "eu.some.model") != 4 {
+			t.Errorf("eu model should appear in all four selects, found %d occurrences", strings.Count(out, "eu.some.model"))
+		}
+		// Unpriced model appears in the two standard selects (any Converse model is listed
+		// there) but not in either flex select (not flex-capable), and renders "n/a" instead of
+		// being hidden.
+		if strings.Count(out, "anthropic.claude-unpriced") != 2 {
+			t.Errorf("unpriced model should appear only in the two standard selects, found %d occurrences", strings.Count(out, "anthropic.claude-unpriced"))
+		}
+		if !strings.Contains(out, "Unpriced Model — n/a") {
+			t.Error("unpriced model should render with an n/a price, not be omitted")
 		}
 	})
 
