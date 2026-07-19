@@ -586,17 +586,21 @@ func (s *server) cachedModels(ctx context.Context) []llm.ModelOption {
 	return models
 }
 
-// modelAllowedForTier mirrors the geo/tier policy rendered into the per-tier <select>s in
-// settings_form.html (classify and improve alike): Standard is limited to
-// single-datacenter, US-, or Global-routed models; Flex accepts any flex-capable model
-// regardless of routing region.
+// modelAllowedForTier mirrors the tier policy rendered into the per-tier <select>s in
+// settings_form.html (classify and improve alike): Standard accepts any Converse-capable
+// text model regardless of routing geography; Flex accepts any flex-capable model,
+// likewise regardless of routing geography.
 func modelAllowedForTier(m llm.ModelOption, tier string) bool {
 	if tier == llm.TierFlex {
 		return m.Flex
 	}
-	return m.ProfileRegion == "" || m.ProfileRegion == "us" || m.ProfileRegion == "global"
+	return true
 }
 
+// settingsTemplateData builds the settings_form.html template data. models is used as-is for
+// the Standard selects (already sorted cheapest-first by ListAvailableModels); FlexModels is a
+// copy re-sorted by flex-tier cost (see llm.SortModelsByFlexCost) so the Flex selects sink their
+// own unpriced entries to the bottom instead of inheriting the standard-cost order.
 func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
 		"ClassifyModel":      classifyModel,
@@ -605,6 +609,7 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier
 		"ImproveTier":        improveTier,
 		"ReasoningDirective": reasoningDirective,
 		"Models":             models,
+		"FlexModels":         llm.SortModelsByFlexCost(models),
 	}
 }
 

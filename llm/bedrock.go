@@ -902,17 +902,38 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 	// Sort cheapest input cost first; unpriced (CostUnknown) sinks to the bottom,
 	// tie-broken by label for a stable order.
 	sort.Slice(opts, func(i, j int) bool {
-		ci, cj := opts[i].InputCostPer1M, opts[j].InputCostPer1M
-		iUnknown, jUnknown := ci < 0, cj < 0
-		if iUnknown != jUnknown {
-			return !iUnknown // known prices before unknown
-		}
-		if !iUnknown && ci != cj {
-			return ci < cj
-		}
-		return opts[i].Label < opts[j].Label
+		return costLess(opts[i], opts[j], func(m ModelOption) float64 { return m.InputCostPer1M })
 	})
 	return opts, nil
+}
+
+// costLess orders two models by cost ascending; unpriced (CostUnknown) sinks to the bottom,
+// tie-broken by label for a stable order. cost extracts the price to compare (InputCostPer1M or
+// FlexCostPer1M) — shared by ListAvailableModels' standard-cost sort and SortModelsByFlexCost.
+func costLess(a, b ModelOption, cost func(ModelOption) float64) bool {
+	ca, cb := cost(a), cost(b)
+	aUnknown, bUnknown := ca < 0, cb < 0
+	if aUnknown != bUnknown {
+		return !aUnknown // known prices before unknown
+	}
+	if !aUnknown && ca != cb {
+		return ca < cb
+	}
+	return a.Label < b.Label
+}
+
+// SortModelsByFlexCost returns a copy of opts ordered by flex-tier input cost — cheapest first,
+// unpriced (CostUnknown) flex cost last, tie-broken by label. ListAvailableModels sorts its
+// result by standard on-demand cost (InputCostPer1M); the Settings UI's Flex dropdown needs its
+// own ordering by FlexCostPer1M so a flex-capable model with no published flex price sinks to
+// the bottom of that list rather than inheriting an arbitrary position from the standard sort.
+func SortModelsByFlexCost(opts []ModelOption) []ModelOption {
+	sorted := make([]ModelOption, len(opts))
+	copy(sorted, opts)
+	sort.Slice(sorted, func(i, j int) bool {
+		return costLess(sorted[i], sorted[j], func(m ModelOption) float64 { return m.FlexCostPer1M })
+	})
+	return sorted
 }
 
 // ============================================================
