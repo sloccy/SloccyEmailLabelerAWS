@@ -733,7 +733,7 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 			}
 		case *types.ConverseStreamOutputMemberMessageStop:
 			if e.Value.StopReason == types.StopReasonMaxTokens {
-				return fmt.Errorf("LLM response truncated at max_tokens")
+				return errors.New("LLM response truncated at max_tokens")
 			}
 		}
 	}
@@ -869,9 +869,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 	// of serialized ahead of it.
 	var cat *pricingCatalog
 	var pricingWG sync.WaitGroup
-	pricingWG.Add(1)
-	go func() {
-		defer pricingWG.Done()
+	pricingWG.Go(func() {
 		var pricingErr error
 		cat, pricingErr = fetchPricingCatalog(ctx, c.pricingClient())
 		if pricingErr != nil {
@@ -881,7 +879,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 				flexCapable:         map[string]bool{},
 			}
 		}
-	}()
+	})
 
 	// One unfiltered catalog call: drives the foundation-model list AND supplies the
 	// modality of the models that back each inference profile.
