@@ -201,8 +201,9 @@ func TestClassifyEmailBatch_CallFails(t *testing.T) {
 }
 
 func TestClassifyEmailBatch_AppliesReasoningDirectiveFromRegistry(t *testing.T) {
-	// Model id matches the "qwen" registry entry (reasoning.go) — the system block
-	// should carry the soft-switch automatically, with no setting required.
+	// Model id matches the "qwen" registry entry (reasoning.go) — the system blocks
+	// should carry the invariant role/output-contract first, then the soft-switch
+	// appended automatically, with no setting required.
 	fake := &fakeConverseAPI{
 		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true, "2": false}`)},
 	}
@@ -212,12 +213,12 @@ func TestClassifyEmailBatch_AppliesReasoningDirectiveFromRegistry(t *testing.T) 
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
 	sys := fake.calls[0].System
-	if len(sys) != 1 {
-		t.Fatalf("expected one system content block, got %d", len(sys))
+	if len(sys) != 2 {
+		t.Fatalf("expected two system content blocks (contract + reasoning switch), got %d", len(sys))
 	}
-	block, ok := sys[0].(*types.SystemContentBlockMemberText)
+	block, ok := sys[len(sys)-1].(*types.SystemContentBlockMemberText)
 	if !ok || block.Value != "/no_think" {
-		t.Errorf("System = %#v, want /no_think text block", sys[0])
+		t.Errorf("last System block = %#v, want /no_think text block", sys[len(sys)-1])
 	}
 }
 
@@ -230,9 +231,10 @@ func TestClassifyEmailBatch_ReasoningOverrideBeatsRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
-	block, ok := fake.calls[0].System[0].(*types.SystemContentBlockMemberText)
+	sys := fake.calls[0].System
+	block, ok := sys[len(sys)-1].(*types.SystemContentBlockMemberText)
 	if !ok || block.Value != "/custom_switch" {
-		t.Errorf("System = %#v, want override text block", fake.calls[0].System[0])
+		t.Errorf("last System block = %#v, want override text block", sys[len(sys)-1])
 	}
 }
 
@@ -245,8 +247,34 @@ func TestClassifyEmailBatch_NoDirectiveForUnknownModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClassifyEmailBatch error: %v", err)
 	}
-	if fake.calls[0].System != nil {
-		t.Errorf("System = %#v, want nil for a model not in reasoningRegistry with no override", fake.calls[0].System)
+	sys := fake.calls[0].System
+	if len(sys) != 1 {
+		t.Fatalf("expected exactly one system content block (the invariant contract, no reasoning switch), got %d: %#v", len(sys), sys)
+	}
+	block, ok := sys[0].(*types.SystemContentBlockMemberText)
+	if !ok || block.Value != classifySystemPrompt {
+		t.Errorf("System[0] = %#v, want classifySystemPrompt", sys[0])
+	}
+}
+
+func TestClassifyEmailBatch_MaxTokensTruncationReportedDistinctly(t *testing.T) {
+	// A response with no closing JSON object (e.g. the model ran out of tokens
+	// mid-object) paired with StopReason=max_tokens should surface as a dedicated
+	// truncation error rather than the generic "no JSON object found" one, and
+	// ClassifyResult.StopReason should record it.
+	truncated := textOutput(`{"1": true, "2": fal`)
+	truncated.StopReason = types.StopReasonMaxTokens
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{truncated}}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
+	if err == nil {
+		t.Fatal("expected an error for a truncated, unparseable response")
+	}
+	if !strings.Contains(err.Error(), "truncated at max_tokens") {
+		t.Errorf("err = %q, want it to mention truncation at max_tokens", err.Error())
+	}
+	if res.StopReason != string(types.StopReasonMaxTokens) {
+		t.Errorf("res.StopReason = %q, want %q", res.StopReason, types.StopReasonMaxTokens)
 	}
 }
 
