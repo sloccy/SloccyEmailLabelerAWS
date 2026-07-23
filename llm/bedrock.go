@@ -234,6 +234,14 @@ func serviceTierFor(tier string) *types.ServiceTier {
 	return nil
 }
 
+// requestMetadataFor tags a Converse/ConverseStream call with which flow issued it
+// ("classify", "improve", or "generate"), so Bedrock model-invocation logs/CloudTrail
+// can be filtered by call type when invocation logging is enabled. Purely additive:
+// harmless (and unread) when it isn't.
+func requestMetadataFor(flow string) map[string]string {
+	return map[string]string{"flow": flow}
+}
+
 // ResolveClassifySettings resolves the classify model, service tier, and reasoning-
 // directive override once. Callers classifying many emails in one pass (e.g. a scan)
 // should call this once up front and pass the result into each ClassifyEmailBatch call,
@@ -281,6 +289,13 @@ type ClassifyResult struct {
 	// reasoning.go) — the signal that suppression is or isn't actually working, since
 	// no Bedrock API reports this directly.
 	ReasoningDetected bool
+
+	// StopReason is the Converse response's stop reason (e.g. "end_turn", "max_tokens"),
+	// recorded verbatim from the SDK's types.StopReason. Populated on every successful
+	// call; empty only if the call itself failed. See ClassifyEmailBatch, which also
+	// turns a max_tokens stop paired with a failed JSON extraction into a dedicated
+	// truncation error instead of the generic parse-failure one.
+	StopReason string
 }
 
 type StreamChunk struct {
@@ -309,7 +324,21 @@ type ImproveRequest struct {
 // Classification
 // ============================================================
 
-func buildBody(email Email, prompts []Prompt) string {
+// classifySystemPrompt is the invariant role + output-contract instructions for a
+// classify call, sent as a Converse system content block. Everything that varies per
+// call (the rules, the count-dependent example, the email) lives in the user turn built
+// by buildUserTurn instead — see classifyPayload. Splitting it this way is the proper
+// Converse idiom; the pre-cleanup version crammed all of this into a single user message
+// (an artifact of the earlier Ollama single-prompt-string port).
+const classifySystemPrompt = `You are an email classification assistant. You will be given a numbered list of rules and an email. For each rule, decide whether the label should be applied to that email.
+
+Respond with a single JSON object and nothing else. Include exactly one boolean key per rule number, even when the answer is false — do not omit any rule.
+Output ONLY that JSON object. Do not include any explanation, reasoning, preamble, "<think>" block, or markdown code fences before or after it.`
+
+// buildUserTurn renders the per-call data (rules, a count-matched example, and the
+// email) as the classify user turn. The role and output-format contract are invariant
+// across calls and live in classifySystemPrompt instead.
+func buildUserTurn(email Email, prompts []Prompt) string {
 	var sb strings.Builder
 	for i, p := range prompts {
 		fmt.Fprintf(&sb, "%d. %s: %s\n", i+1, p.Name, p.Instructions)
@@ -332,13 +361,9 @@ func buildBody(email Email, prompts []Prompt) string {
 	}
 	body = strings.ReplaceAll(body, "\r", "")
 
-	return fmt.Sprintf(`You are an email classification assistant. For each rule below, decide if the label should be applied to the email that follows.
-
-Rules:
+	return fmt.Sprintf(`Rules:
 %s
-Respond with a single JSON object and nothing else. Include exactly one boolean key per rule number listed above, even when the answer is false — do not omit any rule.
 Example (with a rule for every number, matching the count above): {%s}
-Output ONLY that JSON object. Do not include any explanation, reasoning, preamble, "<think>" block, or markdown code fences before or after it.
 
 Email:
 From: %s
@@ -461,11 +486,12 @@ func recordUsage(res *ClassifyResult, usage *types.TokenUsage) string {
 }
 
 // classifyPayload returns the request pieces for a classify Converse call: the user
-// message, inference config, and — when modelID's family is in reasoningRegistry, or
-// reasoningOverride is set — the system content block and/or additional model request
-// fields that suppress that model's chain-of-thought output (see reasoning.go).
+// message, inference config, the system content blocks (the invariant role/output
+// contract, plus — when modelID's family is in reasoningRegistry, or reasoningOverride
+// is set — a trailing chain-of-thought-suppression block; see reasoning.go), and any
+// additional model request fields that suppression directive also carries.
 func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride string) ([]types.Message, *types.InferenceConfiguration, []types.SystemContentBlock, document.Interface) {
-	body := buildBody(email, prompts)
+	turn := buildUserTurn(email, prompts)
 	// Reasoning-capable models can emit chain-of-thought as ordinary output tokens even
 	// when asked to suppress it (see reasoning.go) — some don't honor the suppression
 	// directive on every call. MaxTokens is sized to absorb that rather than truncate a
@@ -478,7 +504,7 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 	msgs := []types.Message{
 		{
 			Role:    types.ConversationRoleUser,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: body}},
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: turn}},
 		},
 	}
 	inf := &types.InferenceConfiguration{
@@ -486,11 +512,11 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 		Temperature: aws.Float32(0),
 	}
 
-	var sys []types.SystemContentBlock
+	sys := []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: classifySystemPrompt}}
 	var fields document.Interface
 	if d := reasoningOff(modelID, reasoningOverride); !d.isZero() {
 		if d.system != "" {
-			sys = []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: d.system}}
+			sys = append(sys, &types.SystemContentBlockMemberText{Value: d.system})
 		}
 		if d.fields != nil {
 			fields = document.NewLazyDocument(d.fields)
@@ -516,16 +542,33 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 
 	svcTier := serviceTierFor(tier)
 
+	reqMeta := requestMetadataFor("classify")
+
 	var res ClassifyResult
 	if debug {
 		reqPayload := map[string]any{
 			"modelId":         model,
 			"messages":        msgs,
 			"inferenceConfig": inf,
+			"requestMetadata": reqMeta,
 		}
-		if len(sys) > 0 {
-			if t, ok := sys[0].(*types.SystemContentBlockMemberText); ok {
-				reqPayload["system"] = []map[string]string{{"text": t.Value}}
+		// classifyPayload always seeds sys with at least the invariant contract block
+		// (see classifyPayload), so this always has something to render.
+		sysPayload := make([]map[string]string, 0, len(sys))
+		for _, block := range sys {
+			if t, ok := block.(*types.SystemContentBlockMemberText); ok {
+				sysPayload = append(sysPayload, map[string]string{"text": t.Value})
+			}
+		}
+		reqPayload["system"] = sysPayload
+		if fields != nil {
+			// document.Interface has no exported way to recover its underlying value
+			// except via its smithy Marshaler method, which renders it straight to JSON
+			// bytes — pass those through as-is rather than embedding the opaque wrapper
+			// (which would otherwise json.Marshal to "{}", since its fields are
+			// unexported).
+			if b, marshalErr := fields.MarshalSmithyDocument(); marshalErr == nil {
+				reqPayload["additionalModelRequestFields"] = json.RawMessage(b)
 			}
 		}
 		if tier == TierFlex {
@@ -554,6 +597,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		InferenceConfig:              inf,
 		ServiceTier:                  svcTier,
 		AdditionalModelRequestFields: fields,
+		RequestMetadata:              reqMeta,
 	})
 	res.LatencyMs = time.Since(start).Milliseconds()
 	if err != nil {
@@ -564,6 +608,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
 	}
 	tokenFragment := recordUsage(&res, out.Usage)
+	res.StopReason = string(out.StopReason)
 
 	raw := extractText(out.Output)
 	res.ReasoningDetected = detectReasoning(out.Output, raw)
@@ -574,7 +619,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	if tokenFragment != "" {
 		combined += ", " + tokenFragment
 	}
-	combined += fmt.Sprintf(", reasoning: suppressed=%v, content=%d chars (tier: %s)", !res.ReasoningDetected, len(raw), tierLabel)
+	combined += fmt.Sprintf(", reasoning: suppressed=%v, content=%d chars (tier: %s), stop=%s", !res.ReasoningDetected, len(raw), tierLabel, res.StopReason)
 	// Response previews/dumps can quote email content back, so they're persisted to the
 	// (auth-gated, TTL'd) log rows only under DEBUG_LOGGING — defense in depth.
 	if debug && len(raw) > 0 {
@@ -589,6 +634,10 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 
 	cleaned := extractJSONObject(raw)
 	if cleaned == "" {
+		if out.StopReason == types.StopReasonMaxTokens {
+			store.Log("ERROR", "LLM response truncated at max_tokens before a JSON object could be found"+rawDump(debug, raw))
+			return res, &Error{Msg: "LLM response truncated at max_tokens before a JSON object could be found"}
+		}
 		store.Log("ERROR", "LLM parse error: no JSON object found"+rawDump(debug, raw))
 		return res, &Error{Msg: "LLM parse error: no JSON object found in response"}
 	}
@@ -644,7 +693,8 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 			MaxTokens:   aws.Int32(2048),
 			Temperature: aws.Float32(0.7),
 		},
-		ServiceTier: serviceTierFor(c.resolveImproveTier(ctx)),
+		ServiceTier:     serviceTierFor(c.resolveImproveTier(ctx)),
+		RequestMetadata: requestMetadataFor("generate"),
 	})
 	if err != nil {
 		return err
@@ -654,13 +704,18 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 	defer func() { _ = stream.Close() }()
 
 	for event := range stream.Events() {
-		if e, ok := event.(*types.ConverseStreamOutputMemberContentBlockDelta); ok {
+		switch e := event.(type) {
+		case *types.ConverseStreamOutputMemberContentBlockDelta:
 			if d, ok := e.Value.Delta.(*types.ContentBlockDeltaMemberText); ok && d.Value != "" {
 				select {
 				case ch <- StreamChunk{Text: d.Value}:
 				case <-ctx.Done():
 					return ctx.Err()
 				}
+			}
+		case *types.ConverseStreamOutputMemberMessageStop:
+			if e.Value.StopReason == types.StopReasonMaxTokens {
+				return fmt.Errorf("LLM response truncated at max_tokens")
 			}
 		}
 	}
@@ -728,7 +783,8 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			MaxTokens:   aws.Int32(16384),
 			Temperature: aws.Float32(0.4),
 		},
-		ServiceTier: serviceTierFor(c.resolveImproveTier(ctx)),
+		ServiceTier:     serviceTierFor(c.resolveImproveTier(ctx)),
+		RequestMetadata: requestMetadataFor("improve"),
 	})
 	if err != nil {
 		return "", nil, err
