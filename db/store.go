@@ -60,6 +60,40 @@ func unmarshalItem[T any](it map[string]types.AttributeValue) T {
 	return v
 }
 
+// getKeyedItem fetches the item at (pk, sk), returning a nil map (no error) if it doesn't
+// exist — callers decide their own not-found error and what to extract from the item.
+// Shared by the Get* methods below to remove the repeated GetItemInput boilerplate.
+func (s *Store) getKeyedItem(ctx context.Context, pk, sk string) (map[string]types.AttributeValue, error) {
+	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv(pk),
+			"SK": sv(sk),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Item, nil
+}
+
+// updateItem issues an UpdateItem call at (pk, sk) with the given SET expression, names, and
+// values — shared by the single/multi-attribute update methods below to remove the repeated
+// UpdateItemInput boilerplate.
+func (s *Store) updateItem(ctx context.Context, pk, sk, expr string, names map[string]string, vals map[string]types.AttributeValue) error {
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv(pk),
+			"SK": sv(sk),
+		},
+		UpdateExpression:          aws.String(expr),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: vals,
+	})
+	return err
+}
+
 // ssmAPI is the subset of the SSM client used for per-account OAuth token storage —
 // an interface so tests can substitute an in-memory implementation.
 type ssmAPI interface {
@@ -366,20 +400,14 @@ func envDaysOr(key string, def int) int {
 // ============================================================
 
 func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("META"),
-			"SK": sv("SETTING#" + key),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "META", "SETTING#"+key)
 	if err != nil {
 		return "", err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return "", fmt.Errorf("setting not found: %s", key)
 	}
-	return getStr(out.Item, "val"), nil
+	return getStr(item, "val"), nil
 }
 
 func (s *Store) SetSetting(ctx context.Context, arg SetSettingParams) error {
@@ -648,20 +676,14 @@ func (s *Store) ListAccountsSafe(ctx context.Context) ([]ListAccountsSafeRow, er
 }
 
 func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("ACCOUNT"),
-			"SK": sv(padID(id)),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "ACCOUNT", padID(id))
 	if err != nil {
 		return Account{}, err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return Account{}, fmt.Errorf("account not found: %d", id)
 	}
-	a := itemToAccount(out.Item)
+	a := itemToAccount(item)
 	if err := s.hydrateAccountToken(ctx, &a); err != nil {
 		return Account{}, err
 	}
@@ -669,20 +691,14 @@ func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
 }
 
 func (s *Store) GetAccountByEmail(ctx context.Context, email string) (int64, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("ACCT_EMAIL#" + email),
-			"SK": sv("0"),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "ACCT_EMAIL#"+email, "0")
 	if err != nil {
 		return 0, err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return 0, fmt.Errorf("account not found: %s", email)
 	}
-	return getInt64(out.Item, attrAccountID), nil
+	return getInt64(item, attrAccountID), nil
 }
 
 func (s *Store) UpsertAccount(ctx context.Context, arg UpsertAccountParams) (int64, error) {
@@ -765,34 +781,16 @@ func (s *Store) UpdateAccountCredentials(ctx context.Context, arg UpdateAccountC
 }
 
 func (s *Store) UpdateLastScan(ctx context.Context, id int64) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("ACCOUNT"),
-			"SK": sv(padID(id)),
-		},
-		UpdateExpression: aws.String("SET lastScan = :ts"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":ts": sv(Now()),
-		},
+	return s.updateItem(ctx, "ACCOUNT", padID(id), "SET lastScan = :ts", nil, map[string]types.AttributeValue{
+		":ts": sv(Now()),
 	})
-	return err
 }
 
 func (s *Store) UpdateAccountWatch(ctx context.Context, arg UpdateAccountWatchParams) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("ACCOUNT"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("SET watchHist = :h, watchExp = :e"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":h": sv(arg.HistoryID),
-			":e": nv(arg.Expiration),
-		},
+	return s.updateItem(ctx, "ACCOUNT", padID(arg.ID), "SET watchHist = :h, watchExp = :e", nil, map[string]types.AttributeValue{
+		":h": sv(arg.HistoryID),
+		":e": nv(arg.Expiration),
 	})
-	return err
 }
 
 func (s *Store) ToggleAccount(ctx context.Context, id int64) (int64, error) {
@@ -960,20 +958,14 @@ func (s *Store) ListActivePromptsForAccount(ctx context.Context, accountID int64
 }
 
 func (s *Store) GetPrompt(ctx context.Context, id int64) (Prompt, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("PROMPT"),
-			"SK": sv(padID(id)),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "PROMPT", padID(id))
 	if err != nil {
 		return Prompt{}, err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return Prompt{}, fmt.Errorf("prompt not found: %d", id)
 	}
-	return itemToPrompt(out.Item), nil
+	return itemToPrompt(item), nil
 }
 
 func (s *Store) CreatePrompt(ctx context.Context, arg CreatePromptParams) (int64, error) {
@@ -1025,33 +1017,9 @@ func (s *Store) UpdatePrompt(ctx context.Context, arg UpdatePromptParams) error 
 }
 
 func (s *Store) UpdatePromptInstructions(ctx context.Context, arg UpdatePromptInstructionsParams) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("PROMPT"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("SET instructions = :i"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":i": sv(arg.Instructions),
-		},
+	return s.updateItem(ctx, "PROMPT", padID(arg.ID), "SET instructions = :i", nil, map[string]types.AttributeValue{
+		":i": sv(arg.Instructions),
 	})
-	return err
-}
-
-func (s *Store) UpdatePromptSortOrder(ctx context.Context, arg UpdatePromptSortOrderParams) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("PROMPT"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("SET sortOrder = :s"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":s": nv(arg.SortOrder),
-		},
-	})
-	return err
 }
 
 func (s *Store) DeletePrompt(ctx context.Context, id int64) error {
@@ -1133,35 +1101,32 @@ func (s *Store) PromptExistsGlobal(ctx context.Context, name string) (int64, err
 	return 0, nil
 }
 
-func (s *Store) PromptExistsForAccount(ctx context.Context, arg PromptExistsForAccountParams) (int64, error) {
-	all, err := s.listAllPrompts(ctx)
-	if err != nil {
-		return 0, err
-	}
-	for _, p := range all {
-		if p.Name == arg.Name && accountIDMatches(p.AccountID, arg.AccountID) {
-			return 1, nil
-		}
-	}
-	return 0, nil
-}
-
-// accountIDMatches reports whether a prompt's (possibly nil) AccountID matches the
-// sql.NullInt64 filter value, including the case where both are unset (global prompt,
-// no account filter).
-func accountIDMatches(p *int64, filter sql.NullInt64) bool {
-	if p == nil {
-		return !filter.Valid
-	}
-	return filter.Valid && *p == filter.Int64
-}
-
 // ReorderPrompts updates sort_order for each prompt ID in order.
 func (s *Store) ReorderPrompts(ctx context.Context, ids []int64) error {
-	for i, id := range ids {
-		if err := s.UpdatePromptSortOrder(ctx, UpdatePromptSortOrderParams{
-			SortOrder: int64(i),
-			ID:        id,
+	// TransactWriteItems caps at 100 items per call, so batch in chunks of that size instead
+	// of one UpdateItem round trip per prompt.
+	const maxTransactItems = 100
+	for i := 0; i < len(ids); i += maxTransactItems {
+		end := min(i+maxTransactItems, len(ids))
+		batch := ids[i:end]
+		items := make([]types.TransactWriteItem, len(batch))
+		for j, id := range batch {
+			items[j] = types.TransactWriteItem{
+				Update: &types.Update{
+					TableName: aws.String(s.table),
+					Key: map[string]types.AttributeValue{
+						"PK": sv("PROMPT"),
+						"SK": sv(padID(id)),
+					},
+					UpdateExpression: aws.String("SET sortOrder = :s"),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":s": nv(int64(i + j)),
+					},
+				},
+			}
+		}
+		if _, err := s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: items,
 		}); err != nil {
 			return err
 		}
@@ -1571,7 +1536,6 @@ func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID in
 	return s.deleteAllByPK(ctx, pkProcessed(accountID))
 }
 
-// BatchInsertProcessingResults persists logs, history, and marks the email processed.
 // BatchInsertProcessingResults writes one email's worth of log lines and history entries.
 // IDs are reserved for the whole group in a single counter increment per entity (instead
 // of one per item) and all items are written via BatchWriteItem — cutting what was ~2
@@ -1611,32 +1575,17 @@ func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntr
 // ============================================================
 
 func (s *Store) GetAccountRetention(ctx context.Context, accountID int64) (AccountRetention, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("RETENTION"),
-			"SK": sv(padID(accountID)),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "RETENTION", padID(accountID))
 	if err != nil {
 		return AccountRetention{}, err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return AccountRetention{AccountID: accountID}, errors.New("not found")
 	}
 	return AccountRetention{
 		AccountID:  accountID,
-		GlobalDays: getNullInt64(out.Item, "globalDays"),
+		GlobalDays: getNullInt64(item, "globalDays"),
 	}, nil
-}
-
-func (s *Store) HasGlobalRetention(ctx context.Context, accountID int64) (int64, error) {
-	r, err := s.GetAccountRetention(ctx, accountID)
-	//nolint:nilerr // a missing or unreadable retention record means "no global retention"
-	if err != nil || !r.GlobalDays.Valid {
-		return 0, nil
-	}
-	return 1, nil
 }
 
 func (s *Store) SetGlobalRetention(ctx context.Context, arg SetGlobalRetentionParams) error {
@@ -1875,20 +1824,14 @@ func (s *Store) InsertPromptSuggestion(ctx context.Context, arg InsertPromptSugg
 }
 
 func (s *Store) GetPromptSuggestion(ctx context.Context, id int64) (PromptSuggestion, error) {
-	out, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("SUGGESTION"),
-			"SK": sv(padID(id)),
-		},
-	})
+	item, err := s.getKeyedItem(ctx, "SUGGESTION", padID(id))
 	if err != nil {
 		return PromptSuggestion{}, err
 	}
-	if out.Item == nil {
+	if item == nil {
 		return PromptSuggestion{}, fmt.Errorf("suggestion not found: %d", id)
 	}
-	return itemToSuggestion(out.Item), nil
+	return itemToSuggestion(item), nil
 }
 
 func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, error) {
@@ -1943,68 +1886,39 @@ func (s *Store) CountPendingPromptSuggestions(ctx context.Context) (int64, error
 }
 
 func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePromptSuggestionParams) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("SUGGESTION"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua"),
-		ExpressionAttributeNames: map[string]string{
-			"#s": attrStatus,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
+	return s.updateItem(ctx, "SUGGESTION", padID(arg.ID),
+		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua",
+		map[string]string{"#s": attrStatus},
+		map[string]types.AttributeValue{
 			":si":         sv(arg.SuggestedInstructions),
 			":cj":         sv(arg.ConversationJSON),
 			exprStatus:    sv(arg.Status),
 			":uc":         sv(arg.UserComment),
 			exprUpdatedAt: sv(Now()),
-		},
-	})
-	return err
+		})
 }
 
+// UpdatePromptSuggestion saves edits to a suggestion and resets it to pending — the same
+// write as FinalizePromptSuggestion, with the status fixed to SuggestionStatusPending.
 func (s *Store) UpdatePromptSuggestion(ctx context.Context, arg UpdatePromptSuggestionParams) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("SUGGESTION"),
-			"SK": sv(padID(arg.ID)),
-		},
-		UpdateExpression: aws.String("SET suggestedInstructions = :si, conversationJson = :cj, userComment = :uc, #s = :st, updatedAt = :ua"),
-		ExpressionAttributeNames: map[string]string{
-			"#s": attrStatus,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":si":         sv(arg.SuggestedInstructions),
-			":cj":         sv(arg.ConversationJSON),
-			":uc":         sv(arg.UserComment),
-			exprStatus:    sv(SuggestionStatusPending),
-			exprUpdatedAt: sv(Now()),
-		},
+	return s.FinalizePromptSuggestion(ctx, FinalizePromptSuggestionParams{
+		SuggestedInstructions: arg.SuggestedInstructions,
+		ConversationJSON:      arg.ConversationJSON,
+		Status:                SuggestionStatusPending,
+		UserComment:           arg.UserComment,
+		ID:                    arg.ID,
 	})
-	return err
 }
 
 // setSuggestionStatus stamps a suggestion's status + updatedAt — shared by
 // ApplyPromptSuggestion and DismissPromptSuggestion, which differ only in the target status.
 func (s *Store) setSuggestionStatus(ctx context.Context, id int64, status string) error {
-	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.table),
-		Key: map[string]types.AttributeValue{
-			"PK": sv("SUGGESTION"),
-			"SK": sv(padID(id)),
-		},
-		UpdateExpression: aws.String("SET #s = :st, updatedAt = :ua"),
-		ExpressionAttributeNames: map[string]string{
-			"#s": attrStatus,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
+	return s.updateItem(ctx, "SUGGESTION", padID(id), "SET #s = :st, updatedAt = :ua",
+		map[string]string{"#s": attrStatus},
+		map[string]types.AttributeValue{
 			exprStatus:    sv(status),
 			exprUpdatedAt: sv(Now()),
-		},
-	})
-	return err
+		})
 }
 
 func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
@@ -2167,11 +2081,6 @@ type UpdatePromptInstructionsParams struct {
 	ID           int64
 }
 
-type UpdatePromptSortOrderParams struct {
-	SortOrder int64
-	ID        int64
-}
-
 type UpdateAccountCredentialsParams struct {
 	CredentialsJSON string
 	ID              int64
@@ -2260,11 +2169,6 @@ type AddLabelExemptionParams struct {
 type DeleteLabelExemptionParams struct {
 	ID        int64
 	AccountID int64
-}
-
-type PromptExistsForAccountParams struct {
-	Name      string
-	AccountID sql.NullInt64
 }
 
 type ListAccountsSafeRow struct {

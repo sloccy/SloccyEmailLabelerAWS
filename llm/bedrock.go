@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -374,18 +375,14 @@ Body:
 		email.Sender, email.Subject, body)
 }
 
-// jsonTypeKey is the JSON field name "type", used by the debug request preview's
-// serviceTier payload (see ClassifyEmailBatch).
-const jsonTypeKey = "type"
-
 // mapKeysToResults converts a {"1": true, "2": false, ...} map (1-based rule index →
 // verdict) into the prompt-ID-keyed result map ClassifyEmailBatch returns. Shared by
 // both the tool-use and text-fallback decode paths.
 func mapKeysToResults(parsed map[string]any, prompts []Prompt) map[int64]bool {
 	results := make(map[int64]bool, len(prompts))
 	for k, v := range parsed {
-		var idx int
-		if _, err := fmt.Sscanf(k, "%d", &idx); err != nil {
+		idx, err := strconv.Atoi(k)
+		if err != nil {
 			continue
 		}
 		idx-- // 1-based → 0-based
@@ -485,6 +482,71 @@ func recordUsage(res *ClassifyResult, usage *types.TokenUsage) string {
 		res.InputTokens, res.OutputTokens, res.TotalTokens)
 }
 
+// debugRequestJSON renders in as the JSON body ClassifyEmailBatch's debug output persists on
+// ClassifyResult.RequestJSON — a projection of the actual Converse request (read straight off
+// in), not a separately rebuilt copy, so it can never drift from what's really sent.
+// AdditionalModelRequestFields is the one field handled specially: document.Interface has no
+// exported way to recover its underlying value except via its smithy Marshaler method, which
+// renders it straight to JSON bytes — those are substituted in as-is (its fields are otherwise
+// unexported and would render as "{}").
+func debugRequestJSON(in *bedrockruntime.ConverseInput) string {
+	type dump struct {
+		ModelID                      *string                       `json:"modelId,omitempty"`
+		Messages                     []types.Message               `json:"messages,omitempty"`
+		System                       []types.SystemContentBlock    `json:"system,omitempty"`
+		InferenceConfig              *types.InferenceConfiguration `json:"inferenceConfig,omitempty"`
+		ServiceTier                  *types.ServiceTier            `json:"serviceTier,omitempty"`
+		RequestMetadata              map[string]string             `json:"requestMetadata,omitempty"`
+		AdditionalModelRequestFields json.RawMessage               `json:"additionalModelRequestFields,omitempty"`
+	}
+	d := dump{
+		ModelID:         in.ModelId,
+		Messages:        in.Messages,
+		System:          in.System,
+		InferenceConfig: in.InferenceConfig,
+		ServiceTier:     in.ServiceTier,
+		RequestMetadata: in.RequestMetadata,
+	}
+	if in.AdditionalModelRequestFields != nil {
+		if b, err := in.AdditionalModelRequestFields.MarshalSmithyDocument(); err == nil {
+			d.AdditionalModelRequestFields = b
+		}
+	}
+	b, err := json.Marshal(d)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// textBlock wraps text as a single-item ContentBlock slice — the shape every Message in
+// this file uses for its content.
+func textBlock(text string) []types.ContentBlock {
+	return []types.ContentBlock{&types.ContentBlockMemberText{Value: text}}
+}
+
+// chatMessage builds a Message with a single text content block for role.
+func chatMessage(role types.ConversationRole, text string) types.Message {
+	return types.Message{Role: role, Content: textBlock(text)}
+}
+
+// userMessage builds a single-block user-role Message — the common case among chatMessage's
+// callers.
+func userMessage(text string) types.Message {
+	return chatMessage(types.ConversationRoleUser, text)
+}
+
+// sysText wraps text as a SystemContentBlock.
+func sysText(text string) types.SystemContentBlock {
+	return &types.SystemContentBlockMemberText{Value: text}
+}
+
+// systemBlock wraps text as a single-item SystemContentBlock slice — the shape every
+// Converse/ConverseStream call in this file uses for its system prompt.
+func systemBlock(text string) []types.SystemContentBlock {
+	return []types.SystemContentBlock{sysText(text)}
+}
+
 // classifyPayload returns the request pieces for a classify Converse call: the user
 // message, inference config, the system content blocks (the invariant role/output
 // contract, plus — when modelID's family is in reasoningRegistry, or reasoningOverride
@@ -501,22 +563,17 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 	if n := len(prompts) * 12; n > 3000 {
 		maxTokens = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
 	}
-	msgs := []types.Message{
-		{
-			Role:    types.ConversationRoleUser,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: turn}},
-		},
-	}
+	msgs := []types.Message{userMessage(turn)}
 	inf := &types.InferenceConfiguration{
 		MaxTokens:   aws.Int32(maxTokens),
 		Temperature: aws.Float32(0),
 	}
 
-	sys := []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: classifySystemPrompt}}
+	sys := systemBlock(classifySystemPrompt)
 	var fields document.Interface
 	if d := reasoningOff(modelID, reasoningOverride); !d.isZero() {
 		if d.system != "" {
-			sys = append(sys, &types.SystemContentBlockMemberText{Value: d.system})
+			sys = append(sys, sysText(d.system))
 		}
 		if d.fields != nil {
 			fields = document.NewLazyDocument(d.fields)
@@ -540,45 +597,19 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 
 	msgs, inf, sys, fields := classifyPayload(email, prompts, model, reasoningOverride)
 
-	svcTier := serviceTierFor(tier)
-
-	reqMeta := requestMetadataFor("classify")
+	in := &bedrockruntime.ConverseInput{
+		ModelId:                      aws.String(model),
+		Messages:                     msgs,
+		System:                       sys,
+		InferenceConfig:              inf,
+		ServiceTier:                  serviceTierFor(tier),
+		AdditionalModelRequestFields: fields,
+		RequestMetadata:              requestMetadataFor("classify"),
+	}
 
 	var res ClassifyResult
 	if debug {
-		reqPayload := map[string]any{
-			"modelId":         model,
-			"messages":        msgs,
-			"inferenceConfig": inf,
-			"requestMetadata": reqMeta,
-		}
-		// classifyPayload always seeds sys with at least the invariant contract block
-		// (see classifyPayload), so this always has something to render.
-		sysPayload := make([]map[string]string, 0, len(sys))
-		for _, block := range sys {
-			if t, ok := block.(*types.SystemContentBlockMemberText); ok {
-				sysPayload = append(sysPayload, map[string]string{"text": t.Value})
-			}
-		}
-		reqPayload["system"] = sysPayload
-		if fields != nil {
-			// document.Interface has no exported way to recover its underlying value
-			// except via its smithy Marshaler method, which renders it straight to JSON
-			// bytes — pass those through as-is rather than embedding the opaque wrapper
-			// (which would otherwise json.Marshal to "{}", since its fields are
-			// unexported).
-			if b, marshalErr := fields.MarshalSmithyDocument(); marshalErr == nil {
-				reqPayload["additionalModelRequestFields"] = json.RawMessage(b)
-			}
-		}
-		if tier == TierFlex {
-			reqPayload["serviceTier"] = map[string]string{jsonTypeKey: TierFlex}
-		}
-		reqJSON, marshalErr := json.Marshal(reqPayload)
-		if marshalErr != nil {
-			reqJSON = []byte("{}")
-		}
-		res.RequestJSON = string(reqJSON)
+		res.RequestJSON = debugRequestJSON(in)
 	}
 
 	tierLabel := tier
@@ -590,15 +621,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	// a stuck Converse call ~1min before that so the error below can still be logged
 	// rather than the whole invocation being silently killed.
 	start := time.Now()
-	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:                      aws.String(model),
-		Messages:                     msgs,
-		System:                       sys,
-		InferenceConfig:              inf,
-		ServiceTier:                  svcTier,
-		AdditionalModelRequestFields: fields,
-		RequestMetadata:              reqMeta,
-	})
+	out, err := c.br.Converse(ctx, in)
 	res.LatencyMs = time.Since(start).Milliseconds()
 	if err != nil {
 		if isBedrockTimeout(err) {
@@ -681,14 +704,9 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 		description)
 
 	out, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-		ModelId: aws.String(model),
-		System:  []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: systemPrompt}},
-		Messages: []types.Message{
-			{
-				Role:    types.ConversationRoleUser,
-				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: userMsg}},
-			},
-		},
+		ModelId:  aws.String(model),
+		System:   systemBlock(systemPrompt),
+		Messages: []types.Message{userMessage(userMsg)},
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens:   aws.Int32(2048),
 			Temperature: aws.Float32(0.7),
@@ -759,25 +777,16 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			if m.Role == "assistant" {
 				role = types.ConversationRoleAssistant
 			}
-			msgs = append(msgs, types.Message{
-				Role:    role,
-				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
-			})
+			msgs = append(msgs, chatMessage(role, m.Content))
 		}
-		msgs = append(msgs, types.Message{
-			Role:    types.ConversationRoleUser,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: req.UserComment}},
-		})
+		msgs = append(msgs, userMessage(req.UserComment))
 	} else {
-		msgs = append(msgs, types.Message{
-			Role:    types.ConversationRoleUser,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: firstTurnMsg}},
-		})
+		msgs = append(msgs, userMessage(firstTurnMsg))
 	}
 
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:  aws.String(model),
-		System:   []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: improveSystemPrompt}},
+		System:   systemBlock(improveSystemPrompt),
 		Messages: msgs,
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens:   aws.Int32(16384),
@@ -853,22 +862,35 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 
 	// Pricing + flex-tier eligibility come entirely from the AWS Price List API — no
 	// hardcoded model data. Non-fatal on error (e.g. missing pricing:GetProducts IAM
-	// permission): the dropdown still lists models, just without prices/flex info.
-	cat, err := fetchPricingCatalog(ctx, c.pricingClient())
-	if err != nil {
-		cat = &pricingCatalog{
-			inputPricePer1M:     map[string]float64{},
-			flexInputPricePer1M: map[string]float64{},
-			flexCapable:         map[string]bool{},
+	// permission): the dropdown still lists models, just without prices/flex info. It has
+	// no data dependency on the foundation-model list below (only the inference-profile
+	// pass, further down, actually reads cat), so the fetch — a paginated GetProducts call,
+	// potentially several round trips — runs concurrently with ListFoundationModels instead
+	// of serialized ahead of it.
+	var cat *pricingCatalog
+	var pricingWG sync.WaitGroup
+	pricingWG.Add(1)
+	go func() {
+		defer pricingWG.Done()
+		var pricingErr error
+		cat, pricingErr = fetchPricingCatalog(ctx, c.pricingClient())
+		if pricingErr != nil {
+			cat = &pricingCatalog{
+				inputPricePer1M:     map[string]float64{},
+				flexInputPricePer1M: map[string]float64{},
+				flexCapable:         map[string]bool{},
+			}
 		}
-	}
+	}()
 
 	// One unfiltered catalog call: drives the foundation-model list AND supplies the
 	// modality of the models that back each inference profile.
 	fmOut, err := c.controlPlane().ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{})
 	if err != nil {
+		pricingWG.Wait() // let the in-flight fetch finish before returning, so it can't outlive this call
 		return nil, fmt.Errorf("list foundation models: %w", err)
 	}
+	pricingWG.Wait()
 	type summary struct {
 		id       string
 		modality modelModality
