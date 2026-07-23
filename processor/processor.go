@@ -367,18 +367,13 @@ func processEmail(
 	}
 
 	var matched []string
-	for _, p := range prompts {
-		if classified.Results[p.ID] {
-			matched = append(matched, p.Name)
-		}
-	}
 	stop := false
 	for _, p := range prompts {
-		if stop {
-			break
+		if !classified.Results[p.ID] {
+			continue
 		}
-		matched := classified.Results[p.ID]
-		if !matched {
+		matched = append(matched, p.Name)
+		if stop {
 			continue
 		}
 

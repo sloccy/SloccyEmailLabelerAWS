@@ -119,31 +119,6 @@ func TestFmtdateStacked(t *testing.T) {
 	})
 }
 
-func TestFmtinterval(t *testing.T) {
-	tests := []struct {
-		secs int
-		want string
-	}{
-		{3600, "1h"},
-		{7200, "2h"},
-		{3601, "1h"}, // integer division
-		{60, "1m"},
-		{90, "1m"},
-		{120, "2m"},
-		{59, "59s"},
-		{1, "1s"},
-		{0, "0s"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.want, func(t *testing.T) {
-			got := fmtinterval(tc.secs)
-			if got != tc.want {
-				t.Errorf("fmtinterval(%d) = %q, want %q", tc.secs, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestFmtretention(t *testing.T) {
 	tests := []struct {
 		days int64
@@ -162,28 +137,6 @@ func TestFmtretention(t *testing.T) {
 			got := fmtretention(tc.days)
 			if got != tc.want {
 				t.Errorf("fmtretention(%d) = %q, want %q", tc.days, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestToJSON(t *testing.T) {
-	tests := []struct {
-		name  string
-		input any
-		want  string
-	}{
-		{name: "string", input: "hello", want: `"hello"`},
-		{name: "number", input: 42, want: "42"},
-		{name: "slice", input: []int{1, 2, 3}, want: "[1,2,3]"},
-		{name: "map", input: map[string]int{"a": 1}, want: `{"a":1}`},
-		{name: "nil", input: nil, want: "null"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := string(toJSON(tc.input))
-			if got != tc.want {
-				t.Errorf("toJSON(%v) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}

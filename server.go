@@ -102,7 +102,10 @@ var gzipPool = sync.Pool{
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-	if strings.HasPrefix(r.URL.Path, "/static/") {
+	// /static/ serves pre-gzipped files itself (see registerRoutes); the SSE stream flushes
+	// one small chunk per generated token, and wrapping it in gzip would force a compress+
+	// flush cycle on every chunk for no real size benefit — both skip the wrapper entirely.
+	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/api/prompts/generate-stream" {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -224,28 +227,21 @@ func (s *server) registerRoutes() {
 // Template rendering helpers
 // ============================================================
 
+// render executes the template named name — either a whole file's basename (as embedded by
+// loadTemplates) or a {{define}} block name — with data, writing a 500 if execution fails.
 func (s *server) render(w http.ResponseWriter, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
 		slog.Error("render template", "name", name, "err", err)
-	}
-}
-
-// renderFragmentFile renders a pre-parsed fragment template by its base filename.
-func (s *server) renderFragmentFile(w http.ResponseWriter, path string, data any) {
-	name := path[strings.LastIndex(path, "/")+1:]
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
-		slog.Error("execute fragment", "name", name, "err", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
 }
 
-func (s *server) fragmentResponse(w http.ResponseWriter, path string, data any, toast string) {
+func (s *server) fragmentResponse(w http.ResponseWriter, name string, data any, toast string) {
 	if toast != "" {
 		setHxTrigger(w, map[string]any{triggerShowToast: toast})
 	}
-	s.renderFragmentFile(w, path, data)
+	s.render(w, name, data)
 }
 
 func setHxTrigger(w http.ResponseWriter, triggers map[string]any) {
@@ -276,7 +272,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"TurnaroundBox":  buildBoxPlotSVG(turnaround),
 		"TurnaroundLine": buildLatencyLineSVG(turnaround),
 	}
-	s.fragmentResponse(w, "templates/fragments/dashboard.html", data, "")
+	s.fragmentResponse(w, "dashboard.html", data, "")
 }
 
 // ============================================================
@@ -294,7 +290,7 @@ type accountView struct {
 func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	rows, _ := s.store.ListAccountsSafe(ctx)
-	s.fragmentResponse(w, "templates/fragments/accounts_list.html", toAccountViews(rows), "")
+	s.fragmentResponse(w, "accounts_list.html", toAccountViews(rows), "")
 }
 
 func (s *server) handleToggleAccount(w http.ResponseWriter, r *http.Request) {
@@ -370,53 +366,87 @@ func (s *server) getPromptViews(ctx context.Context, accountIDFilter string) ([]
 // handlers so the template path and load-then-render sequence can't drift between them.
 func (s *server) renderPromptsList(w http.ResponseWriter, ctx context.Context, accountIDFilter, toast string) {
 	views, _ := s.getPromptViews(ctx, accountIDFilter)
-	s.fragmentResponse(w, "templates/fragments/prompts_list.html", views, toast)
+	s.fragmentResponse(w, "prompts_list.html", views, toast)
 }
 
 func (s *server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
 	s.renderPromptsList(w, r.Context(), r.URL.Query().Get("account_id"), "")
 }
 
-func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	_ = r.ParseForm()
+// promptFormFields holds the prompt fields shared by create and update — the name/label/
+// instructions trim, the 5 boolToInt(action=="1") flags, and the account filter — parsed
+// from r's form values by promptFieldsFromForm.
+type promptFormFields struct {
+	Name           string
+	Instructions   string
+	LabelName      string
+	ActionArchive  int64
+	ActionSpam     int64
+	ActionTrash    int64
+	ActionMarkRead int64
+	StopProcessing int64
+	AccountID      sql.NullInt64
+}
 
-	name := strings.TrimSpace(r.FormValue("name"))
-	labelName := strings.TrimSpace(r.FormValue("label_name"))
-	instructions := strings.TrimSpace(r.FormValue("instructions"))
-	if name == "" {
-		s.fragmentResponse(w, "templates/fragments/prompts_list.html", nil, "Name is required")
-		return
-	}
-
-	var accountID sql.NullInt64
-	if v := r.FormValue("account_id"); v != "" {
-		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
-			accountID = sql.NullInt64{Int64: id, Valid: true}
-		}
-	}
-
-	maxOrder, _ := s.store.MaxPromptSortOrder(ctx)
-	_, err := s.store.CreatePrompt(ctx, db.CreatePromptParams{
-		Name:           name,
-		Instructions:   instructions,
-		LabelName:      labelName,
+func promptFieldsFromForm(r *http.Request) promptFormFields {
+	return promptFormFields{
+		Name:           strings.TrimSpace(r.FormValue("name")),
+		Instructions:   strings.TrimSpace(r.FormValue("instructions")),
+		LabelName:      strings.TrimSpace(r.FormValue("label_name")),
 		ActionArchive:  boolToInt(r.FormValue("action_archive") == "1"),
 		ActionSpam:     boolToInt(r.FormValue("action_spam") == "1"),
 		ActionTrash:    boolToInt(r.FormValue("action_trash") == "1"),
 		ActionMarkRead: boolToInt(r.FormValue("action_mark_read") == "1"),
-		SortOrder:      maxOrder + 1,
 		StopProcessing: boolToInt(r.FormValue("stop_processing") == "1"),
-		AccountID:      accountID,
+		AccountID:      parseAccountID(r),
+	}
+}
+
+// parseAccountID parses the "account_id" form value into a sql.NullInt64 — empty or
+// unparseable means "no account filter" (global).
+func parseAccountID(r *http.Request) sql.NullInt64 {
+	v := r.FormValue("account_id")
+	if v == "" {
+		return sql.NullInt64{}
+	}
+	id, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: id, Valid: true}
+}
+
+func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_ = r.ParseForm()
+
+	f := promptFieldsFromForm(r)
+	if f.Name == "" {
+		s.fragmentResponse(w, "prompts_list.html", nil, "Name is required")
+		return
+	}
+
+	maxOrder, _ := s.store.MaxPromptSortOrder(ctx)
+	_, err := s.store.CreatePrompt(ctx, db.CreatePromptParams{
+		Name:           f.Name,
+		Instructions:   f.Instructions,
+		LabelName:      f.LabelName,
+		ActionArchive:  f.ActionArchive,
+		ActionSpam:     f.ActionSpam,
+		ActionTrash:    f.ActionTrash,
+		ActionMarkRead: f.ActionMarkRead,
+		SortOrder:      maxOrder + 1,
+		StopProcessing: f.StopProcessing,
+		AccountID:      f.AccountID,
 	})
 	if err != nil {
 		slog.Error("create prompt", "err", err)
-		s.fragmentResponse(w, "templates/fragments/prompts_list.html", nil, "Failed to create rule")
+		s.fragmentResponse(w, "prompts_list.html", nil, "Failed to create rule")
 		return
 	}
 
 	// Pre-create label in background for all matching accounts
-	go s.ensureLabelForAccounts(context.Background(), labelName, accountID) //nolint:gosec // G118: must outlive request
+	go s.ensureLabelForAccounts(context.Background(), f.LabelName, f.AccountID) //nolint:gosec // G118: must outlive request
 
 	s.renderPromptsList(w, ctx, "", "Rule saved")
 }
@@ -429,28 +459,22 @@ func (s *server) handleUpdatePrompt(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
 
-	var accountID sql.NullInt64
-	if v := r.FormValue("account_id"); v != "" {
-		if aid, err := strconv.ParseInt(v, 10, 64); err == nil {
-			accountID = sql.NullInt64{Int64: aid, Valid: true}
-		}
-	}
-	labelName := strings.TrimSpace(r.FormValue("label_name"))
+	f := promptFieldsFromForm(r)
 
 	_ = s.store.UpdatePrompt(ctx, db.UpdatePromptParams{
-		Name:           strings.TrimSpace(r.FormValue("name")),
-		Instructions:   strings.TrimSpace(r.FormValue("instructions")),
-		LabelName:      labelName,
-		ActionArchive:  boolToInt(r.FormValue("action_archive") == "1"),
-		ActionSpam:     boolToInt(r.FormValue("action_spam") == "1"),
-		ActionTrash:    boolToInt(r.FormValue("action_trash") == "1"),
-		ActionMarkRead: boolToInt(r.FormValue("action_mark_read") == "1"),
-		StopProcessing: boolToInt(r.FormValue("stop_processing") == "1"),
-		AccountID:      accountID,
+		Name:           f.Name,
+		Instructions:   f.Instructions,
+		LabelName:      f.LabelName,
+		ActionArchive:  f.ActionArchive,
+		ActionSpam:     f.ActionSpam,
+		ActionTrash:    f.ActionTrash,
+		ActionMarkRead: f.ActionMarkRead,
+		StopProcessing: f.StopProcessing,
+		AccountID:      f.AccountID,
 		ID:             id,
 	})
 
-	go s.ensureLabelForAccounts(context.Background(), labelName, accountID) //nolint:gosec // G118: must outlive request
+	go s.ensureLabelForAccounts(context.Background(), f.LabelName, f.AccountID) //nolint:gosec // G118: must outlive request
 
 	s.renderPromptsList(w, ctx, "", "Rule updated")
 }
@@ -642,8 +666,36 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
 	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
 	models := s.cachedModels(ctx)
-	s.fragmentResponse(w, "templates/fragments/settings_form.html",
+	s.fragmentResponse(w, "settings_form.html",
 		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models), "")
+}
+
+// applyTierSetting reads formKey from r's form; if it's a recognized tier ("standard" or
+// "flex") it's persisted under settingKey and returned, otherwise cur (the current setting)
+// is returned unchanged. Shared by the classify/improve tier fields in handleUpdateSettings.
+func (s *server) applyTierSetting(ctx context.Context, r *http.Request, formKey, settingKey, cur string) string {
+	v := r.FormValue(formKey)
+	if v != llm.TierStandard && v != llm.TierFlex {
+		return cur
+	}
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: settingKey, Value: v})
+	return v
+}
+
+// applyModelSetting reads formKey from r's form; if it names a model (via findModel) allowed
+// on tier, it's persisted under settingKey and returned, otherwise cur is returned unchanged
+// — garbage/disallowed input is silently ignored. Shared by the classify/improve model fields.
+func (s *server) applyModelSetting(ctx context.Context, r *http.Request, formKey, settingKey, cur, tier string, findModel func(string) *llm.ModelOption) string {
+	v := r.FormValue(formKey)
+	if v == "" {
+		return cur
+	}
+	m := findModel(v)
+	if m == nil || !modelAllowedForTier(*m, tier) {
+		return cur
+	}
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: settingKey, Value: v})
+	return v
 }
 
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -665,34 +717,16 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
 	// classify_model choice: the two tiers have different eligible-model policies (see
 	// modelAllowedForTier) enforced below.
-	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
-	if v := r.FormValue("classify_tier"); v == llm.TierStandard || v == llm.TierFlex {
-		classifyTier = v
-		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyTier, Value: v})
-	}
-
-	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
-	if v := r.FormValue("classify_model"); v != "" {
-		if m := findModel(v); m != nil && modelAllowedForTier(*m, classifyTier) {
-			classifyModel = v
-			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyModel, Value: v})
-		}
-	}
+	classifyTier := s.applyTierSetting(ctx, r, "classify_tier", llm.SettingClassifyTier,
+		settingOr(settings, llm.SettingClassifyTier, llm.TierStandard))
+	classifyModel := s.applyModelSetting(ctx, r, "classify_model", llm.SettingClassifyModel,
+		settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel), classifyTier, findModel)
 
 	// Prompt-improver tier + model — same standard/flex policy as classification above.
-	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
-	if v := r.FormValue("improve_tier"); v == llm.TierStandard || v == llm.TierFlex {
-		improveTier = v
-		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveTier, Value: v})
-	}
-
-	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
-	if v := r.FormValue("improve_model"); v != "" {
-		if m := findModel(v); m != nil && modelAllowedForTier(*m, improveTier) {
-			improveModel = v
-			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveModel, Value: v})
-		}
-	}
+	improveTier := s.applyTierSetting(ctx, r, "improve_tier", llm.SettingImproveTier,
+		settingOr(settings, llm.SettingImproveTier, llm.TierStandard))
+	improveModel := s.applyModelSetting(ctx, r, "improve_model", llm.SettingImproveModel,
+		settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel), improveTier, findModel)
 
 	// Reasoning-suppression override: free text, no validation beyond trimming — it's an
 	// escape hatch for a model family reasoningRegistry (llm/reasoning.go) doesn't know
@@ -702,7 +736,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
 
 	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models)
-	s.fragmentResponse(w, "templates/fragments/settings_form.html", data, "Settings saved")
+	s.fragmentResponse(w, "settings_form.html", data, "Settings saved")
 }
 
 // ============================================================
@@ -775,7 +809,7 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 			views[i].ExtraActions = strings.Split(h.Actions, ",")
 		}
 	}
-	s.fragmentResponse(w, "templates/fragments/history_table.html", views, "")
+	s.fragmentResponse(w, "history_table.html", views, "")
 }
 
 func (s *server) handleTroubleshooting(w http.ResponseWriter, r *http.Request) {
@@ -785,7 +819,7 @@ func (s *server) handleTroubleshooting(w http.ResponseWriter, r *http.Request) {
 		slog.Error("troubleshooting query", "err", err)
 		rows = nil
 	}
-	s.fragmentResponse(w, "templates/fragments/troubleshooting_list.html", rows, "")
+	s.fragmentResponse(w, "troubleshooting_list.html", rows, "")
 }
 
 func (s *server) handleHistoryFilters(w http.ResponseWriter, r *http.Request) {
@@ -802,7 +836,7 @@ func (s *server) handleHistoryFilters(w http.ResponseWriter, r *http.Request) {
 		options[i] = promptOption{ID: p.ID, Name: p.Name}
 	}
 
-	s.fragmentResponse(w, "templates/fragments/history_filters.html", map[string]any{
+	s.fragmentResponse(w, "history_filters.html", map[string]any{
 		"Accounts": toAccountViews(accounts),
 		"Prompts":  options,
 	}, "")
@@ -864,7 +898,7 @@ func (s *server) buildRetentionData(ctx context.Context, accountID int64) retent
 // so the template path and build-then-render sequence can't drift between them.
 func (s *server) renderRetentionPanel(w http.ResponseWriter, ctx context.Context, accountID int64, toast string) {
 	data := s.buildRetentionDataWithGmail(ctx, accountID)
-	s.fragmentResponse(w, "templates/fragments/retention_panel.html", data, toast)
+	s.fragmentResponse(w, "retention_panel.html", data, toast)
 }
 
 // daysFromForm parses the "value"/"unit" retention form fields into a day count, treating
@@ -1028,7 +1062,7 @@ func (s *server) handleOAuthStart(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	data := map[string]string{"AuthURL": authURL}
-	s.fragmentResponse(w, "templates/fragments/oauth_step2.html", data, "")
+	s.fragmentResponse(w, "oauth_step2.html", data, "")
 }
 
 func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
@@ -1037,7 +1071,7 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 	rawURL := r.FormValue("url")
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		s.fragmentResponse(w, "templates/fragments/accounts_list.html", nil, "Invalid URL")
+		s.fragmentResponse(w, "accounts_list.html", nil, "Invalid URL")
 		return
 	}
 	code := parsed.Query().Get("code")
@@ -1051,14 +1085,14 @@ func (s *server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 	s.oauthMu.Unlock()
 
 	if !ok || time.Now().After(pending.expires) {
-		s.fragmentResponse(w, "templates/fragments/accounts_list.html", nil, "OAuth state expired — try again")
+		s.fragmentResponse(w, "accounts_list.html", nil, "OAuth state expired — try again")
 		return
 	}
 
 	emailAddr, credJSON, err := s.auth.ExchangeCode(ctx, code, pending.verifier)
 	if err != nil {
 		slog.Error("oauth exchange", "err", err)
-		s.fragmentResponse(w, "templates/fragments/accounts_list.html", nil, "OAuth failed: "+err.Error())
+		s.fragmentResponse(w, "accounts_list.html", nil, "OAuth failed: "+err.Error())
 		return
 	}
 
@@ -1129,7 +1163,7 @@ func (s *server) handleAccountOptions(w http.ResponseWriter, r *http.Request) {
 		firstOption = template.HTML(`<option value="">All accounts (global)</option>`)
 	}
 
-	s.fragmentResponse(w, "templates/fragments/account_options.html", map[string]any{
+	s.fragmentResponse(w, "account_options.html", map[string]any{
 		"FirstOption": firstOption,
 		"Accounts":    toAccountViews(accounts),
 	}, "")
@@ -1387,7 +1421,7 @@ func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Requ
 	for i, sg := range suggestions {
 		views[i] = toSuggestionView(sg, promptNames[sg.PromptID])
 	}
-	s.fragmentResponse(w, "templates/fragments/prompt_suggestions_list.html", views, "")
+	s.fragmentResponse(w, "prompt_suggestions_list.html", views, "")
 }
 
 func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Request) {
@@ -1403,7 +1437,7 @@ func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Req
 	}
 	p, _ := s.store.GetPrompt(ctx, sg.PromptID)
 	view := toSuggestionView(sg, p.Name)
-	s.fragmentResponse(w, "templates/fragments/prompt_suggestion_detail.html", view, "")
+	s.fragmentResponse(w, "prompt_suggestion_detail.html", view, "")
 }
 
 func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http.Request) {
@@ -1463,7 +1497,7 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 	view.SuggestedInstructions = suggested
 	view.UserComment = userComment
 	view.Status = db.SuggestionStatusPending
-	s.fragmentResponse(w, "templates/fragments/prompt_suggestion_detail.html", view, "")
+	s.fragmentResponse(w, "prompt_suggestion_detail.html", view, "")
 }
 
 func (s *server) handlePromptSuggestionApply(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"embed"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -18,13 +17,8 @@ func tmplFuncs() template.FuncMap {
 	return template.FuncMap{
 		"fmtdate":        fmtdate,
 		"fmtdateStacked": fmtdateStacked,
-		"fmtinterval":    fmtinterval,
 		"fmtretention":   fmtretention,
-		"toJSON":         toJSON,
-		"safeHTML":       func(s string) template.HTML { return template.HTML(s) }, //nolint:gosec // G203: used with trusted internal strings only
-		"printf":         fmt.Sprintf,
 		"dict":           dict,
-		"not":            func(b bool) bool { return !b },
 	}
 }
 
@@ -70,17 +64,6 @@ func fmtdateStacked(ts string) template.HTML {
 	return template.HTML(date + `<br><span class="text-muted">` + timeStr + `</span>`) //nolint:gosec // G203: formatted from parsed time, no user input
 }
 
-func fmtinterval(secs int) string {
-	switch {
-	case secs >= 3600:
-		return fmt.Sprintf("%dh", secs/3600)
-	case secs >= 60:
-		return fmt.Sprintf("%dm", secs/60)
-	default:
-		return fmt.Sprintf("%ds", secs)
-	}
-}
-
 func fmtretention(days int64) string {
 	if days >= 365 && days%365 == 0 {
 		y := days / 365
@@ -93,14 +76,6 @@ func fmtretention(days int64) string {
 		return "1 day"
 	}
 	return fmt.Sprintf("%d days", days)
-}
-
-func toJSON(v any) template.JS {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return template.JS("null")
-	}
-	return template.JS(b) //nolint:gosec // G203: JSON-encoded from internal data
 }
 
 // loadTemplates parses all embedded templates.

@@ -211,6 +211,19 @@ type apiBatchModifyRequest struct {
 
 // --- HTTP helpers ---
 
+// httpStatusError carries the HTTP status code from a failed Gmail API response, so callers
+// that need to branch on a specific code (e.g. ListHistoryAddedMessageIDs's 404 check) can
+// use errors.As instead of re-implementing the request/response handling get already does.
+type httpStatusError struct {
+	status int
+	path   string
+	body   []byte
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("gmail API %s: %s", e.path, e.body)
+}
+
 func (c *Client) get(ctx context.Context, path string, params url.Values, out any) error {
 	u := gmailBase + path
 	if len(params) > 0 {
@@ -227,7 +240,7 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, out an
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("gmail API %s: %s", path, body)
+		return &httpStatusError{status: resp.StatusCode, path: path, body: body}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
@@ -409,28 +422,13 @@ func ListHistoryAddedMessageIDs(ctx context.Context, svc *Client, startHistoryID
 		if pageToken != "" {
 			params.Set("pageToken", pageToken)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, gmailBase+"/history?"+params.Encode(), nil)
-		if err != nil {
-			return nil, latest, err
-		}
-		resp, err := svc.http.Do(req)
-		if err != nil {
-			return nil, latest, err
-		}
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
-			return nil, latest, ErrHistoryTooOld
-		}
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			return nil, latest, fmt.Errorf("gmail API /history: %s", body)
-		}
 		var res apiHistoryResponse
-		derr := json.NewDecoder(resp.Body).Decode(&res)
-		_ = resp.Body.Close()
-		if derr != nil {
-			return nil, latest, derr
+		if err := svc.get(ctx, "/history", params, &res); err != nil {
+			var statusErr *httpStatusError
+			if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
+				return nil, latest, ErrHistoryTooOld
+			}
+			return nil, latest, err
 		}
 		for _, h := range res.History {
 			for _, ma := range h.MessagesAdded {
