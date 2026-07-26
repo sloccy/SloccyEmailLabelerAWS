@@ -218,9 +218,9 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 		t.Fatalf("loadTemplates: %v", err)
 	}
 	models := []llm.ModelOption{
-		{ID: "us.amazon.nova-micro-v1:0", Label: "Nova Micro", ProfileRegion: "us", InputCostPer1M: 0.035, FlexCostPer1M: 0.017, Flex: true},
-		{ID: "eu.some.model", Label: "EU Model", ProfileRegion: "eu", InputCostPer1M: 0.5, FlexCostPer1M: 0.25, Flex: true},
-		{ID: "anthropic.claude-unpriced", Label: "Unpriced Model", InputCostPer1M: llm.CostUnknown, FlexCostPer1M: llm.CostUnknown},
+		{ID: "us.amazon.nova-micro-v1:0", Label: "Nova Micro", ProfileRegion: "us", InputCostPer1M: 0.035, OutputCostPer1M: 0.14, FlexCostPer1M: 0.017, FlexOutputCostPer1M: 0.07, Flex: true},
+		{ID: "eu.some.model", Label: "EU Model", ProfileRegion: "eu", InputCostPer1M: 0.5, OutputCostPer1M: 1.5, FlexCostPer1M: 0.25, FlexOutputCostPer1M: 0.75, Flex: true},
+		{ID: "anthropic.claude-unpriced", Label: "Unpriced Model", InputCostPer1M: llm.CostUnknown, OutputCostPer1M: llm.CostUnknown, FlexCostPer1M: llm.CostUnknown, FlexOutputCostPer1M: llm.CostUnknown},
 	}
 
 	render := func(classifyTier, improveTier string) string {

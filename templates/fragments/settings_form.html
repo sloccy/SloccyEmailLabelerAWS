@@ -53,6 +53,50 @@
 
 <div class="card mt-4">
   <div class="card-body p-0">
+    <div class="py-3 px-4 border-bottom d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <div>
+        <div class="fw-medium">Model pricing</div>
+        <div class="small text-muted mt-1">Every Converse-capable model with its published price per 1M tokens, sorted cheapest input first.</div>
+      </div>
+      <div class="btn-group btn-group-sm" role="group" aria-label="Pricing tier" id="pricing-tier-toggle">
+        <button type="button" class="btn btn-outline-primary active" data-ptier="standard">Normal</button>
+        <button type="button" class="btn btn-outline-primary" data-ptier="flex">Flex</button>
+      </div>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr>
+            <th class="ps-4">Model</th>
+            <th>Input $/1M</th>
+            <th class="pe-4">Output $/1M</th>
+          </tr>
+        </thead>
+        <tbody id="model-pricing-standard">
+          {{range .Models}}
+          <tr>
+            <td class="ps-4">{{.Label}}</td>
+            <td>{{if ge .InputCostPer1M 0.0}}${{printf "%.3f" .InputCostPer1M}}{{else}}n/a{{end}}</td>
+            <td class="pe-4">{{if ge .OutputCostPer1M 0.0}}${{printf "%.3f" .OutputCostPer1M}}{{else}}n/a{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+        <tbody id="model-pricing-flex" class="d-none">
+          {{range .FlexModels}}
+          <tr>
+            <td class="ps-4">{{.Label}}</td>
+            <td>{{if ge .FlexCostPer1M 0.0}}${{printf "%.3f" .FlexCostPer1M}}{{else}}n/a{{end}}</td>
+            <td class="pe-4">{{if ge .FlexOutputCostPer1M 0.0}}${{printf "%.3f" .FlexOutputCostPer1M}}{{else}}n/a{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card mt-4">
+  <div class="card-body p-0">
     <div class="py-3 px-4 border-bottom">
       <div class="fw-medium">Backup &amp; Restore</div>
       <div class="small text-muted mt-1">Export all accounts, prompts, settings, and retention rules to a JSON file. Import adds data without overwriting existing configuration. OAuth credentials are not exported — you will need to re-authenticate accounts after import.</div>
