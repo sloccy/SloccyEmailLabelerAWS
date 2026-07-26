@@ -142,18 +142,22 @@ func candidateKeys(id string) []string {
 // (see normalizeKey/candidateKeys) so both Price List naming conventions resolve to the
 // same entry.
 type pricingCatalog struct {
-	inputPricePer1M     map[string]float64
-	flexInputPricePer1M map[string]float64
-	flexCapable         map[string]bool
+	inputPricePer1M      map[string]float64
+	outputPricePer1M     map[string]float64
+	flexInputPricePer1M  map[string]float64
+	flexOutputPricePer1M map[string]float64
+	flexCapable          map[string]bool
 }
 
 // fetchPricingCatalog queries the AWS Price List API for Amazon Bedrock's us-east-1
 // on-demand catalog and derives per-model standard and flex-tier input pricing.
 func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatalog, error) {
 	cat := &pricingCatalog{
-		inputPricePer1M:     map[string]float64{},
-		flexInputPricePer1M: map[string]float64{},
-		flexCapable:         map[string]bool{},
+		inputPricePer1M:      map[string]float64{},
+		outputPricePer1M:     map[string]float64{},
+		flexInputPricePer1M:  map[string]float64{},
+		flexOutputPricePer1M: map[string]float64{},
+		flexCapable:          map[string]bool{},
 	}
 
 	paginator := pricing.NewGetProductsPaginator(pc, &pricing.GetProductsInput{
@@ -187,24 +191,30 @@ func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatal
 				for _, k := range candidateKeys(base) {
 					cat.flexCapable[k] = true
 				}
-				if direction == directionInput {
-					if price := firstOnDemandPricePer1K(e); price > 0 {
-						for _, k := range candidateKeys(base) {
-							cat.flexInputPricePer1M[k] = price * 1000
-						}
+				if price := firstOnDemandPricePer1K(e); price > 0 {
+					dst := cat.flexInputPricePer1M
+					if direction != directionInput {
+						dst = cat.flexOutputPricePer1M
+					}
+					for _, k := range candidateKeys(base) {
+						dst[k] = price * 1000
 					}
 				}
 				continue
 			}
-			if direction != directionInput || (effTier != "standard" && effTier != "") {
+			if effTier != "standard" && effTier != "" {
 				continue
 			}
 			price := firstOnDemandPricePer1K(e)
 			if price <= 0 {
 				continue
 			}
+			dst := cat.inputPricePer1M
+			if direction != directionInput {
+				dst = cat.outputPricePer1M
+			}
 			for _, k := range candidateKeys(base) {
-				cat.inputPricePer1M[k] = price * 1000 // $/1K tokens -> $/1M tokens
+				dst[k] = price * 1000 // $/1K tokens -> $/1M tokens
 			}
 		}
 	}
@@ -300,6 +310,24 @@ func (cat *pricingCatalog) inputCostPer1M(baseModelID string) float64 {
 // model id (region prefix already stripped), or CostUnknown if the catalog has no match.
 func (cat *pricingCatalog) flexCostPer1M(baseModelID string) float64 {
 	if price, ok := lookup(cat.flexInputPricePer1M, baseModelID); ok {
+		return price
+	}
+	return CostUnknown
+}
+
+// outputCostPer1M returns the on-demand output price per 1M tokens for a Bedrock base
+// model id (region prefix already stripped), or CostUnknown if the catalog has no match.
+func (cat *pricingCatalog) outputCostPer1M(baseModelID string) float64 {
+	if price, ok := lookup(cat.outputPricePer1M, baseModelID); ok {
+		return price
+	}
+	return CostUnknown
+}
+
+// flexOutputCostPer1M returns the flex-tier output price per 1M tokens for a Bedrock base
+// model id (region prefix already stripped), or CostUnknown if the catalog has no match.
+func (cat *pricingCatalog) flexOutputCostPer1M(baseModelID string) float64 {
+	if price, ok := lookup(cat.flexOutputPricePer1M, baseModelID); ok {
 		return price
 	}
 	return CostUnknown

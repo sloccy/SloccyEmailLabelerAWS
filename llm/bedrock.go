@@ -87,10 +87,12 @@ const (
 
 // ModelOption is one entry in the model-selection dropdown.
 type ModelOption struct {
-	ID             string  // value sent to Bedrock (modelId or inferenceProfileId)
-	Label          string  // human-readable display name
-	InputCostPer1M float64 // standard on-demand input price per 1M tokens; CostUnknown if unpriced
-	FlexCostPer1M  float64 // flex-tier input price per 1M tokens; CostUnknown if unpriced or not flex-capable
+	ID                  string  // value sent to Bedrock (modelId or inferenceProfileId)
+	Label               string  // human-readable display name
+	InputCostPer1M      float64 // standard on-demand input price per 1M tokens; CostUnknown if unpriced
+	OutputCostPer1M     float64 // standard on-demand output price per 1M tokens; CostUnknown if unpriced
+	FlexCostPer1M       float64 // flex-tier input price per 1M tokens; CostUnknown if unpriced or not flex-capable
+	FlexOutputCostPer1M float64 // flex-tier output price per 1M tokens; CostUnknown if unpriced or not flex-capable
 	// ProfileRegion is the cross-region inference-profile geography ("us", "global", "eu",
 	// "apac", "us-gov"), or "" for a bare/single-datacenter foundation-model id.
 	ProfileRegion string
@@ -921,11 +923,13 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		}
 		seen[id] = true
 		opts = append(opts, ModelOption{
-			ID:             id,
-			Label:          label,
-			InputCostPer1M: cat.inputCostPer1M(id),
-			FlexCostPer1M:  cat.flexCostPer1M(id),
-			Flex:           cat.isFlexCapable(id),
+			ID:                  id,
+			Label:               label,
+			InputCostPer1M:      cat.inputCostPer1M(id),
+			OutputCostPer1M:     cat.outputCostPer1M(id),
+			FlexCostPer1M:       cat.flexCostPer1M(id),
+			FlexOutputCostPer1M: cat.flexOutputCostPer1M(id),
+			Flex:                cat.isFlexCapable(id),
 		}) // ProfileRegion left as "" — bare foundation-model id, single datacenter
 	}
 
@@ -966,12 +970,14 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		seen[id] = true
 		base := baseModelID(id)
 		opts = append(opts, ModelOption{
-			ID:             id,
-			Label:          label,
-			InputCostPer1M: cat.inputCostPer1M(base),
-			FlexCostPer1M:  cat.flexCostPer1M(base),
-			ProfileRegion:  profileRegion(id),
-			Flex:           cat.isFlexCapable(base),
+			ID:                  id,
+			Label:               label,
+			InputCostPer1M:      cat.inputCostPer1M(base),
+			OutputCostPer1M:     cat.outputCostPer1M(base),
+			FlexCostPer1M:       cat.flexCostPer1M(base),
+			FlexOutputCostPer1M: cat.flexOutputCostPer1M(base),
+			ProfileRegion:       profileRegion(id),
+			Flex:                cat.isFlexCapable(base),
 		})
 	}
 

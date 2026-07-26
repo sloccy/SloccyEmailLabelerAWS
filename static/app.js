@@ -341,6 +341,19 @@ document.addEventListener('click', function(e) {
   flexSel.disabled = !showFlex;
 });
 
+// ---- Model pricing table: Normal/Flex toggle ----
+// Same delegated-handler pattern as the tier toggles above (the settings form is
+// HTMX-swapped, so a direct binding wouldn't survive a re-render).
+document.addEventListener('click', function(e) {
+  const btn = e.target.closest('#pricing-tier-toggle button[data-ptier]');
+  if (!btn) return;
+  const group = btn.closest('.btn-group');
+  group.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+  const showFlex = btn.dataset.ptier === 'flex';
+  document.getElementById('model-pricing-standard').classList.toggle('d-none', showFlex);
+  document.getElementById('model-pricing-flex').classList.toggle('d-none', !showFlex);
+});
+
 // ---- Hx-Trigger event handlers ----
 document.body.addEventListener('showToast', function(e) {
   const { message, type } = e.detail || {};
