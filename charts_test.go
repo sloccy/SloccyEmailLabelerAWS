@@ -54,30 +54,26 @@ func TestBuildBoxPlotSVGWithData(t *testing.T) {
 	}
 }
 
-func TestBuildLatencyLineSVGEmpty(t *testing.T) {
-	svg := string(buildLatencyLineSVG(nil))
+func TestBuildLatencyScatterSVGEmpty(t *testing.T) {
+	svg := string(buildLatencyScatterSVG(nil))
 	if !strings.Contains(svg, "<svg") || !strings.Contains(svg, "No LLM latency data yet") {
 		t.Errorf("expected empty-state SVG, got %s", svg)
 	}
 }
 
-func TestBuildLatencyLineSVGBridgesGaps(t *testing.T) {
-	// Two samples an hour apart with a large gap of empty hours between two more distant
-	// samples: the polyline should still connect every present point in time order.
+func TestBuildLatencyScatterSVGPlotsRawSamples(t *testing.T) {
+	// Raw samples, including two in the same hour: each should get its own dot (no
+	// averaging/bucketing), and dots must never be connected by a line.
 	samples := []db.TurnaroundSample{
 		{Timestamp: "2026-07-01 08:00:00", DurationMs: 200},
-		{Timestamp: "2026-07-01 09:00:00", DurationMs: 400},
+		{Timestamp: "2026-07-01 08:30:00", DurationMs: 400},
 		{Timestamp: "2026-07-03 09:00:00", DurationMs: 600}, // 2 days later, no data in between
 	}
-	svg := string(buildLatencyLineSVG(samples))
-	if !strings.Contains(svg, "<polyline") {
-		t.Errorf("expected a polyline element, got %s", svg)
+	svg := string(buildLatencyScatterSVG(samples))
+	if strings.Contains(svg, "<polyline") {
+		t.Errorf("expected no polyline (dots must not be connected), got %s", svg)
 	}
-	// Three points in, three points should be in the polyline.
-	start := strings.Index(svg, `points="`) + len(`points="`)
-	end := strings.Index(svg[start:], `"`) + start
-	pts := strings.Fields(svg[start:end])
-	if len(pts) != 3 {
-		t.Errorf("polyline has %d points, want 3: %s", len(pts), svg[start:end])
+	if got := strings.Count(svg, `class="chart-dot"`); got != len(samples) {
+		t.Errorf("got %d chart-dot circles, want %d: %s", got, len(samples), svg)
 	}
 }

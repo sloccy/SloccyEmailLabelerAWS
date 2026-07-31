@@ -199,8 +199,7 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .chart-whisker { stroke: var(--om-text-50); stroke-width: 1.5; }
 .chart-box { fill: var(--om-primary-25); stroke: var(--om-primary-70); stroke-width: 1.5; }
 .chart-median { stroke: var(--om-primary); stroke-width: 2; }
-.chart-line { fill: none; stroke: var(--om-primary); stroke-width: 1.5; }
-.chart-point { fill: var(--om-primary); }
+.chart-dot { fill: var(--om-primary); fill-opacity: 0.5; }
 /* font-size is set inline per-chart in charts.go (emptyChartSVG), scaled so differently
    sized chart viewBoxes still render the placeholder text at the same on-screen size */
 .chart-empty { fill: var(--om-text-50); }
