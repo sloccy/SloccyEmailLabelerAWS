@@ -19,7 +19,7 @@ import (
 const (
 	chartHeight = 165 // 220 * 0.75: ~25% shorter row (charts scale to their column width, so height is proportional to this)
 	// boxChartWidth is lineChartWidth/3, matching the dashboard's 1fr:3fr chart-row grid
-	// (box plot : line graph) so both SVGs render at the same on-screen height and scale
+	// (box plot : scatter plot) so both SVGs render at the same on-screen height and scale
 	// factor at any page width — see .chart-row in static/style.css.
 	boxChartWidth  = 160
 	lineChartWidth = 480
@@ -189,64 +189,52 @@ func buildBoxPlotSVG(samples []db.TurnaroundSample) template.HTML {
 	return template.HTML(b.String()) //nolint:gosec // b only ever contains our own static markup plus %d/%.1f-formatted numbers, never free-form text
 }
 
-type hourBucket struct {
-	hour time.Time
-	sum  int64
-	n    int
+// scatterPoint is one raw sample: the exact time an email was processed and the
+// LLM latency for it, in ms.
+type scatterPoint struct {
+	t  time.Time
+	ms int64
 }
 
-func (b hourBucket) avg() float64 { return float64(b.sum) / float64(b.n) }
-
-// buildLatencyLineSVG renders a line graph of average latency per 1-hour window, in time
-// order. Hours with no samples simply have no point, so the line bridges the gap by
-// connecting straight to the next hour that does have data.
-func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
+// buildLatencyScatterSVG renders a scatter plot of every raw latency sample against its
+// actual timestamp — one dot per processed email. Unlike an hourly average, this shows
+// the real spread and outliers instead of smoothing them away, and dots are deliberately
+// not connected: latency from one email to the next isn't a continuous signal, so a line
+// between them would imply a trend that isn't there.
+func buildLatencyScatterSVG(samples []db.TurnaroundSample) template.HTML {
 	if len(samples) == 0 {
 		return emptyChartSVG(lineChartWidth, "No LLM latency data yet")
 	}
 
-	buckets := map[int64]*hourBucket{}
+	points := make([]scatterPoint, 0, len(samples))
 	for _, s := range samples {
 		t, err := time.Parse("2006-01-02 15:04:05", s.Timestamp)
 		if err != nil {
 			continue
 		}
-		t = t.UTC().Truncate(time.Hour)
-		key := t.Unix()
-		hb := buckets[key]
-		if hb == nil {
-			hb = &hourBucket{hour: t}
-			buckets[key] = hb
-		}
-		hb.sum += s.DurationMs
-		hb.n++
+		points = append(points, scatterPoint{t: t.UTC(), ms: s.DurationMs})
 	}
-	if len(buckets) == 0 {
+	if len(points) == 0 {
 		return emptyChartSVG(lineChartWidth, "No LLM latency data yet")
 	}
+	sort.Slice(points, func(i, j int) bool { return points[i].t.Before(points[j].t) })
 
-	points := make([]hourBucket, 0, len(buckets))
-	for _, hb := range buckets {
-		points = append(points, *hb)
-	}
-	sort.Slice(points, func(i, j int) bool { return points[i].hour.Before(points[j].hour) })
-
-	maxAvg := points[0].avg()
+	maxMs := points[0].ms
 	for _, p := range points {
-		if a := p.avg(); a > maxAvg {
-			maxAvg = a
+		if p.ms > maxMs {
+			maxMs = p.ms
 		}
 	}
-	if maxAvg <= 0 {
-		maxAvg = 1 // avoid a degenerate flat axis
+	if maxMs <= 0 {
+		maxMs = 1 // avoid a degenerate flat axis
 	}
-	// Round the step *up* (round=false) toward a nice number so step >= maxAvg/4. This
+	// Round the step *up* (round=false) toward a nice number so step >= maxMs/4. This
 	// guarantees niceMax/step <= 4, i.e. never more than 5 gridlines (0 + up to 4 steps),
 	// while keeping ticks on clean 1/2/5×10ⁿ increments.
-	step := niceNum(maxAvg/4, false)
-	niceMax := math.Ceil(maxAvg/step) * step
+	step := niceNum(float64(maxMs)/4, false)
+	niceMax := math.Ceil(float64(maxMs)/step) * step
 
-	first, last := points[0].hour, points[len(points)-1].hour
+	first, last := points[0].t, points[len(points)-1].t
 	span := last.Sub(first).Hours()
 	if span == 0 {
 		span = 1
@@ -264,7 +252,7 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="Average LLM latency per hour">`, lineChartWidth, chartHeight)
+	fmt.Fprintf(&b, `<svg viewBox="0 0 %d %d" class="chart-svg" role="img" aria-label="LLM latency per email over time">`, lineChartWidth, chartHeight)
 
 	for a := 0.0; a <= niceMax+step/2; a += step {
 		y := yFor(a)
@@ -272,13 +260,13 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		fmt.Fprintf(&b, `<text x="%d" y="%.1f" class="chart-axis-label" text-anchor="end">%.0fms</text>`, plotLeft-6, y, a)
 	}
 
-	// X-axis ticks: the first and last are the real data points' own hour buckets, so
-	// those two always match their point's hover tooltip exactly. Interior ticks, though,
-	// land on genuine calendar boundaries (midnight UTC, or a clean hour-of-day) rather
-	// than on whatever sample happens to be nearby — snapping them to real data points
-	// instead made them look unevenly spaced, since e.g. one day's first sample might be
-	// at 08:00 and the next day's at 23:00. This mirrors the Y-axis: gridlines sit at nice
-	// round values, independent of where the actual data falls.
+	// X-axis ticks: the first and last are the earliest/latest sample's own timestamp.
+	// Interior ticks, though, land on genuine calendar boundaries (midnight UTC, or a
+	// clean hour-of-day) rather than on whatever sample happens to be nearby — snapping
+	// them to real data points instead made them look unevenly spaced, since e.g. one
+	// day's first sample might be at 08:00 and the next day's at 23:00. This mirrors the
+	// Y-axis: gridlines sit at nice round values, independent of where the actual data
+	// falls.
 	const minTickGapPx = 48.0
 	// A span under a day means multiple ticks could land on the same calendar date, so
 	// include the hour in the label to keep them distinguishable.
@@ -293,8 +281,8 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 	labelFor := func(t time.Time) xTick {
 		return xTick{xFor(t), t.Format(xLabelFormat)}
 	}
-	ticks := []xTick{labelFor(points[0].hour)}
-	lastTick := labelFor(points[len(points)-1].hour)
+	ticks := []xTick{labelFor(points[0].t)}
+	lastTick := labelFor(points[len(points)-1].t)
 	if len(points) > 1 {
 		step := time.Duration(niceTimeStepHours(span) * float64(time.Hour))
 		dayStart := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, time.UTC)
@@ -321,19 +309,12 @@ func buildLatencyLineSVG(samples []db.TurnaroundSample) template.HTML {
 		fmt.Fprintf(&b, `<text x="%.1f" y="%d" class="chart-axis-label" text-anchor="%s">%s</text>`, tk.x, chartHeight-8, anchor, tk.label)
 	}
 
-	coords := make([]string, 0, len(points))
+	// One dot per raw sample, deliberately not connected — see the function doc comment.
+	// Dots are semi-transparent so overlapping samples (common with many emails in a
+	// 30-day window) read as visibly denser rather than just stacking opaquely.
 	for _, p := range points {
-		coords = append(coords, fmt.Sprintf("%.1f,%.1f", xFor(p.hour), yFor(p.avg())))
-	}
-	fmt.Fprintf(&b, `<polyline points="%s" class="chart-line"/>`, strings.Join(coords, " "))
-	for _, p := range points {
-		x, y := xFor(p.hour), yFor(p.avg())
-		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="2.5" class="chart-point"/>`, x, y)
-		// Invisible, larger hover target carrying the tooltip. fill="transparent" is
-		// painted (unlike fill:none) so it still receives pointer events for the native
-		// <title>, which shows the exact UTC hour and average on hover.
-		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="9" fill="transparent"><title>%s UTC &#183; %.0fms avg</title></circle>`,
-			x, y, p.hour.Format("Jan 2 15:04"), p.avg())
+		x, y := xFor(p.t), yFor(float64(p.ms))
+		fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="2" class="chart-dot"/>`, x, y)
 	}
 
 	b.WriteString(`</svg>`)

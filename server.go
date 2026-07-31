@@ -270,7 +270,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"ScanCadence":    scanCadenceLabel,
 		"TimeoutCount":   timeoutCount,
 		"TurnaroundBox":  buildBoxPlotSVG(turnaround),
-		"TurnaroundLine": buildLatencyLineSVG(turnaround),
+		"TurnaroundLine": buildLatencyScatterSVG(turnaround),
 	}
 	s.fragmentResponse(w, "dashboard.html", data, "")
 }
