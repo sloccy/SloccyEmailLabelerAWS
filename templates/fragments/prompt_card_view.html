@@ -24,7 +24,7 @@
           {{if .ActionMarkRead}}<span class="badge border text-secondary ms-1">mark read</span>{{end}}
           {{if .StopProcessing}}<span class="badge text-bg-danger ms-1">&#9940; stop</span>{{end}}
           <span class="ms-1" hx-get="/fragments/prompts/{{.ID}}/examples-count" hx-trigger="intersect once" hx-swap="outerHTML">
-            <span class="badge text-bg-light border">&hellip;</span>
+            <span class="badge border text-secondary">&hellip;</span>
           </span>
         </div>
         <div class="small text-muted border-top pt-2 mt-2" style="line-height:1.625">{{.Instructions}}</div>
