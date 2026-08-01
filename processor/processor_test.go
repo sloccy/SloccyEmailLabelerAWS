@@ -437,6 +437,73 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 }
 
+// TestProcessEmail_WritesConfirmedPositiveExample covers passive confirmation: a rule that
+// matches during ordinary classification (not a manual recategorize) should get a
+// confirmed_positive db.PromptExample, grounding future AI rule improvement in what the
+// rule already gets right without the user having to touch anything.
+func TestProcessEmail_WritesConfirmedPositiveExample(t *testing.T) {
+	store := newTestStore(t)
+	llmClient := newLLMServer(t, `{"1": true}`)
+
+	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "test@example.com"})
+	account := db.Account{ID: accID, Email: "test@example.com", Active: 1}
+	msg := gmailpkg.Message{ID: "conf1", Subject: "Weekly Digest", Sender: "news@test.com", Body: "Here's what's new this week."}
+	prompts := []db.Prompt{
+		{ID: 1, Name: "NL", LabelName: "newsletters", Active: 1, Instructions: "label nl"},
+	}
+	labelCache := map[string]string{"newsletters": "L1"}
+
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	applyWriteJob(t.Context(), store, job)
+
+	examples, err := store.ListExamplesByVerdict(t.Context(), 1, db.VerdictConfirmedPositive, 10)
+	if err != nil {
+		t.Fatalf("ListExamplesByVerdict: %v", err)
+	}
+	if len(examples) != 1 {
+		t.Fatalf("expected 1 confirmed_positive example, got %d: %+v", len(examples), examples)
+	}
+	ex := examples[0]
+	if ex.PromptID != 1 || ex.AccountID != accID || ex.MessageID != "conf1" ||
+		ex.Sender != "news@test.com" || ex.Subject != "Weekly Digest" {
+		t.Errorf("example fields mismatch: %+v", ex)
+	}
+	if ex.BodyExcerpt == "" {
+		t.Error("expected a non-empty body excerpt")
+	}
+}
+
+// TestProcessEmail_NoConfirmedExampleForStopShadowedPrompt mirrors
+// TestProcessEmail_StopProcessing: a prompt matched but shadowed by an earlier
+// stop-processing rule gets no history row today, and must get no passive-confirm example
+// either — the two are meant to stay in lockstep (same gate in processEmail), not just
+// coincidentally agree.
+func TestProcessEmail_NoConfirmedExampleForStopShadowedPrompt(t *testing.T) {
+	store := newTestStore(t)
+	llmClient := newLLMServer(t, `{"1": true, "2": true}`)
+
+	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "test@example.com"})
+	account := db.Account{ID: accID, Email: "test@example.com", Active: 1}
+	msg := gmailpkg.Message{ID: "stop-ex1", Subject: "Test", Sender: "a@b.com"}
+	prompts := []db.Prompt{
+		{ID: 1, Name: "First", LabelName: "l1", StopProcessing: 1, Active: 1, Instructions: "stop"},
+		{ID: 2, Name: "Second", LabelName: "l2", Active: 1, Instructions: "should not run"},
+	}
+	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
+
+	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	applyWriteJob(t.Context(), store, job)
+
+	first, _ := store.ListExamplesByVerdict(t.Context(), 1, db.VerdictConfirmedPositive, 10)
+	if len(first) != 1 {
+		t.Errorf("expected 1 confirmed_positive example for prompt 1 (not shadowed), got %d", len(first))
+	}
+	second, _ := store.ListExamplesByVerdict(t.Context(), 2, db.VerdictConfirmedPositive, 10)
+	if len(second) != 0 {
+		t.Errorf("expected 0 confirmed_positive examples for prompt 2 (shadowed by stop-processing), got %d", len(second))
+	}
+}
+
 // TestProcessEmail_LlmDebugGatedOnDebugLogging asserts the fattest per-email write (raw
 // Gmail message + full LLM request/response) is only built and returned for the writer
 // to persist when DebugLogging is on — keeping normal operation to just the batched

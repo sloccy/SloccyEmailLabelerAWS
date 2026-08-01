@@ -126,3 +126,21 @@ func Truncate(s string, maxChars int) string {
 	}
 	return s[:maxChars]
 }
+
+// CollapseExcerpt joins s's whitespace-separated fields with single spaces and truncates to
+// maxRunes — turns a raw (possibly multi-line, multi-space) email body into a compact,
+// single-line excerpt safe to store and display. Not a substitute for Truncate: Truncate is
+// a byte-length cutoff with no whitespace collapsing and no UTF-8-rune safety (fine for a
+// log preview, risky for content meant to be stored and re-rendered — a byte cutoff can
+// split a multi-byte rune mid-character). Used for db.PromptExample.BodyExcerpt by both the
+// recategorize handlers and the classify path (processor), which is why this lives here
+// rather than in either of those packages — both already import gmail, and this avoids a
+// main<->processor import cycle that duplicating it in each would otherwise require.
+func CollapseExcerpt(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) > maxRunes {
+		r = r[:maxRunes]
+	}
+	return string(r)
+}

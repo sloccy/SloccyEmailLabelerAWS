@@ -373,6 +373,97 @@ func TestClassifyEmailBatch_SingleSummaryLogLine(t *testing.T) {
 
 // ---- extractJSONObject ----
 
+func TestSanitizeRuleText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "Matches newsletters from SaaS products.", "Matches newsletters from SaaS products."},
+		{
+			"leaked think block",
+			"<think>\nThe rule should cover promotional emails too.\n</think>\nMatches promotional emails.",
+			"Matches promotional emails.",
+		},
+		{
+			"fenced markdown",
+			"```\nMatches receipts and invoices.\n```",
+			"Matches receipts and invoices.",
+		},
+		{
+			"fenced with language tag",
+			"```text\nMatches shipping notifications.\n```",
+			"Matches shipping notifications.",
+		},
+		{"surrounding double quotes", `"Matches order confirmations."`, "Matches order confirmations."},
+		{"surrounding smart quotes", "“Matches calendar invites.”", "Matches calendar invites."},
+		{
+			"embedded newlines collapse to single spaces",
+			"Matches newsletters.\nDo not match transactional receipts.\n\nOr spam.",
+			"Matches newsletters. Do not match transactional receipts. Or spam.",
+		},
+		{
+			"multiple internal spaces collapse",
+			"Matches   newsletters    from  SaaS products.",
+			"Matches newsletters from SaaS products.",
+		},
+		{"empty input", "", ""},
+		{"whitespace only", "   \n\t  ", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeRuleText(c.in)
+			if got != c.want {
+				t.Errorf("sanitizeRuleText(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuildImproveUserTurn_EmptyCorpusStaysCoherent(t *testing.T) {
+	// A brand-new rule has no recorded examples yet — the prompt must still be a sensible,
+	// well-formed request rather than printing empty "SHOULD MATCH:" headings with nothing
+	// under them.
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches newsletters from SaaS products.",
+	})
+	if !strings.Contains(turn, "RULE: Newsletters") || !strings.Contains(turn, "LABEL: News") {
+		t.Errorf("missing rule/label header: %q", turn)
+	}
+	if !strings.Contains(turn, "Matches newsletters from SaaS products.") {
+		t.Errorf("missing current instructions: %q", turn)
+	}
+	for _, heading := range []string{"SHOULD MATCH", "SHOULD NOT MATCH", "ALREADY CORRECT", "USER NOTE"} {
+		if strings.Contains(turn, heading) {
+			t.Errorf("empty section heading %q should be omitted entirely, got: %q", heading, turn)
+		}
+	}
+}
+
+func TestBuildImproveUserTurn_RendersPopulatedSections(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches newsletters.",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "Weekly digest", Excerpt: "top stories this week"}},
+		ShouldNotMatch:       []ExampleRef{{Sender: "b@example.com", Subject: "Your receipt", Excerpt: "payment confirmed"}},
+		AlreadyCorrect:       []ExampleRef{{Sender: "c@example.com", Subject: "Product update", Excerpt: "new features"}},
+		UserNote:             "these are spam, not receipts",
+	})
+	for _, want := range []string{
+		"SHOULD MATCH", "a@example.com", "Weekly digest",
+		"SHOULD NOT MATCH", "b@example.com", "Your receipt",
+		"ALREADY CORRECT", "c@example.com", "Product update",
+		"USER NOTE: these are spam, not receipts",
+	} {
+		if !strings.Contains(turn, want) {
+			t.Errorf("expected user turn to contain %q, got: %q", want, turn)
+		}
+	}
+}
+
 func TestExtractJSONObject(t *testing.T) {
 	cases := []struct {
 		name string
@@ -445,9 +536,10 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 			fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
 			cl := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0", settings: c.settings}
 			_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
-				PromptName: "newsletter", LabelName: "News", TriggerKind: "false_negative",
+				PromptName:           "newsletter",
+				LabelName:            "News",
 				OriginalInstructions: "matches newsletters",
-				EmailSender:          "a@example.com", EmailSubject: "hello", EmailBody: "world",
+				ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
 			})
 			if err != nil {
 				t.Fatalf("ImprovePromptInstructions error: %v", err)
@@ -464,6 +556,100 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 				t.Errorf("ServiceTier = %+v, want nil (implicit standard)", got)
 			}
 		})
+	}
+}
+
+// TestReplayAgainstExamples_UsesClassifyModelNotImproveModel is the load-bearing test for
+// ReplayAgainstExamples: the whole point of replay is to answer "will the model that
+// actually labels production mail apply this rule correctly?", which only holds if it's
+// scored on classify_model. It's easy to get backwards because every other Bedrock call in
+// the improve flow resolves improve_model, and this function is invoked from deep inside
+// that same flow. classify_model and improve_model are deliberately set to different,
+// distinctively-named ids here so a regression that resolves the wrong one fails loudly.
+func TestReplayAgainstExamples_UsesClassifyModelNotImproveModel(t *testing.T) {
+	settings := &multiSettings{vals: map[string]string{
+		SettingClassifyModel: "classify-model-x",
+		SettingImproveModel:  "improve-model-y",
+	}}
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{
+		textOutput(`{"1": true}`),
+		textOutput(`{"1": false}`),
+		textOutput(`{"1": true}`),
+	}}
+	cl := &Client{br: fake, defaultModel: "fallback-model", settings: settings}
+
+	examples := []ReplayExample{
+		{Verdict: "false_negative", Sender: "a@example.com", Subject: "s1", Excerpt: "e1", Want: true},
+		{Verdict: "false_positive", Sender: "b@example.com", Subject: "s2", Excerpt: "e2", Want: false},
+		{Verdict: "confirmed_positive", Sender: "c@example.com", Subject: "s3", Excerpt: "e3", Want: true},
+	}
+	// concurrency: 1 keeps call order deterministic for the per-call ModelId assertion below.
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate rule text", examples, 1)
+
+	if len(fake.calls) != 3 {
+		t.Fatalf("expected 3 Converse calls, got %d", len(fake.calls))
+	}
+	for i, call := range fake.calls {
+		if call.ModelId == nil || *call.ModelId != "classify-model-x" {
+			t.Errorf("call %d: ModelId = %v, want %q (classify_model) — must never resolve improve_model", i, call.ModelId, "classify-model-x")
+		}
+	}
+	if res.Model != "classify-model-x" {
+		t.Errorf("ReplayResult.Model = %q, want %q", res.Model, "classify-model-x")
+	}
+	if res.Total != 3 || res.Passed != 3 {
+		t.Errorf("Total/Passed = %d/%d, want 3/3 (all three examples scored correctly)", res.Total, res.Passed)
+	}
+	if len(res.Failures) != 0 {
+		t.Errorf("Failures = %+v, want none", res.Failures)
+	}
+}
+
+// TestReplayAgainstExamples_ScoresMismatchesAsFailures checks the pass/fail bookkeeping
+// itself, independent of the model-selection concern above: a candidate that gets an
+// example wrong should show up in Failures with what it actually returned.
+func TestReplayAgainstExamples_ScoresMismatchesAsFailures(t *testing.T) {
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{
+		textOutput(`{"1": false}`), // wanted true (false_negative) -> mismatch
+		textOutput(`{"1": false}`), // wanted false (false_positive) -> match
+	}}
+	cl := &Client{br: fake, defaultModel: "m"}
+
+	examples := []ReplayExample{
+		{Verdict: "false_negative", Sender: "a@example.com", Subject: "s1", Excerpt: "e1", Want: true},
+		{Verdict: "false_positive", Sender: "b@example.com", Subject: "s2", Excerpt: "e2", Want: false},
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.Total != 2 || res.Passed != 1 {
+		t.Fatalf("Total/Passed = %d/%d, want 2/1", res.Total, res.Passed)
+	}
+	if len(res.Failures) != 1 || res.Failures[0].Verdict != "false_negative" || res.Failures[0].Got != false {
+		t.Errorf("Failures = %+v, want one false_negative failure with Got=false", res.Failures)
+	}
+}
+
+// TestReplayAgainstExamples_ClassifyErrorExcludedNotFailed checks that a Bedrock error for
+// one example is excluded from Total rather than counted as a failure — a transient
+// classify error isn't a signal about the candidate rule's quality.
+func TestReplayAgainstExamples_ClassifyErrorExcludedNotFailed(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{nil, textOutput(`{"1": true}`)},
+		errs:    []error{errors.New("boom"), nil},
+	}
+	cl := &Client{br: fake, defaultModel: "m"}
+
+	examples := []ReplayExample{
+		{Verdict: "false_negative", Sender: "a@example.com", Subject: "s1", Excerpt: "e1", Want: true},
+		{Verdict: "confirmed_positive", Sender: "b@example.com", Subject: "s2", Excerpt: "e2", Want: true},
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.Total != 1 || res.Passed != 1 {
+		t.Errorf("Total/Passed = %d/%d, want 1/1 (errored example excluded, not failed)", res.Total, res.Passed)
+	}
+	if len(res.Failures) != 0 {
+		t.Errorf("Failures = %+v, want none", res.Failures)
 	}
 }
 

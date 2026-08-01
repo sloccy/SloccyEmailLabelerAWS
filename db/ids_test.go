@@ -59,3 +59,36 @@ func TestLocalID_RoughlyTimeOrdered(t *testing.T) {
 		t.Errorf("expected second id (%d) > first id (%d) after a sleep", second, first)
 	}
 }
+
+func TestPkExample(t *testing.T) {
+	if got, want := pkExample(5), "EXAMPLE#5"; got != want {
+		t.Errorf("pkExample(5) = %q, want %q", got, want)
+	}
+}
+
+// TestExampleSK_SortsNewestFirstWithinVerdict guards the ordering ListExamplesByVerdict
+// depends on: a ScanIndexForward:false query over one verdict's SK range must return the
+// newest example first, which requires SK to sort lexicographically by timestamp within a
+// fixed verdict prefix.
+func TestExampleSK_SortsNewestFirstWithinVerdict(t *testing.T) {
+	older := exampleSK(VerdictFalsePositive, "2026-07-01 12:00:00", 1)
+	newer := exampleSK(VerdictFalsePositive, "2026-07-02 12:00:00", 2)
+	if older >= newer {
+		t.Errorf("exampleSK ordering: older SK %q should sort before newer SK %q", older, newer)
+	}
+}
+
+// TestExampleSK_TieBreaksByID guards the same-millisecond case: two examples inserted in
+// the same InsertPromptExamples batch share a timestamp (Now() is called once per batch),
+// so the padded id must be what keeps their SKs distinct and ordered.
+func TestExampleSK_TieBreaksByID(t *testing.T) {
+	ts := "2026-07-01 12:00:00"
+	first := exampleSK(VerdictConfirmedPositive, ts, 1)
+	second := exampleSK(VerdictConfirmedPositive, ts, 2)
+	if first == second {
+		t.Errorf("exampleSK produced identical SKs for different ids: %q", first)
+	}
+	if first >= second {
+		t.Errorf("exampleSK tie-break ordering: id=1 SK %q should sort before id=2 SK %q", first, second)
+	}
+}

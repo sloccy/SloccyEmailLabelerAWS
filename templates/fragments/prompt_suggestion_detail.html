@@ -29,10 +29,44 @@
     </button>
   </div>
 
+  {{if .ExampleGroups}}
   <details class="mb-3">
-    <summary class="small text-muted" style="cursor:pointer">Email: {{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</summary>
-    <pre class="mt-2 p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;max-height:12rem;overflow-y:auto">{{.EmailBodySnapshot}}</pre>
+    <summary class="small text-muted" style="cursor:pointer">Example history used ({{range $i, $g := .ExampleGroups}}{{if $i}}, {{end}}{{len $g.Examples}} {{$g.Verdict}}{{end}})</summary>
+    <div class="mt-2 d-flex flex-column gap-3">
+      {{range .ExampleGroups}}
+      <div>
+        <div class="small fw-semibold text-muted text-uppercase mb-1">{{.Label}} &middot; {{len .Examples}}</div>
+        <ul class="small mb-0 ps-3">
+          {{range .Examples}}
+          <li class="text-truncate" style="max-width:100%"><span class="text-muted">{{.Sender}}</span> &mdash; {{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}</li>
+          {{end}}
+        </ul>
+      </div>
+      {{end}}
+    </div>
   </details>
+  {{else}}
+  <div class="small text-muted mb-3">No example history yet for this rule — this suggestion is based on its current instructions alone.</div>
+  {{end}}
+
+  {{if gt .ReplayTotal 0}}
+  <div class="small mb-3">
+    <span class="fw-semibold">Validation:</span>
+    {{.ReplayPassed}}/{{.ReplayTotal}} correct
+    <span class="text-muted">({{.ReplayBaseline}}/{{.ReplayTotal}} at time of correction)</span>
+    <span class="text-muted">&middot; replayed on {{.ReplayModel}}</span>
+    {{if .ReplayFailures}}
+    <details class="mt-1">
+      <summary class="text-muted" style="cursor:pointer">{{len .ReplayFailures}} mismatch{{if ne (len .ReplayFailures) 1}}es{{end}} &#9656;</summary>
+      <ul class="small mt-1 ps-3 mb-0">
+        {{range .ReplayFailures}}
+        <li>{{.Verdict}}: <span class="text-muted">{{.Sender}}</span> &mdash; {{if .Subject}}{{.Subject}}{{else}}(no subject){{end}} <span class="text-muted">(model said {{.Got}})</span></li>
+        {{end}}
+      </ul>
+    </details>
+    {{end}}
+  </div>
+  {{end}}
 
   <div class="row g-3 mb-4">
     <div class="col-md-6">

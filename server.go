@@ -46,6 +46,7 @@ const (
 	triggerRefreshSuggestionBadge = "refreshSuggestionBadge"
 	toastKeyMessage               = "message"
 	jsonKeyType                   = "type"
+	toastTypeSuccess              = "success"
 	encodingGzip                  = "gzip"
 	headerAcceptEncoding          = "Accept-Encoding"
 )
@@ -188,6 +189,8 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("POST /fragments/prompts/{id}/toggle", s.handleTogglePrompt)
 	s.mux.HandleFunc("GET /fragments/prompts/{id}/edit", s.handleEditPrompt)
 	s.mux.HandleFunc("GET /fragments/prompts/{id}/view", s.handleViewPrompt)
+	s.mux.HandleFunc("GET /fragments/prompts/{id}/examples-count", s.handlePromptExamplesBadge)
+	s.mux.HandleFunc("POST /fragments/prompts/{id}/clear-examples", s.handleClearPromptExamples)
 	s.mux.HandleFunc("GET /fragments/settings", s.handleGetSettings)
 	s.mux.HandleFunc("PATCH /fragments/settings", s.handleUpdateSettings)
 	s.mux.HandleFunc("GET /fragments/logs", s.handleLogs)
@@ -197,6 +200,8 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("GET /fragments/history/{id}/llm-response", s.handleHistoryLlmResponse)
 	s.mux.HandleFunc("GET /fragments/history/{id}/recategorize", s.handleRecategorizeForm)
 	s.mux.HandleFunc("POST /fragments/history/{id}/recategorize", s.handleRecategorize)
+	s.mux.HandleFunc("GET /fragments/history/bulk-recategorize", s.handleBulkRecategorizeForm)
+	s.mux.HandleFunc("POST /fragments/history/bulk-recategorize", s.handleBulkRecategorize)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions", s.handlePromptSuggestionsList)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}", s.handlePromptSuggestionDetail)
 	s.mux.HandleFunc("POST /fragments/prompt-suggestions/{id}/regenerate", s.handlePromptSuggestionRegenerate)
@@ -536,6 +541,44 @@ func (s *server) handleViewPrompt(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "prompt_card_view", pv)
 }
 
+// promptExamplesBadgeData feeds prompt_examples_badge.html.
+type promptExamplesBadgeData struct {
+	ID    int64
+	Total int64
+}
+
+// handlePromptExamplesBadge renders a prompt card's example-corpus count. Lazy-loaded per
+// card (hx-trigger="intersect once" in prompt_card_view.html) rather than fetched eagerly
+// for every prompt when the list renders — CountExamplesByVerdict is 3 Query calls, and the
+// prompts list can render on every page load, so eagerly summing it for every rule would be
+// 3x the query volume for a count nobody's necessarily looking at.
+func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Request) {
+	id := pathInt(r, "id")
+	ctx := r.Context()
+	counts, err := s.store.CountExamplesByVerdict(ctx, id)
+	if err != nil {
+		slog.Error("count prompt examples", "prompt_id", id, "err", err)
+	}
+	var total int64
+	for _, n := range counts {
+		total += n
+	}
+	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: total}, "")
+}
+
+// handleClearPromptExamples deletes a rule's entire example corpus — the escape hatch for
+// when the rule's intent has changed enough that its recorded history would mislead the
+// next AI prompt improvement round (see DeleteExamplesForPrompt's doc comment). Returns the
+// same badge fragment so the card updates in place to "0 examples".
+func (s *server) handleClearPromptExamples(w http.ResponseWriter, r *http.Request) {
+	id := pathInt(r, "id")
+	ctx := r.Context()
+	if err := s.store.DeleteExamplesForPrompt(ctx, id); err != nil {
+		slog.Error("clear prompt examples", "prompt_id", id, "err", err)
+	}
+	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: 0}, "Examples cleared")
+}
+
 func buildAccountMap(accounts []db.ListAccountsSafeRow) map[int64]string {
 	m := make(map[int64]string, len(accounts))
 	for _, a := range accounts {
@@ -625,13 +668,14 @@ func modelAllowedForTier(m llm.ModelOption, tier string) bool {
 // the Standard selects (already sorted cheapest-first by ListAvailableModels); FlexModels is a
 // copy re-sorted by flex-tier cost (see llm.SortModelsByFlexCost) so the Flex selects sink their
 // own unpriced entries to the bottom instead of inheriting the standard-cost order.
-func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, models []llm.ModelOption) map[string]any {
 	return map[string]any{
 		"ClassifyModel":      classifyModel,
 		"ImproveModel":       improveModel,
 		"ClassifyTier":       classifyTier,
 		"ImproveTier":        improveTier,
 		"ReasoningDirective": reasoningDirective,
+		"ImproveReplay":      improveReplay,
 		"Models":             models,
 		"FlexModels":         llm.SortModelsByFlexCost(models),
 	}
@@ -665,9 +709,10 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
 	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
 	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
+	improveReplay := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, models), "")
 }
 
 // applyTierSetting reads formKey from r's form; if it's a recognized tier ("standard" or
@@ -735,7 +780,17 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	reasoningDirective := strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, models)
+	// Checkbox semantics: the browser only sends improve_replay when checked, so its
+	// presence (any value) means enabled — persisted as "1"/"0" to match improveReplayEnabled's
+	// (recategorize.go) unset-means-enabled default.
+	improveReplay := r.FormValue("improve_replay") != ""
+	replayValue := "0"
+	if improveReplay {
+		replayValue = "1"
+	}
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReplay, Value: replayValue})
+
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, models)
 	s.fragmentResponse(w, "settings_form.html", data, "Settings saved")
 }
 
@@ -755,6 +810,8 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 type historyRow struct {
 	ID             int64
+	AccountID      int64  // for the bulk-select checkbox's data-aid (see history_table.html)
+	MessageID      string // for the bulk-select checkbox's data-mid
 	Timestamp      string
 	AccountEmail   string
 	Subject        string
@@ -797,6 +854,8 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	for i, h := range rows {
 		views[i] = historyRow{
 			ID:             h.ID,
+			AccountID:      h.AccountID,
+			MessageID:      h.MessageID,
 			Timestamp:      h.Timestamp,
 			AccountEmail:   h.AccountEmail,
 			Subject:        h.Subject,
@@ -1138,7 +1197,7 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 	s.store.Log("INFO", "Manual scan triggered")
 	scanOnce(r.Context(), s.store, s.llm, s.auth, s.cfg)
 	setHxTrigger(w, map[string]any{
-		triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: "success"},
+		triggerShowToast:   map[string]any{toastKeyMessage: "Scan complete", jsonKeyType: toastTypeSuccess},
 		"refreshDashboard": "",
 	})
 	w.WriteHeader(http.StatusOK)
@@ -1381,6 +1440,26 @@ type suggestionView struct {
 	SuggestedInstructions string
 	UserComment           string
 	Status                string
+
+	// Detail-view only (populated by suggestionDetailView, left zero-value by the compact
+	// list view in handlePromptSuggestionsList — that view never renders them, and fetching
+	// a rule's example corpus for every card in the list would be N*3 extra queries for
+	// nothing shown). ExampleGroups is the corpus the improver/replay actually used, in
+	// place of the single mishandled-email snapshot the pre-corpus UI showed.
+	ExampleGroups  []suggestionExampleGroup
+	ReplayModel    string
+	ReplayTotal    int64
+	ReplayPassed   int64
+	ReplayBaseline int64
+	ReplayFailures []llm.ReplayFailure
+}
+
+// suggestionExampleGroup is one verdict's worth of a rule's example corpus, labeled for
+// display in prompt_suggestion_detail.html.
+type suggestionExampleGroup struct {
+	Verdict  string
+	Label    string
+	Examples []db.PromptExample
 }
 
 // toSuggestionView converts a stored suggestion + its prompt's name into the view shape
@@ -1404,6 +1483,43 @@ func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView 
 		UserComment:           sg.UserComment,
 		Status:                sg.Status,
 	}
+}
+
+// suggestionDetailView builds the detail-page view for a suggestion: the base fields plus
+// its rule's example corpus (grouped by verdict, same corpus selectExamplesForPrompt fed
+// into the improve/replay calls) and the stored replay result, if any
+// (ReplayTotal == 0 means replay didn't run — improve_replay disabled, or an older
+// suggestion from before this field existed — and the template renders nothing for that
+// case rather than a misleading "0/0").
+func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestion, promptName string) suggestionView {
+	view := toSuggestionView(sg, promptName)
+
+	examples := s.selectExamplesForPrompt(ctx, sg.PromptID)
+	labels := map[string]string{
+		db.VerdictFalseNegative:     "Missed it (should have matched)",
+		db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
+		db.VerdictConfirmedPositive: "Already correct (must keep matching)",
+	}
+	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+		var grouped []db.PromptExample
+		for _, ex := range examples {
+			if ex.Verdict == v {
+				grouped = append(grouped, ex)
+			}
+		}
+		if len(grouped) > 0 {
+			view.ExampleGroups = append(view.ExampleGroups, suggestionExampleGroup{Verdict: v, Label: labels[v], Examples: grouped})
+		}
+	}
+
+	view.ReplayModel = sg.ReplayModel
+	view.ReplayTotal = sg.ReplayTotal
+	view.ReplayPassed = sg.ReplayPassed
+	view.ReplayBaseline = sg.ReplayBaseline
+	if sg.ReplayFailures != "" {
+		_ = json.Unmarshal([]byte(sg.ReplayFailures), &view.ReplayFailures)
+	}
+	return view
 }
 
 func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Request) {
@@ -1436,10 +1552,16 @@ func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Req
 		return
 	}
 	p, _ := s.store.GetPrompt(ctx, sg.PromptID)
-	view := toSuggestionView(sg, p.Name)
+	view := s.suggestionDetailView(ctx, sg, p.Name)
 	s.fragmentResponse(w, "prompt_suggestion_detail.html", view, "")
 }
 
+// handlePromptSuggestionRegenerate kicks off a fresh improve+replay round for an existing
+// suggestion, in the background: see regeneratePromptSuggestion (recategorize.go) for why
+// this can't run synchronously in the request once replay is in the picture. Returns the
+// same 'generating' view the detail page already renders with a spinner for a brand-new
+// suggestion (prompt_suggestion_detail.html); the suggestions list's existing 60s poll
+// (templates/index.html) picks up the finished result, no new client-side polling needed.
 func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http.Request) {
 	id, ok := requireID(w, r)
 	if !ok {
@@ -1468,35 +1590,14 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 		_ = json.Unmarshal([]byte(sg.ConversationJSON), &conv)
 	}
 
-	suggested, newConv, llmErr := s.llm.ImprovePromptInstructions(ctx, llm.ImproveRequest{
-		PromptName:           p.Name,
-		LabelName:            p.LabelName,
-		OriginalInstructions: sg.OriginalInstructions,
-		TriggerKind:          sg.TriggerKind,
-		EmailSubject:         sg.EmailSubject,
-		EmailSender:          sg.EmailSender,
-		EmailBody:            sg.EmailBodySnapshot,
-		PriorConversation:    conv,
-		UserComment:          userComment,
-	})
-	if llmErr != nil {
-		http.Error(w, "AI error: "+llmErr.Error(), http.StatusInternalServerError)
+	if err := s.store.MarkPromptSuggestionGenerating(ctx, id); err != nil {
+		http.Error(w, "regenerate failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	convJSON, _ := json.Marshal(newConv) //nolint:errchkjson // []ChatMessage cannot fail
-	_ = s.store.UpdatePromptSuggestion(ctx, db.UpdatePromptSuggestionParams{
-		SuggestedInstructions: suggested,
-		ConversationJSON:      string(convJSON),
-		UserComment:           userComment,
-		ID:                    id,
-	})
+	go s.regeneratePromptSuggestion(s.ctx, id, p, sg.OriginalInstructions, conv, userComment)
 
 	view := toSuggestionView(sg, p.Name)
-	view.UpdatedAt = db.Now()
-	view.SuggestedInstructions = suggested
-	view.UserComment = userComment
-	view.Status = db.SuggestionStatusPending
+	view.Status = db.SuggestionStatusGenerating
 	s.fragmentResponse(w, "prompt_suggestion_detail.html", view, "")
 }
 
@@ -1511,7 +1612,15 @@ func (s *server) handlePromptSuggestionApply(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if err := s.store.ApplyPromptSuggestionAndUpdatePrompt(ctx, id, sg.PromptID, sg.SuggestedInstructions); err != nil {
+	// Which false_negative/false_positive examples this suggestion was built from — marks
+	// them resolved once applied, so future improve rounds for this rule stop re-showing
+	// problems it already fixed (see db.PromptExample.ResolvedBySuggestionID). Empty for
+	// suggestions generated before this field existed; that's fine, there's nothing to mark.
+	var problemKeys []db.ResolvedExampleKey
+	if sg.ProblemExampleKeys != "" {
+		_ = json.Unmarshal([]byte(sg.ProblemExampleKeys), &problemKeys)
+	}
+	if err := s.store.ApplyPromptSuggestionAndUpdatePrompt(ctx, id, sg.PromptID, sg.SuggestedInstructions, problemKeys); err != nil {
 		http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

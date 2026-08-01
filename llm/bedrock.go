@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -77,6 +78,13 @@ const (
 	// a model family the registry doesn't recognize yet; empty (the default) means "use
 	// the registry, or no-op if the model isn't in it."
 	SettingClassifyReasoningDirective = "classify_reasoning_directive"
+	// SettingImproveReplay toggles replaying a candidate rule against its example corpus
+	// on the classify model before showing a suggestion (see ReplayAgainstExamples).
+	// "1" (the default when unset) enables it; any other value disables it. Read directly
+	// via db.Store.GetSetting from recategorize.go/server.go, not through this package's
+	// resolveSetting — replay is orchestrated by the caller (which example set to use, when
+	// to run it), not by Client itself, so there's no per-call resolution to centralize here.
+	SettingImproveReplay = "improve_replay"
 )
 
 // Values for SettingClassifyTier and SettingImproveTier.
@@ -311,14 +319,29 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
+// ExampleRef is one labeled example rendered into an improve call's user turn — a
+// compact view of db.PromptExample (sender/subject/body-excerpt only; the verdict is
+// carried by which ImproveRequest slice the example sits in, not a field here).
+type ExampleRef struct {
+	Sender  string
+	Subject string
+	Excerpt string
+}
+
+// ImproveRequest carries a rule and its labeled-example corpus into ImprovePromptInstructions,
+// grouped by verdict instead of the single mishandled email the pre-corpus version used:
+// ShouldMatch (false negatives — emails the rule missed), ShouldNotMatch (false positives —
+// emails the rule wrongly caught), and AlreadyCorrect (confirmed positives — emails the rule
+// must keep matching). Any slice may be empty, including all three for a rule with no
+// recorded corpus yet; the improve prompt is written to stay coherent in that case.
 type ImproveRequest struct {
 	PromptName           string
 	LabelName            string
 	OriginalInstructions string
-	TriggerKind          string
-	EmailSubject         string
-	EmailSender          string
-	EmailBody            string
+	ShouldMatch          []ExampleRef
+	ShouldNotMatch       []ExampleRef
+	AlreadyCorrect       []ExampleRef
+	UserNote             string
 	PriorConversation    []ChatMessage
 	UserComment          string
 }
@@ -696,25 +719,43 @@ func (c *Client) StreamGeneratePromptInstruction(ctx context.Context, descriptio
 
 func (c *Client) streamGenerate(ctx context.Context, description string, ch chan<- StreamChunk) error {
 	model := c.resolveModel(ctx, SettingImproveModel)
-	systemPrompt := "You write email filter rules for an AI classifier. Output only the rule text. No preamble, no drafts, no self-critique, no quotes, no explanation."
+	// Same 60-word/single-line/no-markdown shape as improveSystemPrompt, so a rule
+	// written by the builder and a rule rewritten by the improver read the same way — both
+	// end up inline in buildUserTurn's numbered rule list at classify time, and both are
+	// applied by a small model with reasoning disabled.
+	systemPrompt := "You write email filter rules for an AI classifier. Output only the rule text: one line, at most 60 words, plain declarative prose, no bullets, headings, markdown, quotes, preamble, or self-critique."
 	userMsg := fmt.Sprintf(
-		"Write a 2-4 sentence classifier instruction for emails matching: %q\n\n"+
+		"Write a one-line classifier instruction for emails matching: %q\n\n"+
 			"The instruction must describe: what the email is about, its purpose/intent, "+
 			"and what distinguishes it from similar-but-non-matching emails. "+
 			"Do not use keywords or sender addresses as criteria — focus on meaning and context.\n\n"+
 			"Output ONLY the instruction text.",
 		description)
 
+	// Reasoning suppression (see reasoning.go): same rationale as ImprovePromptInstructions
+	// — a rule padded with chain-of-thought is exactly what this prompt is trying to avoid.
+	sys := systemBlock(systemPrompt)
+	var fields document.Interface
+	if d := reasoningOff(model, ""); !d.isZero() {
+		if d.system != "" {
+			sys = append(sys, sysText(d.system))
+		}
+		if d.fields != nil {
+			fields = document.NewLazyDocument(d.fields)
+		}
+	}
+
 	out, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:  aws.String(model),
-		System:   systemBlock(systemPrompt),
+		System:   sys,
 		Messages: []types.Message{userMessage(userMsg)},
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens:   aws.Int32(2048),
 			Temperature: aws.Float32(0.7),
 		},
-		ServiceTier:     serviceTierFor(c.resolveImproveTier(ctx)),
-		RequestMetadata: requestMetadataFor("generate"),
+		ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
+		AdditionalModelRequestFields: fields,
+		RequestMetadata:              requestMetadataFor("generate"),
 	})
 	if err != nil {
 		return err
@@ -746,18 +787,105 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 // Prompt improvement
 // ============================================================
 
-const improveSystemPrompt = `You are a careful editor of email-classification rules. You are given one existing rule (its name, target Gmail label, and current instructions) and one concrete email that the rule handled incorrectly. Your job is to rewrite the instructions so that the same rule would have handled this email correctly, without damaging its behavior on emails it currently classifies correctly.
+// thinkBlockRe strips a leaked <think>...</think> span — reasoning suppression (reasoningOff
+// in reasoning.go) isn't guaranteed to work for every model family, and this is the one
+// concrete artifact that shows up in raw output when it doesn't.
+var thinkBlockRe = regexp.MustCompile(`(?is)<think>.*?</think>`)
 
-CRITICAL OUTPUT REQUIREMENT: Your entire response must be ONLY the rewritten rule instructions — nothing else. No preamble, no explanation, no "Here is the updated rule:", no quoting of the email, no markdown formatting, no commentary. Think as long as you need internally, but the only thing you output is the new instructions text itself.
+// codeFenceRe unwraps a ```...``` fenced block some models default to for anything that
+// looks like "output text", despite improveSystemPrompt asking for plain prose.
+var codeFenceRe = regexp.MustCompile("(?s)```(?:[a-zA-Z]*\n)?(.*?)```")
 
-Rules for rewriting:
-1. Preserve the rule's original intent. Do not widen scope beyond what the name and label imply. Do not turn a narrow rule into a catch-all.
-2. Never use the specific sender address, subject line, or body phrases of the example email as matching criteria. The example is an illustration, not a fingerprint. Match on meaning, purpose, and context.
-3. If trigger_kind is false_negative: explain what category of email was missed and add language that would match it. If trigger_kind is false_positive: add exclusions or clarify the scope so emails like this one are no longer matched.
-4. Keep the output 2-6 sentences. Plain prose. No bullet lists, no code blocks, no markdown headings.
-5. If the user comments on your suggestion, treat the comment as authoritative feedback and produce another revision that addresses it while still obeying rules 1-4.
+// sanitizeRuleText cleans an LLM-produced rule instruction before it's stored or shown to
+// the user: strips a leaked <think> block, unwraps a markdown code fence and surrounding
+// quotes, then collapses all embedded whitespace (including newlines) to single spaces.
+// That last step isn't cosmetic — buildUserTurn (see the classify section below) renders
+// every rule inline as "N. Name: Instructions" in the numbered rule list sent to the
+// classify model, so a multi-line rule would corrupt the shape of that list for every rule
+// after it. Applied to ImprovePromptInstructions' output; not applied to
+// StreamGeneratePromptInstruction, which streams chunks live as they arrive and has
+// nothing to post-process once the call is a single buffered string.
+func sanitizeRuleText(s string) string {
+	s = thinkBlockRe.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	if m := codeFenceRe.FindStringSubmatch(s); m != nil {
+		s = strings.TrimSpace(m[1])
+	}
+	s = strings.Trim(s, "\"'“”‘’")
+	s = strings.TrimSpace(s)
+	return strings.Join(strings.Fields(s), " ")
+}
 
-Remember: output ONLY the rewritten instructions text. No other text whatsoever.`
+// improveSystemPrompt targets a small model with reasoning disabled (see reasoningOff,
+// applied below) applying the *output* of this call, one email at a time, with no
+// chain-of-thought budget of its own — so the rewritten rule has to be short and literal
+// enough to be decidable on sight. The pre-corpus version of this prompt was framed around
+// a single mishandled email and told the model to "think as long as you need internally,"
+// which is exactly backwards for that target: it produced long, hedged, multi-clause rules
+// that a reasoning-disabled classifier then had to interpret under the same constraint.
+const improveSystemPrompt = `You rewrite email-classification rules. Output only the rewritten rule text.
+
+- One paragraph, one line, at most 60 words.
+- First sentence: what the email IS, by purpose and intent.
+- Then, only if needed: what to exclude, phrased as "Do not match ...".
+- Keep the original scope. Never widen a narrow rule into a catch-all.
+- Never cite a sender, subject, or body phrase from the examples. Generalize to the category.
+- Plain declarative prose. No bullets, headings, markdown, quotes, or hedging.
+
+A small model with no reasoning applies this rule to one email at a time.
+It must be decidable from the email alone.`
+
+// formatExampleRefs renders a labeled-example group as "- sender | subject | excerpt" lines
+// for the improve user turn, one call per ImproveRequest slice (ShouldMatch/ShouldNotMatch/
+// AlreadyCorrect). Returns "" for an empty slice so buildImproveUserTurn can omit the
+// section entirely rather than print an empty heading — matters most for a brand-new rule
+// with no corpus yet, where the prompt otherwise still has to read coherently.
+func formatExampleRefs(refs []ExampleRef) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, r := range refs {
+		fmt.Fprintf(&sb, "- %s | %s | %s\n", r.Sender, r.Subject, r.Excerpt)
+	}
+	return sb.String()
+}
+
+// buildImproveUserTurn renders one ImproveRequest as the improve call's first user turn.
+// Sections for empty example groups are omitted rather than printed empty.
+func buildImproveUserTurn(req ImproveRequest) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "RULE: %s   LABEL: %s\n\nCURRENT:\n%s\n", req.PromptName, req.LabelName, req.OriginalInstructions)
+
+	// Each clause of the closing instruction is only meaningful if its section was
+	// actually printed above — a brand-new rule with no corpus yet would otherwise get a
+	// closing line that references three example groups that don't exist ("every SHOULD
+	// MATCH matches" with no SHOULD MATCH section anywhere above it), which is confusing
+	// rather than merely redundant. goals collects only the clauses that apply.
+	var goals []string
+	if s := formatExampleRefs(req.ShouldMatch); s != "" {
+		fmt.Fprintf(&sb, "\nSHOULD MATCH (missed these):\n%s", s)
+		goals = append(goals, "every SHOULD MATCH matches")
+	}
+	if s := formatExampleRefs(req.ShouldNotMatch); s != "" {
+		fmt.Fprintf(&sb, "\nSHOULD NOT MATCH (wrongly caught these):\n%s", s)
+		goals = append(goals, "no SHOULD NOT MATCH matches")
+	}
+	if s := formatExampleRefs(req.AlreadyCorrect); s != "" {
+		fmt.Fprintf(&sb, "\nALREADY CORRECT (do not break these):\n%s", s)
+		goals = append(goals, "every ALREADY CORRECT still matches")
+	}
+	if req.UserNote != "" {
+		fmt.Fprintf(&sb, "\nUSER NOTE: %s\n", req.UserNote)
+	}
+
+	if len(goals) > 0 {
+		fmt.Fprintf(&sb, "\nRewrite CURRENT so %s.", strings.Join(goals, ", "))
+	} else {
+		sb.WriteString("\nRewrite CURRENT to be clearer and more precise, preserving its exact scope and intent.")
+	}
+	return sb.String()
+}
 
 func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error) {
 	model := c.resolveModel(ctx, SettingImproveModel)
@@ -765,13 +893,8 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 
 	// The first-turn prompt (no prior conversation) is used twice below — once as the
 	// Bedrock message, once as the stored conversation entry — so it's built once here
-	// rather than duplicating the format string and its 6 args at both call sites.
-	firstTurnMsg := fmt.Sprintf(
-		"RULE NAME: %s\nTARGET LABEL: %s\nTRIGGER: %s\n\nCURRENT INSTRUCTIONS:\n%s\n\nMISHANDLED EMAIL:\nFrom: %s\nSubject: %s\nBody:\n%s\n\nRewrite the instructions per the system rules.",
-		req.PromptName, req.LabelName, req.TriggerKind,
-		req.OriginalInstructions,
-		req.EmailSender, req.EmailSubject, req.EmailBody,
-	)
+	// rather than duplicating buildImproveUserTurn at both call sites.
+	firstTurnMsg := buildImproveUserTurn(req)
 
 	if len(req.PriorConversation) > 0 {
 		for _, m := range req.PriorConversation {
@@ -786,21 +909,41 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		msgs = append(msgs, userMessage(firstTurnMsg))
 	}
 
+	// Reasoning suppression (see reasoning.go) was previously classify-only; the improve
+	// model is just as capable of emitting chain-of-thought padding as the classify model,
+	// and improveSystemPrompt now depends on getting a single short line back, not a
+	// paragraph wrapped in a <think> block.
+	sys := systemBlock(improveSystemPrompt)
+	var fields document.Interface
+	if d := reasoningOff(model, ""); !d.isZero() {
+		if d.system != "" {
+			sys = append(sys, sysText(d.system))
+		}
+		if d.fields != nil {
+			fields = document.NewLazyDocument(d.fields)
+		}
+	}
+
 	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:  aws.String(model),
-		System:   systemBlock(improveSystemPrompt),
+		System:   sys,
 		Messages: msgs,
 		InferenceConfig: &types.InferenceConfiguration{
-			MaxTokens:   aws.Int32(16384),
+			// 2048, not the old 16384: that ceiling existed only to absorb chain-of-thought
+			// padding from a reasoning model. With reasoning suppressed above and a 60-word
+			// target in the system prompt, anything near 2048 tokens signals a truncation
+			// or a suppression failure, not a legitimately long answer.
+			MaxTokens:   aws.Int32(2048),
 			Temperature: aws.Float32(0.4),
 		},
-		ServiceTier:     serviceTierFor(c.resolveImproveTier(ctx)),
-		RequestMetadata: requestMetadataFor("improve"),
+		ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
+		AdditionalModelRequestFields: fields,
+		RequestMetadata:              requestMetadataFor("improve"),
 	})
 	if err != nil {
 		return "", nil, err
 	}
-	suggestion := strings.TrimSpace(extractText(out.Output))
+	suggestion := sanitizeRuleText(extractText(out.Output))
 
 	// Build updated conversation for storage
 	var conv []ChatMessage
@@ -813,6 +956,113 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	conv = append(conv, ChatMessage{Role: "assistant", Content: suggestion})
 
 	return suggestion, conv, nil
+}
+
+// ============================================================
+// Replay validation
+// ============================================================
+
+// ReplayExample is one labeled example scored during replay validation. Want is what the
+// candidate rule is expected to output for it (true for a false_negative or
+// confirmed_positive example, false for a false_positive one) — that verdict→bool mapping
+// is the caller's job (recategorize.go's db.Verdict* constants aren't visible from this
+// package, and shouldn't be: this package stays decoupled from db, see the Settings
+// interface above for the same reasoning). Verdict is carried through only for display in
+// ReplayFailures.
+type ReplayExample struct {
+	Verdict string
+	Sender  string
+	Subject string
+	Excerpt string
+	Want    bool
+}
+
+// ReplayFailure is one example the candidate rule scored incorrectly, for display next to
+// the suggestion.
+type ReplayFailure struct {
+	Verdict string `json:"verdict"`
+	Sender  string `json:"sender"`
+	Subject string `json:"subject"`
+	Got     bool   `json:"got"`
+}
+
+// ReplayResult summarizes a replay run. Total counts only examples that were successfully
+// classified — a Bedrock error for one example (throttling, a transient timeout) isn't a
+// signal about the candidate rule's quality, so it's logged and excluded rather than
+// counted as a failure; Total < len(examples) is possible when that happens.
+type ReplayResult struct {
+	Model    string
+	Total    int
+	Passed   int
+	Failures []ReplayFailure
+}
+
+// ReplayAgainstExamples re-runs candidateInstructions through the *classification* model —
+// deliberately not the improve model that produced it — against a set of labeled examples,
+// to answer "will the model that actually labels production mail apply this rewritten rule
+// correctly?" Scoring it with the improve model would measure a model that never sees
+// production email and would flatter every rewrite.
+//
+// This is the one place in the improve flow that's easy to get backwards: every other
+// Bedrock call in ImprovePromptInstructions/streamGenerate resolves SettingImproveModel,
+// and this function is invoked from deep inside that same flow (recategorize.go's
+// runImproveSuggestions). It must call ResolveClassifySettings — never resolveModel(ctx,
+// SettingImproveModel) — resolved once here and reused across every example, exactly as
+// ResolveClassifySettings' own doc comment directs for a batch of calls.
+func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, candidateInstructions string, examples []ReplayExample, concurrency int) ReplayResult {
+	model, tier, reasoningOverride := c.ResolveClassifySettings(ctx)
+	result := ReplayResult{Model: model}
+	if len(examples) == 0 {
+		return result
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	// candidatePrompt is a placeholder — the candidate rule isn't a saved db.Prompt, just
+	// text being evaluated — so ClassifyEmailBatch only ever sees one prompt per call and
+	// its id is never persisted or shown to the user.
+	candidatePrompt := []Prompt{{ID: 1, Name: "candidate", Instructions: candidateInstructions}}
+
+	type outcome struct {
+		ex      ReplayExample
+		got     bool
+		errored bool
+	}
+	outcomes := make([]outcome, len(examples))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i, ex := range examples {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			email := Email{Sender: ex.Sender, Subject: ex.Subject, Body: ex.Excerpt}
+			res, err := c.ClassifyEmailBatch(ctx, store, email, candidatePrompt, model, tier, reasoningOverride, false)
+			if err != nil {
+				outcomes[i] = outcome{ex: ex, errored: true}
+				return
+			}
+			outcomes[i] = outcome{ex: ex, got: res.Results[1]}
+		})
+	}
+	wg.Wait()
+
+	for _, o := range outcomes {
+		if o.errored {
+			store.Log("ERROR", fmt.Sprintf("replay validation: classify failed for example (verdict=%s), excluded from score", o.ex.Verdict))
+			continue
+		}
+		result.Total++
+		if o.got == o.ex.Want {
+			result.Passed++
+		} else {
+			result.Failures = append(result.Failures, ReplayFailure{
+				Verdict: o.ex.Verdict, Sender: o.ex.Sender, Subject: o.ex.Subject, Got: o.got,
+			})
+		}
+	}
+	return result
 }
 
 // ============================================================

@@ -93,3 +93,25 @@ func TestExtractText(t *testing.T) {
 		})
 	}
 }
+
+func TestCollapseExcerpt(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		maxRunes int
+		want     string
+	}{
+		{"collapses newlines and extra spaces", "Hello\n\nworld   there", 100, "Hello world there"},
+		{"truncates to maxRunes", "abcdefghij", 5, "abcde"},
+		{"shorter than max is untouched", "hi", 100, "hi"},
+		{"empty input", "", 10, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := CollapseExcerpt(c.in, c.maxRunes)
+			if got != c.want {
+				t.Errorf("CollapseExcerpt(%q, %d) = %q, want %q", c.in, c.maxRunes, got, c.want)
+			}
+		})
+	}
+}

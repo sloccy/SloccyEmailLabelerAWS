@@ -21,7 +21,9 @@ OllaMail connects to your Gmail accounts via OAuth, processes new mail the momen
 - **Drag-and-drop rule ordering** — control the order in which rules are evaluated
 - **Per-account or global rules** — scope a rule to a specific account or apply it across all accounts
 - **AI prompt builder** — describe what you want to catch in plain English; the LLM writes the classifier instruction for you (streaming output)
-- **AI rule improvement** — flag a mislabeled email from History and the LLM proposes a rewritten rule; review, comment, and apply from the Prompt Updates page
+- **AI rule improvement, grounded in history** — every recategorization permanently records a labeled example (which rule, which verdict, sender/subject/a short excerpt) against that rule. Improvement calls draw on up to ~30 of the newest examples per rule instead of just the one email that triggered the current round, so rewrites are shaped by what the rule already gets right, not just its latest miss
+- **Bulk recategorization** — select multiple emails in History, choose "apply to all" / "remove from all" per rule, and correct them in one action; produces one AI suggestion per rule (not per email) from the combined examples
+- **Suggestion validation** — before you review an AI-suggested rewrite, it's optionally replayed against the rule's example corpus on the *classification* model (never the improver) and shown as a pass rate, e.g. "27/30 correct" — toggle in Settings
 - **Real-time labeling** — optional Gmail push (Pub/Sub → Lambda webhook) processes mail seconds after arrival
 - **Batch classification** — all rules for an email are evaluated in a single Bedrock call for efficiency
 - **Standard/Flex Bedrock tiers** — run classification and the prompt improver on Bedrock's discounted flex tier, selectable per model in Settings
@@ -30,7 +32,7 @@ OllaMail connects to your Gmail accounts via OAuth, processes new mail the momen
 - **Web UI** — manage accounts, rules, retention, settings, and logs from a browser
 - **Auto-label creation** — labels are created in Gmail automatically if they don't exist
 - **Email retention management** — set per-label or global retention rules that auto-trash old emails; add label exemptions to protect important labels
-- **Categorization history** — searchable and filterable log of every labeling decision, with recategorization
+- **Categorization history** — searchable and filterable log of every labeling decision, with single or bulk recategorization
 - **Log export** — download processing logs as CSV
 - **Config import/export** — full backup and restore of accounts, rules, settings, and retention as JSON
 - **Deduplication** — each email is evaluated once per account and never reprocessed
@@ -67,8 +69,8 @@ OllaMail connects to your Gmail accounts via OAuth, processes new mail the momen
   - **WebFunction** — serves the management UI via a **Lambda Function URL**. Two auth modes (see [Open the web interface](#5-open-the-web-interface)): `AWS_IAM` (default; browse via a local SigV4 proxy) or, when the `CfAccessAud` stack parameter is set, a **CloudFront distribution behind Cloudflare Access** with the app verifying the Access JWT on every request.
   - **ScanFunction** — triggered by **EventBridge daily at 2 AM Eastern**. Runs one catch-up labeling pass (`scanOnce`) per invocation and renews Gmail `watch()` registrations. Overlapping runs are safe — processed emails are deduped in DynamoDB.
   - **PushFunction** — public Function URL that receives Gmail push notifications from Pub/Sub (OIDC-verified) and processes just the affected account immediately. This is the primary labeling path when push is configured (step 3b).
-- **DynamoDB** single-table `ollamail` (provisioned 2 RCU / 2 WCU — inside the always-free tier; TTL enabled) — accounts, rules, history, logs, retention, suggestions. Per-account Gmail OAuth tokens are **not** in the table: they live as SSM SecureStrings under `/ollamail/accounts/<id>/token`, so table read access alone can't exfiltrate mailbox credentials.
-- **Amazon Bedrock** — classification, the prompt builder, and rule improvement (models and Standard/Flex service tier selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured).
+- **DynamoDB** single-table `ollamail` (provisioned 2 RCU / 2 WCU — inside the always-free tier; TTL enabled) — accounts, rules, history, logs, retention, suggestions, and a permanent per-rule example corpus that AI rule improvement draws on (no TTL — written only on manual recategorization, so it stays tiny relative to the free tier). Per-account Gmail OAuth tokens are **not** in the table: they live as SSM SecureStrings under `/ollamail/accounts/<id>/token`, so table read access alone can't exfiltrate mailbox credentials.
+- **Amazon Bedrock** — classification, the prompt builder, and rule improvement (models and Standard/Flex service tier selectable in Settings; falls back to `us.amazon.nova-micro-v1:0` until one is configured). Suggestion validation (Settings toggle, on by default) adds a batch of classify calls per suggestion — always on the *classification* model, never the improver, so the resulting pass rate reflects the model that actually labels your mail.
 - **SSM Parameter Store** — the Google OAuth **client** JSON, stored as a SecureString at `/ollamail/credentials`.
 
 > **Scan cadence is fixed in the template** (`template.yaml`, `cron(0 2 * * ? *)` at `America/New_York`, i.e. 2 AM Eastern — off-peak for Bedrock flex-tier traffic). There is no user-configurable poll interval — to change cadence, edit the `ScanSchedule` and redeploy. The **Scan Now** button on the dashboard runs an immediate pass in the web request.
@@ -203,9 +205,9 @@ Flags let you override `-target` (Function URL), `-region`, and `-listen`.
 | **Accounts** | Add Gmail accounts via OAuth; enable/disable/delete |
 | **Prompts** | Define labeling rules in plain English; drag to reorder |
 | **Builder** | AI prompt builder — describe what to catch, let Bedrock write the classifier |
-| **Prompt Updates** | AI-suggested rule rewrites triggered by recategorized emails; review, comment, regenerate, apply |
-| **History** | Searchable log of every labeling decision; recategorize |
-| **Settings** | Choose Bedrock models and Standard/Flex tier per model; reasoning-suppression override; backup/restore config |
+| **Prompt Updates** | AI-suggested rule rewrites grounded in each rule's example corpus, with a validation pass rate; review, comment, regenerate, apply |
+| **History** | Searchable log of every labeling decision; recategorize one email or select many for a bulk action |
+| **Settings** | Choose Bedrock models and Standard/Flex tier per model; reasoning-suppression override; suggestion validation toggle; backup/restore config |
 | **Logs** | Per-account processing history; CSV export |
 | **Retention** | Per-label and global email retention rules; label exemptions |
 | **Troubleshooting** | Test rules against sample emails and inspect raw LLM responses |
