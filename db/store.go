@@ -212,6 +212,12 @@ func pkHistory(accountID int64) string        { return fmt.Sprintf("HIST#%d", ac
 func pkProcessed(accountID int64) string      { return fmt.Sprintf("PROC#%d", accountID) }
 func pkLabelRetention(accountID int64) string { return fmt.Sprintf("LBL_RET#%d", accountID) }
 func pkLabelExemption(accountID int64) string { return fmt.Sprintf("LBL_EX#%d", accountID) }
+func pkExample(promptID int64) string         { return fmt.Sprintf("EXAMPLE#%d", promptID) }
+
+// exampleSK builds a PromptExample sort key with the verdict as a prefix, so
+// ListExamplesByVerdict can scope a Query's KeyConditionExpression to begins_with(SK,
+// verdict+"#") and read only that verdict's newest items instead of the whole partition.
+func exampleSK(verdict, ts string, id int64) string { return verdict + "#" + tsKey(ts, id) }
 
 // ============================================================
 // Atomic counter (replaces AUTOINCREMENT)
@@ -1022,7 +1028,13 @@ func (s *Store) UpdatePromptInstructions(ctx context.Context, arg UpdatePromptIn
 	})
 }
 
+// DeletePrompt removes the prompt itself and its example corpus (DeleteExamplesForPrompt) —
+// folded in here rather than left to each call site, so a rule can never be deleted while
+// leaving an orphaned EXAMPLE# partition behind.
 func (s *Store) DeletePrompt(ctx context.Context, id int64) error {
+	if err := s.DeleteExamplesForPrompt(ctx, id); err != nil {
+		return err
+	}
 	_, err := s.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
@@ -1048,6 +1060,9 @@ func (s *Store) DeletePromptsByAccount(ctx context.Context, accountID sql.NullIn
 				"PK": sv("PROMPT"),
 				"SK": sv(padID(p.ID)),
 			})
+			if err := s.DeleteExamplesForPrompt(ctx, p.ID); err != nil {
+				return err
+			}
 		}
 	}
 	return s.batchDelete(ctx, keys)
@@ -1468,6 +1483,155 @@ func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, 
 	return nil
 }
 
+// MessageHistoryState is one message's resolved state within an account's HIST# partition:
+// its subject/sender/account-email (identical across every row for that message) and the
+// set of prompt ids currently applied to it. Returned by GetHistoryStateForMessages.
+type MessageHistoryState struct {
+	Subject          string
+	Sender           string
+	AccountEmail     string
+	CurrentPromptIDs map[int64]bool
+}
+
+// GetHistoryStateForMessages resolves subject/sender/account-email/current-prompt-ids for
+// many messages in one account with a single partition query — the bulk-recategorize
+// counterpart to GetCurrentPromptIDsForMessage, which reads the whole partition per call
+// and would mean one query per selected email if looped. Messages with no history rows
+// (shouldn't happen for anything selected from the History table, but handled defensively)
+// are simply absent from the returned map.
+func (s *Store) GetHistoryStateForMessages(ctx context.Context, accountID int64, messageIDs []string) (map[string]MessageHistoryState, error) {
+	want := make(map[string]bool, len(messageIDs))
+	for _, mid := range messageIDs {
+		want[mid] = true
+	}
+
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkHistory(accountID)),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]MessageHistoryState, len(messageIDs))
+	for _, it := range items {
+		mid := getStr(it, "messageId")
+		if !want[mid] {
+			continue
+		}
+		st, ok := result[mid]
+		if !ok {
+			st = MessageHistoryState{
+				Subject:          getStr(it, "subject"),
+				Sender:           getStr(it, "sender"),
+				AccountEmail:     getStr(it, "accountEmail"),
+				CurrentPromptIDs: map[int64]bool{},
+			}
+		}
+		if pid := getNullInt64(it, "promptId"); pid.Valid {
+			st.CurrentPromptIDs[pid.Int64] = true
+		}
+		result[mid] = st
+	}
+	return result, nil
+}
+
+// RewriteMessagePlan is one message's post-correction state for RewriteHistoryForMessages:
+// the prompt ids that should remain (already-history rows to keep, same semantics as
+// RewriteHistoryForMessage's keptIDs) and the prompts newly applied (fresh rows to add).
+type RewriteMessagePlan struct {
+	MessageID    string
+	Subject      string
+	Sender       string
+	KeptIDs      []int64
+	AddedPrompts []Prompt
+}
+
+// RewriteHistoryForMessages is the bulk counterpart to RewriteHistoryForMessage: one query
+// over the account's HIST# partition instead of one per message, then batched deletes and
+// puts across every plan. This is the change that keeps a 50-email bulk recategorize inside
+// the 2 RCU/2 WCU provisioned table instead of throttling — looping
+// RewriteHistoryForMessage would mean 50 full partition reads.
+func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, accountEmail string, plans []RewriteMessagePlan) error {
+	if len(plans) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(plans))
+	for _, p := range plans {
+		want[p.MessageID] = true
+	}
+
+	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkHistory(accountID)),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	byMessage := make(map[string][]map[string]types.AttributeValue, len(plans))
+	for _, it := range items {
+		if mid := getStr(it, "messageId"); want[mid] {
+			byMessage[mid] = append(byMessage[mid], it)
+		}
+	}
+
+	var deleteKeys []map[string]types.AttributeValue
+	var putItems []map[string]types.AttributeValue
+	ts := Now()
+
+	for _, p := range plans {
+		keptSet := make(map[int64]bool, len(p.KeptIDs))
+		for _, id := range p.KeptIDs {
+			keptSet[id] = true
+		}
+		for _, it := range byMessage[p.MessageID] {
+			pid := getNullInt64(it, "promptId")
+			if len(p.KeptIDs) == 0 || !pid.Valid || !keptSet[pid.Int64] {
+				deleteKeys = append(deleteKeys, map[string]types.AttributeValue{
+					"PK": it["PK"], "SK": it["SK"],
+				})
+			}
+		}
+		for _, prompt := range p.AddedPrompts {
+			var labelName *string
+			if prompt.LabelName != "" {
+				labelName = ptr(prompt.LabelName)
+			}
+			putItems = append(putItems, historyItem(localID(), ts, HistoryEntry{
+				AccountID:    accountID,
+				AccountEmail: accountEmail,
+				MessageID:    p.MessageID,
+				Subject:      p.Subject,
+				Sender:       p.Sender,
+				PromptID:     ptr(prompt.ID),
+				PromptName:   ptr(prompt.Name),
+				LabelName:    labelName,
+				Actions:      "manual",
+			}))
+		}
+		if len(p.KeptIDs) == 0 && len(p.AddedPrompts) == 0 {
+			putItems = append(putItems, historyItem(localID(), ts, HistoryEntry{
+				AccountID:    accountID,
+				AccountEmail: accountEmail,
+				MessageID:    p.MessageID,
+				Subject:      p.Subject,
+				Sender:       p.Sender,
+			}))
+		}
+	}
+
+	if err := s.batchDelete(ctx, deleteKeys); err != nil {
+		return err
+	}
+	return s.batchPut(ctx, putItems)
+}
+
 // ============================================================
 // Processed emails
 // ============================================================
@@ -1536,14 +1700,23 @@ func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID in
 	return s.deleteAllByPK(ctx, pkProcessed(accountID))
 }
 
-// BatchInsertProcessingResults writes one email's worth of log lines and history entries.
-// IDs are reserved for the whole group in a single counter increment per entity (instead
-// of one per item) and all items are written via BatchWriteItem — cutting what was ~2
-// DynamoDB writes per log/history line down to one counter update per entity plus one
-// batched write per 25 items.
-func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, accountID int64, messageID string) error {
+// BatchInsertProcessingResults writes one email's worth of log lines, history entries, and
+// (passively-confirmed) prompt examples in a single batched write. IDs come from localIDs
+// for every entity here — a process-local, no-round-trip generator, not the atomic nextIDs
+// counter — since each entity's SK already carries a real timestamp for ordering, so the id
+// only needs to be unique, not globally sequential (see localID's doc comment). That's what
+// keeps this call to exactly one BatchWriteItem call per 25 items total, regardless of how
+// many of logs/history/examples are non-empty, instead of a counter round trip per entity.
+//
+// examples is usually just the confirmed_positive rows for whichever prompts this email
+// matched (processor.processEmail) — every email a rule matches and the user never corrects
+// becomes evidence the rule is right about it. Folding them into this same call (rather than
+// a separate InsertPromptExamples call per email) is deliberate: it means passive
+// confirmation adds zero extra DynamoDB API calls per email, only more items in the same
+// existing batch.
+func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error {
 	ts := Now()
-	items := make([]map[string]types.AttributeValue, 0, len(logs)+len(history))
+	items := make([]map[string]types.AttributeValue, 0, len(logs)+len(history)+len(examples))
 
 	if len(logs) > 0 {
 		ids := localIDs(len(logs))
@@ -1555,6 +1728,14 @@ func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntr
 		ids := localIDs(len(history))
 		for i, h := range history {
 			items = append(items, historyItem(ids[i], ts, h))
+		}
+	}
+	if len(examples) > 0 {
+		ids := localIDs(len(examples))
+		for i, e := range examples {
+			e.ID = ids[i]
+			e.CreatedAt = ts
+			items = append(items, promptExampleItem(e))
 		}
 	}
 	if len(items) > 0 {
@@ -1784,6 +1965,133 @@ func (s *Store) InsertEmailCorrection(ctx context.Context, arg InsertEmailCorrec
 }
 
 // ============================================================
+// Prompt examples
+// ============================================================
+//
+// Growth and retention: examples are written from two sources — the recategorize handlers
+// (any verdict, on manual correction) and processor.processEmail (confirmed_positive only,
+// on every ordinary classify match — see BatchInsertProcessingResults). Even at a heavy 200
+// matched-emails/day of passive confirmation, storage grows by roughly
+// 200 × 800B × 365 ≈ 58MB/year — still trivial against the 25GB free-tier allowance — and
+// read cost is unaffected by corpus size either way, since ListExamplesByVerdict is always
+// Limit-bounded regardless of how much has accumulated. So there's still no TTL and no trim
+// job here. The DeleteExamplesForPrompt escape hatch (wired into DeletePrompt) covers the
+// one real reason to clear a prompt's history — its intent changed enough that old examples
+// mislead the improver — without needing a background sweep. See db/models.go's
+// PromptExample doc comment for the key schema (PK = EXAMPLE#<promptId>,
+// SK = <verdict>#<ts>#<padID(id)>).
+
+// InsertPromptExamples writes a batch of examples produced by one recategorization (single
+// or bulk). Deliberately append-only: a re-correction of the same (promptId, messageId)
+// pair writes a new row rather than overwriting the old one. Deduping to "the newest
+// verdict wins" happens at read time in ListExamplesByVerdict's caller
+// (recategorize.go's selectExamplesForPrompt), not here — a dedupe index would cost an
+// extra read-then-write per example, unaffordable during a bulk write at 2 WCU.
+// promptExampleItem and itemToPromptExample are the marshal/unmarshal pair for
+// PromptExample, mirroring every other entity's xToItem/itemToX helpers (accountItem/
+// itemToAccount, suggestionItem/itemToSuggestion, etc.) so the wire format has one place to
+// verify — see db/attributevalue_test.go's PromptExample round-trip tests.
+func promptExampleItem(e PromptExample) map[string]types.AttributeValue {
+	return keyedItem(e, pkExample(e.PromptID), exampleSK(e.Verdict, e.CreatedAt, e.ID), 0)
+}
+
+func itemToPromptExample(it map[string]types.AttributeValue) PromptExample {
+	return unmarshalItem[PromptExample](it)
+}
+
+func (s *Store) InsertPromptExamples(ctx context.Context, examples []PromptExample) error {
+	if len(examples) == 0 {
+		return nil
+	}
+	// localIDs, not nextIDs: same reasoning as BatchInsertProcessingResults — the SK already
+	// carries CreatedAt for ordering, so the id only needs to be unique, not a counter round
+	// trip. This also matters for correctness, not just cost: selectExamplesForPrompt's
+	// "newest verdict wins" dedup (recategorize.go) depends on every PromptExample write
+	// path — this one (manual recategorize) and BatchInsertProcessingResults' (passive
+	// confirmation on classify) — sharing the same monotonically-ordered id source, so a
+	// later correction's id reliably outranks an earlier passive confirmation's regardless
+	// of which of the two code paths wrote which.
+	ids := localIDs(len(examples))
+	ts := Now()
+	items := make([]map[string]types.AttributeValue, len(examples))
+	for i, e := range examples {
+		e.ID = ids[i]
+		e.CreatedAt = ts
+		items[i] = promptExampleItem(e)
+	}
+	return s.batchPut(ctx, items)
+}
+
+// ListExamplesByVerdict returns the newest limit examples of one verdict for a prompt. The
+// KeyConditionExpression's begins_with(SK, verdict+"#") scopes the query to that verdict's
+// contiguous SK range — DynamoDB seeks directly there rather than scanning the rest of the
+// partition — so this reads exactly `limit` items regardless of how large the corpus grows.
+// Uses ddb.Query directly rather than queryAll, which follows pagination to read an entire
+// result set and would defeat the Limit.
+func (s *Store) ListExamplesByVerdict(ctx context.Context, promptID int64, verdict string, limit int32) ([]PromptExample, error) {
+	out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :vprefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK:     sv(pkExample(promptID)),
+			":vprefix": sv(verdict + "#"),
+		},
+		ScanIndexForward: aws.Bool(false),
+		Limit:            aws.Int32(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]PromptExample, len(out.Items))
+	for i, it := range out.Items {
+		result[i] = itemToPromptExample(it)
+	}
+	return result, nil
+}
+
+// CountExamplesByVerdict returns per-verdict counts for a prompt's example corpus (UI
+// badges). Select: COUNT reads only key attributes, not full items; paginates like queryAll
+// since a single Query page caps at ~1MB and a long-lived rule could exceed that.
+func (s *Store) CountExamplesByVerdict(ctx context.Context, promptID int64) (map[string]int64, error) {
+	verdicts := []string{VerdictFalsePositive, VerdictFalseNegative, VerdictConfirmedPositive}
+	counts := make(map[string]int64, len(verdicts))
+	for _, v := range verdicts {
+		var total int64
+		var start map[string]types.AttributeValue
+		for {
+			out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(s.table),
+				KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :vprefix)"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					exprPK:     sv(pkExample(promptID)),
+					":vprefix": sv(v + "#"),
+				},
+				Select:            types.SelectCount,
+				ExclusiveStartKey: start,
+			})
+			if err != nil {
+				return nil, err
+			}
+			total += int64(out.Count)
+			if out.LastEvaluatedKey == nil {
+				break
+			}
+			start = out.LastEvaluatedKey
+		}
+		counts[v] = total
+	}
+	return counts, nil
+}
+
+// DeleteExamplesForPrompt removes every example recorded against a prompt. Called when the
+// prompt itself is deleted (handleDeletePrompt, server.go), and as a manual "Clear
+// examples" action on the prompt card for when a rule's intent has changed enough that its
+// history would mislead the improver.
+func (s *Store) DeleteExamplesForPrompt(ctx context.Context, promptID int64) error {
+	return s.deleteAllByPK(ctx, pkExample(promptID))
+}
+
+// ============================================================
 // Prompt suggestions
 // ============================================================
 
@@ -1887,7 +2195,9 @@ func (s *Store) CountPendingPromptSuggestions(ctx context.Context) (int64, error
 
 func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePromptSuggestionParams) error {
 	return s.updateItem(ctx, "SUGGESTION", padID(arg.ID),
-		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua",
+		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua, "+
+			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayFailures = :rf, "+
+			"problemExampleKeys = :pk",
 		map[string]string{"#s": attrStatus},
 		map[string]types.AttributeValue{
 			":si":         sv(arg.SuggestedInstructions),
@@ -1895,6 +2205,12 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			exprStatus:    sv(arg.Status),
 			":uc":         sv(arg.UserComment),
 			exprUpdatedAt: sv(Now()),
+			":rm":         sv(arg.ReplayModel),
+			":rt":         nv(arg.ReplayTotal),
+			":rp":         nv(arg.ReplayPassed),
+			":rb":         nv(arg.ReplayBaseline),
+			":rf":         sv(arg.ReplayFailures),
+			":pk":         sv(arg.ProblemExampleKeys),
 		})
 }
 
@@ -1925,18 +2241,56 @@ func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
 	return s.setSuggestionStatus(ctx, id, SuggestionStatusApplied)
 }
 
+// MarkPromptSuggestionGenerating flips a suggestion back to "generating" — used when
+// regenerate kicks off a fresh (now asynchronous) improve+replay round in the background,
+// so the detail page immediately shows the same spinner state it uses for a brand-new
+// suggestion instead of the stale previous instructions while Bedrock runs.
+func (s *Store) MarkPromptSuggestionGenerating(ctx context.Context, id int64) error {
+	return s.setSuggestionStatus(ctx, id, SuggestionStatusGenerating)
+}
+
 func (s *Store) DismissPromptSuggestion(ctx context.Context, id int64) error {
 	return s.setSuggestionStatus(ctx, id, SuggestionStatusDismissed)
 }
 
-// ApplyPromptSuggestionAndUpdatePrompt applies a suggestion and updates the prompt in sequence.
-func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, suggestionID int64, promptID int64, newInstructions string) error {
+// MarkExamplesResolved sets resolvedBySuggestionId on each of the given examples — called
+// once, when the suggestion that used them as evidence is applied (see
+// PromptSuggestion.ProblemExampleKeys; never on generate or dismiss, since nothing about
+// the rule has changed in either of those cases). Best-effort per key: a failure on one
+// example is logged and skipped rather than propagated, since this is bookkeeping for
+// future improve rounds, not the primary effect of applying a suggestion — it must never be
+// able to block a rule update the user explicitly asked for.
+func (s *Store) MarkExamplesResolved(ctx context.Context, keys []ResolvedExampleKey, suggestionID int64) {
+	for _, k := range keys {
+		err := s.updateItem(ctx, pkExample(k.PromptID), exampleSK(k.Verdict, k.CreatedAt, k.ID),
+			"SET resolvedBySuggestionId = :sid",
+			nil,
+			map[string]types.AttributeValue{":sid": nv(suggestionID)},
+		)
+		if err != nil {
+			slog.Error("mark example resolved", "prompt_id", k.PromptID, "verdict", k.Verdict, "id", k.ID, "suggestion_id", suggestionID, "err", err)
+		}
+	}
+}
+
+// ApplyPromptSuggestionAndUpdatePrompt applies a suggestion and updates the prompt in
+// sequence, then marks the false_negative/false_positive examples it was built from as
+// resolved (problemExampleKeys — see ResolvedExampleKey) so they're excluded from future
+// improve rounds for this rule. Not transactional, same as the two steps before it — a
+// failure partway through leaves the prompt/suggestion state ahead of the resolved-marking,
+// which is the same order of priority MarkExamplesResolved's own best-effort behavior
+// already assumes.
+func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, suggestionID int64, promptID int64, newInstructions string, problemExampleKeys []ResolvedExampleKey) error {
 	if err := s.UpdatePromptInstructions(ctx, UpdatePromptInstructionsParams{
 		Instructions: newInstructions, ID: promptID,
 	}); err != nil {
 		return err
 	}
-	return s.ApplyPromptSuggestion(ctx, suggestionID)
+	if err := s.ApplyPromptSuggestion(ctx, suggestionID); err != nil {
+		return err
+	}
+	s.MarkExamplesResolved(ctx, problemExampleKeys, suggestionID)
+	return nil
 }
 
 // ============================================================
@@ -2136,6 +2490,20 @@ type FinalizePromptSuggestionParams struct {
 	Status                string
 	UserComment           string
 	ID                    int64
+
+	// Replay validation fields — always set (possibly zero-value when replay didn't run,
+	// e.g. improve_replay disabled or the improve call itself failed). See
+	// PromptSuggestion's doc comment in db/models.go.
+	ReplayModel    string
+	ReplayTotal    int64
+	ReplayPassed   int64
+	ReplayBaseline int64
+	ReplayFailures string
+
+	// ProblemExampleKeys is a JSON-encoded []ResolvedExampleKey — see PromptSuggestion's
+	// doc comment in db/models.go. Empty ("") on a failed improve call, since nothing was
+	// built from anything in that case.
+	ProblemExampleKeys string
 }
 
 type UpdatePromptSuggestionParams struct {

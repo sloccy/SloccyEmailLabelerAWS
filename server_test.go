@@ -225,7 +225,7 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 
 	render := func(classifyTier, improveTier string) string {
 		var sb strings.Builder
-		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", models)
+		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", true, models)
 		if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
 			t.Fatalf("ExecuteTemplate: %v", err)
 		}

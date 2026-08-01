@@ -303,11 +303,13 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 // writeJob carries one email's DynamoDB writes so they can be applied by the single
 // serial writer in processMessageIDs instead of inline inside the classify goroutine.
 // messageID == "" means "don't mark processed" (the LLM-error retry case); llmDebug == nil
-// means skip the (comparatively large) LLM-debug write entirely.
+// means skip the (comparatively large) LLM-debug write entirely. examples is the passive
+// confirmed_positive rows for whichever prompts this email matched — see processEmail.
 type writeJob struct {
 	accountID int64
 	logs      []db.LogEntry
 	history   []db.HistoryEntry
+	examples  []db.PromptExample
 	messageID string
 	llmDebug  *db.AddLlmDebugParams
 }
@@ -315,7 +317,7 @@ type writeJob struct {
 // applyWriteJob persists one writeJob. Errors are logged, not propagated — matching the
 // prior inline behavior where a DB write failure doesn't block or retry email processing.
 func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
-	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.accountID, job.messageID); err != nil {
+	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.examples, job.accountID, job.messageID); err != nil {
 		slog.Error("db write failed", "err", err)
 	}
 	if job.llmDebug != nil {
@@ -359,12 +361,18 @@ func processEmail(
 	logs = append(logs, logger.entries...)
 
 	var history []db.HistoryEntry
+	var examples []db.PromptExample
 
 	if llmErr != nil {
 		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
 		// Don't mark processed (messageID left ""); will retry.
 		return nil, nil, writeJob{accountID: account.ID, logs: logs}
 	}
+
+	// Computed once and reused for every matched prompt below — msg.Body is already in
+	// memory from classification (gmailpkg.IterMessageDetails), so building this costs no
+	// extra Gmail API call, unlike the recategorize path's dedicated FetchMessage.
+	excerpt := gmailpkg.CollapseExcerpt(msg.Body, db.ExampleExcerptRunes)
 
 	var matched []string
 	stop := false
@@ -427,6 +435,26 @@ func processEmail(
 			LlmResponse:  classified.RawResponse,
 			DurationMs:   classified.LatencyMs,
 		})
+		// Passive confirmation: this rule matched and the user hasn't (yet) corrected it —
+		// treat it as evidence the rule is right about this email. Only for prompts that
+		// actually get a history row (the same "not shadowed by an earlier stop-processing
+		// rule" gate as above, since this whole block is skipped via `continue` otherwise);
+		// never a confirmed-negative for prompts that didn't match (see
+		// db.VerdictConfirmedPositive's doc comment on why that's a deliberate omission, not
+		// an oversight). A later manual correction for this same (rule, email) pair — should
+		// the user ever make one — supersedes this at read time via
+		// selectExamplesForPrompt's newest-id-wins dedup (recategorize.go); see
+		// db.InsertPromptExamples' doc comment for why that dedup depends on every
+		// PromptExample write path sharing the same monotonically-ordered id source.
+		examples = append(examples, db.PromptExample{
+			PromptID:    p.ID,
+			AccountID:   account.ID,
+			MessageID:   msg.ID,
+			Verdict:     db.VerdictConfirmedPositive,
+			Sender:      msg.Sender,
+			Subject:     msg.Subject,
+			BodyExcerpt: excerpt,
+		})
 	}
 
 	// If no prompts matched, record a "no match" entry
@@ -473,6 +501,7 @@ func processEmail(
 		accountID: account.ID,
 		logs:      logs,
 		history:   history,
+		examples:  examples,
 		messageID: msg.ID,
 		llmDebug:  llmDebug,
 	}

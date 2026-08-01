@@ -17,6 +17,7 @@ type FakeStore struct {
 	emailToID   map[string]int64
 	settings    map[string]string
 	history     []*CategorizationHistory
+	examples    []*PromptExample
 	processed   map[int64]map[string]bool
 	labelRet    map[int64][]LabelRetention
 	labelExempt map[int64][]LabelExemption
@@ -153,7 +154,7 @@ func (s *FakeStore) FilterUnprocessed(_ context.Context, accountID int64, messag
 	return out, nil
 }
 
-func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry, history []HistoryEntry, accountID int64, messageID string) error {
+func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, h := range history {
@@ -174,6 +175,12 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 		}
 		s.history = append(s.history, entry)
 	}
+	ts := Now()
+	for _, e := range examples {
+		e.ID = s.nextID("examples")
+		e.CreatedAt = ts
+		s.examples = append(s.examples, &e)
+	}
 	if messageID != "" {
 		if s.processed[accountID] == nil {
 			s.processed[accountID] = make(map[string]bool)
@@ -181,6 +188,27 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 		s.processed[accountID][messageID] = true
 	}
 	return nil
+}
+
+// ListExamplesByVerdict mirrors Store.ListExamplesByVerdict for tests: the newest (highest
+// ID) up to limit examples of one verdict for a prompt, newest first — same contract real
+// callers (selectExamplesForPrompt) depend on.
+func (s *FakeStore) ListExamplesByVerdict(_ context.Context, promptID int64, verdict string, limit int32) ([]PromptExample, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var matched []PromptExample
+	for _, e := range s.examples {
+		if e.PromptID == promptID && e.Verdict == verdict {
+			matched = append(matched, *e)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i].ID > matched[j].ID })
+	// Widen limit to int rather than narrow len(matched) to int32 — avoids a lossy
+	// conversion on either side regardless of platform int width.
+	if len(matched) > int(limit) {
+		matched = matched[:limit]
+	}
+	return matched, nil
 }
 
 func (s *FakeStore) RecordLlmDebug(_ context.Context, _ AddLlmDebugParams) error { return nil }

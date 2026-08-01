@@ -39,6 +39,13 @@
           {{end}}{{end}}
         </select>
       </div>
+      <div class="py-3 px-4 border-bottom setting-row">
+        <div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" role="switch" name="improve_replay" id="improve-replay-toggle"{{if .ImproveReplay}} checked{{end}}>
+          <label class="form-check-label fw-medium" for="improve-replay-toggle">Validate suggestions against example history</label>
+        </div>
+        <div class="small text-muted mt-1">Before showing an AI-suggested rule rewrite, replay it against the rule's stored example corpus using the <strong>classification</strong> model (never the improver) and show a pass rate — e.g. "27/30 correct". Adds a classify call per stored example (up to ~30) each time a suggestion is generated or regenerated; costs a fraction of a cent per suggestion on Nova Micro, more on a pricier classification model.</div>
+      </div>
       <div class="py-3 px-4 setting-row">
         <div class="fw-medium">Reasoning suppression override</div>
         <div class="small text-muted mt-1">Reasoning-capable classification models (Qwen3, Nemotron, etc.) are told to skip chain-of-thought automatically, based on the selected model's family — this costs nothing to leave blank. Only set this if your model isn't recognized yet: enter its "reasoning off" soft-switch text (e.g. <code>/no_think</code>) and it overrides the automatic choice. Check the logs after a classify run for a "reasoning: suppressed=true/false" line to confirm it's working.</div>

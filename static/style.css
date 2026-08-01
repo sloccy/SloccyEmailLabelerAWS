@@ -145,6 +145,7 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 /* History table */
 .history-table { width: 100%; min-width: 900px; }
 .history-table th { text-transform: uppercase; font-size: 0.6875rem; letter-spacing: 0.10em; font-weight: 600; opacity: 0.6; }
+.col-select { width: 1%; white-space: nowrap; }
 .col-time { width: 1%; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; padding-right: 2px; }
 .col-account { width: 12%; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
 .col-subject { min-width: 16rem; overflow-wrap: anywhere; }

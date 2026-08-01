@@ -1,6 +1,11 @@
 {{if .}}
   {{range .}}
   <tr>
+    <td class="col-select">
+      {{if .MessageID}}
+      <input type="checkbox" class="form-check-input hist-select" data-aid="{{.AccountID}}" data-mid="{{.MessageID}}" aria-label="Select this email">
+      {{end}}
+    </td>
     <td class="col-time">{{fmtdateStacked .Timestamp}}</td>
     <td class="col-account d-none d-md-table-cell" title="{{.AccountEmail}}">{{.AccountEmail}}</td>
     <td class="col-subject">{{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}</td>
@@ -42,7 +47,7 @@
   </tr>
   {{end}}
 {{else}}
-<tr><td colspan="7"><div class="text-center text-muted py-5">
+<tr><td colspan="8"><div class="text-center text-muted py-5">
   <div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
   No matching history found.
 </div></td></tr>

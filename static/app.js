@@ -376,6 +376,103 @@ function recategorizeToggle(checkbox) {
   }
 }
 
+// ---- Bulk recategorize: history table multi-select ----
+// #hist-body is htmx-swapped (filters, refreshHistory), so selection listeners are
+// document-level delegated handlers rather than bound to the (re-rendered) checkbox
+// elements directly — same pattern as the settings tier toggles above. Checked state
+// itself lives in the DOM (each .hist-select checkbox), not a separate JS-tracked set: a
+// swap wipes out stale checkboxes and their checked state together, so there's nothing to
+// resync by hand — bulkUpdateToolbar() just re-reads the DOM whenever something might have
+// changed.
+const BULK_RECATEGORIZE_MAX = 50;
+
+// bulkSelectedKeys returns the deduped "accountId:messageId" pairs for every checked
+// .hist-select box currently in #hist-body. Multiple history rows can share a messageId
+// (one row per rule that matched that email), so the same email can appear checked via more
+// than one row — Set dedupes that down to one entry per email, matching what the server
+// counts (recategorize_bulk.go's parseBulkSelections dedupes the same way).
+function bulkSelectedKeys() {
+  const boxes = document.querySelectorAll('#hist-body .hist-select:checked');
+  const keys = new Set();
+  boxes.forEach(b => keys.add(b.dataset.aid + ':' + b.dataset.mid));
+  return [...keys];
+}
+
+function bulkUpdateToolbar() {
+  const count = bulkSelectedKeys().length;
+  const toolbar = document.getElementById('hist-bulk-toolbar');
+  const countEl = document.getElementById('hist-bulk-count');
+  if (!toolbar || !countEl) return;
+  toolbar.classList.toggle('d-none', count === 0);
+  toolbar.classList.toggle('d-flex', count > 0);
+  countEl.textContent = count + (count === 1 ? ' email selected' : ' emails selected');
+}
+
+document.addEventListener('change', function(e) {
+  if (e.target.matches('#hist-body .hist-select')) {
+    bulkUpdateToolbar();
+  } else if (e.target.id === 'hist-select-all') {
+    document.querySelectorAll('#hist-body .hist-select').forEach(b => { b.checked = e.target.checked; });
+    bulkUpdateToolbar();
+  }
+});
+
+// Any swap of #hist-body (initial load, a filter change, or the refreshHistory trigger
+// fired after applying a recategorization) discards whatever was checked — reset the
+// header checkbox and toolbar to match rather than showing a stale selected count.
+document.getElementById('hist-body')?.addEventListener('htmx:afterSwap', function() {
+  const selectAll = document.getElementById('hist-select-all');
+  if (selectAll) selectAll.checked = false;
+  bulkUpdateToolbar();
+});
+
+function bulkRecategorizeClearSelection() {
+  document.querySelectorAll('#hist-body .hist-select:checked').forEach(b => { b.checked = false; });
+  const selectAll = document.getElementById('hist-select-all');
+  if (selectAll) selectAll.checked = false;
+  bulkUpdateToolbar();
+}
+
+// bulkActionToggle enforces "Apply to all" / "Remove from all" as mutually exclusive per
+// rule (styled as a segmented btn-check pair, but they're two independent checkboxes —
+// see bulk_recategorize_form.html — so nothing else keeps them from both being checked at
+// once) and shows/hides that rule's "Improve prompt with AI" checkbox based on whether
+// either is checked, mirroring recategorizeToggle's behavior for the single-email modal.
+function bulkActionToggle(checkbox) {
+  const row = checkbox.closest('.bulk-recategorize-row');
+  if (!row) return;
+  const other = checkbox.name === 'apply_prompt_ids'
+    ? row.querySelector('input[name="remove_prompt_ids"]')
+    : row.querySelector('input[name="apply_prompt_ids"]');
+  if (checkbox.checked && other) other.checked = false;
+
+  const anyChecked = row.querySelector('input[name="apply_prompt_ids"]:checked, input[name="remove_prompt_ids"]:checked');
+  const improveWrap = row.querySelector('.bulk-improve-wrap');
+  if (improveWrap) {
+    improveWrap.classList.toggle('d-none', !anyChecked);
+    if (!anyChecked) {
+      const improveCheck = improveWrap.querySelector('input[type="checkbox"]');
+      if (improveCheck) improveCheck.checked = false;
+    }
+  }
+}
+
+function bulkRecategorizeOpen() {
+  const keys = bulkSelectedKeys();
+  if (keys.length === 0) return;
+  if (keys.length > BULK_RECATEGORIZE_MAX) {
+    toast(`Select at most ${BULK_RECATEGORIZE_MAX} emails at a time (${keys.length} selected).`, 'error');
+    return;
+  }
+  const params = new URLSearchParams();
+  keys.forEach(k => params.append('selections', k));
+  htmx.ajax('GET', '/fragments/history/bulk-recategorize?' + params.toString(),
+    { target: '#recategorize-modal-body', swap: 'innerHTML' }
+  ).then(() => {
+    new bootstrap.Modal(document.getElementById('recategorize-modal')).show();
+  });
+}
+
 // ---- Suggestions badge ----
 function _refreshSuggestionsBadge() {
   fetch('/fragments/prompt-suggestions')

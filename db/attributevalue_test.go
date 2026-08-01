@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -369,5 +370,192 @@ func TestSuggestionRoundTrip_NoCorrection(t *testing.T) {
 	got := itemToSuggestion(item)
 	if got.CorrectionID != nil {
 		t.Errorf("CorrectionID = %v, want nil", got.CorrectionID)
+	}
+}
+
+// TestSuggestionRoundTrip_ReplayFields locks in the wire format for the replay-validation
+// fields added to PromptSuggestion (see db/models.go): they're plain MarshalMap/UnmarshalMap
+// fields, not part of suggestionItem's InsertPromptSuggestionParams construction (replay
+// results only exist once FinalizePromptSuggestion writes them, after the improve+replay
+// round completes), so this round-trips the struct directly rather than via suggestionItem.
+func TestSuggestionRoundTrip_ReplayFields(t *testing.T) {
+	want := PromptSuggestion{
+		ID: 9, PromptID: 5, Status: "pending",
+		ReplayModel: "us.amazon.nova-micro-v1:0", ReplayTotal: 30, ReplayPassed: 27, ReplayBaseline: 24,
+		ReplayFailures: `[{"Verdict":"false_positive","Sender":"a@example.com","Subject":"s","Got":true}]`,
+	}
+	item := mustMarshalMap(want)
+	got := unmarshalItem[PromptSuggestion](item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestSuggestionRoundTrip_ReplayFieldsOmittedWhenZero checks that a suggestion which never
+// ran replay (improve_replay disabled, or an older item from before these fields existed)
+// round-trips to the zero value rather than some other sentinel — the UI's "render the
+// validation block only when ReplayTotal > 0" check (see suggestionDetailView in server.go)
+// depends on this.
+func TestSuggestionRoundTrip_ReplayFieldsOmittedWhenZero(t *testing.T) {
+	want := PromptSuggestion{ID: 9, PromptID: 5, Status: "pending"}
+	item := mustMarshalMap(want)
+	for _, attr := range []string{"replayModel", "replayTotal", "replayPassed", "replayBaseline", "replayFailures"} {
+		if _, ok := item[attr]; ok {
+			t.Errorf("item[%q] present; want omitted (omitempty) when zero-value", attr)
+		}
+	}
+	got := unmarshalItem[PromptSuggestion](item)
+	if got.ReplayTotal != 0 || got.ReplayPassed != 0 || got.ReplayBaseline != 0 || got.ReplayModel != "" || got.ReplayFailures != "" {
+		t.Errorf("decoded replay fields not zero: %+v", got)
+	}
+}
+
+// ============================================================
+// PromptExample
+// ============================================================
+
+func TestPromptExampleRoundTrip(t *testing.T) {
+	want := PromptExample{
+		ID: 3, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, AccountID: 1,
+		MessageID: "msg1", Verdict: VerdictFalseNegative,
+		Sender: "a@example.com", Subject: "Hello", BodyExcerpt: "excerpt text", Note: "note text",
+	}
+	item := promptExampleItem(want)
+
+	if got, ok := item["PK"].(*types.AttributeValueMemberS); !ok || got.Value != "EXAMPLE#5" {
+		t.Errorf("PK = %v, want EXAMPLE#5", item["PK"])
+	}
+	wantSK := "false_negative#2026-07-01 12:00:00#00000000000000000003"
+	if got, ok := item["SK"].(*types.AttributeValueMemberS); !ok || got.Value != wantSK {
+		t.Errorf("SK = %v, want %q", item["SK"], wantSK)
+	}
+
+	got := itemToPromptExample(item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestPromptExampleRoundTrip_SKVerdictPrefix checks the property ListExamplesByVerdict's
+// begins_with(SK, verdict+"#") query depends on: every verdict produces a distinctly
+// prefixed SK, so a query scoped to one verdict can never accidentally match another's items
+// (e.g. "false_negative#..." must not begin_with "false_positive#", and vice versa — a risk
+// specifically because those two strings share a long common prefix, "false_"+"n"/"p"...).
+func TestPromptExampleRoundTrip_SKVerdictPrefix(t *testing.T) {
+	verdicts := []string{VerdictFalseNegative, VerdictFalsePositive, VerdictConfirmedPositive}
+	for _, v := range verdicts {
+		e := PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: v}
+		item := promptExampleItem(e)
+		skAttr, ok := item["SK"].(*types.AttributeValueMemberS)
+		if !ok {
+			t.Fatalf("verdict %q: SK attribute type = %T, want *types.AttributeValueMemberS", v, item["SK"])
+		}
+		sk := skAttr.Value
+		if !strings.HasPrefix(sk, v+"#") {
+			t.Errorf("verdict %q: SK = %q, want prefix %q", v, sk, v+"#")
+		}
+		for _, other := range verdicts {
+			if other == v {
+				continue
+			}
+			if strings.HasPrefix(sk, other+"#") {
+				t.Errorf("verdict %q: SK %q unexpectedly also matches prefix %q", v, sk, other+"#")
+			}
+		}
+	}
+}
+
+// TestPromptExampleRoundTrip_LocalIDsProduceDistinctOrderedSKs exercises the exact pattern
+// InsertPromptExamples and BatchInsertProcessingResults now both use — several examples
+// sharing one batch-level CreatedAt timestamp, with per-example IDs coming from localIDs
+// (switched from the atomic nextIDs counter so passive confirmation on classify, which can't
+// afford a round trip per email, has the same batched-ID-allocation shape as logs/history).
+// Guards against a regression where switching id sources broke the SK's role as a stable
+// sort/tie-break key within one batch.
+func TestPromptExampleRoundTrip_LocalIDsProduceDistinctOrderedSKs(t *testing.T) {
+	ids := localIDs(5)
+	ts := "2026-07-01 12:00:00"
+	seen := make(map[string]bool, len(ids))
+	var prevSK string
+	for i, id := range ids {
+		e := PromptExample{ID: id, CreatedAt: ts, PromptID: 5, Verdict: VerdictConfirmedPositive}
+		item := promptExampleItem(e)
+		skAttr, ok := item["SK"].(*types.AttributeValueMemberS)
+		if !ok {
+			t.Fatalf("example %d: SK attribute type = %T, want *types.AttributeValueMemberS", i, item["SK"])
+		}
+		sk := skAttr.Value
+		if seen[sk] {
+			t.Fatalf("example %d: SK %q collided with a previous example in the same batch", i, sk)
+		}
+		seen[sk] = true
+		if i > 0 && sk <= prevSK {
+			t.Errorf("example %d: SK %q did not sort after previous SK %q (ids from localIDs must stay ordered within a batch)", i, sk, prevSK)
+		}
+		prevSK = sk
+
+		got := itemToPromptExample(item)
+		if got.ID != id {
+			t.Errorf("example %d: round-tripped ID = %d, want %d", i, got.ID, id)
+		}
+	}
+}
+
+// TestPromptExampleRoundTrip_ResolvedBySuggestion checks a resolved example (see
+// PromptExample.ResolvedBySuggestionID) survives the marshal/unmarshal round trip — the
+// property MarkExamplesResolved's UpdateItem and selectExamplesForPrompt's filterResolved
+// both depend on.
+func TestPromptExampleRoundTrip_ResolvedBySuggestion(t *testing.T) {
+	sid := int64(7)
+	want := PromptExample{
+		ID: 3, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, AccountID: 1,
+		MessageID: "msg1", Verdict: VerdictFalsePositive,
+		Sender: "a@example.com", Subject: "Hello", BodyExcerpt: "excerpt",
+		ResolvedBySuggestionID: &sid,
+	}
+	item := promptExampleItem(want)
+	got := itemToPromptExample(item)
+	if got.ResolvedBySuggestionID == nil || *got.ResolvedBySuggestionID != sid {
+		t.Fatalf("ResolvedBySuggestionID = %v, want %d", got.ResolvedBySuggestionID, sid)
+	}
+	got.ResolvedBySuggestionID, want.ResolvedBySuggestionID = nil, nil
+	if got != want {
+		t.Errorf("round trip mismatch (excluding ResolvedBySuggestionID, checked above): got %+v, want %+v", got, want)
+	}
+}
+
+// TestPromptExampleRoundTrip_UnresolvedIsExplicitNull checks a still-live example (the
+// overwhelming common case) marshals resolvedBySuggestionId as an explicit DynamoDB NULL,
+// not an omitted attribute — matching this codebase's established nullable-pointer
+// convention (see db/models.go's package doc comment).
+func TestPromptExampleRoundTrip_UnresolvedIsExplicitNull(t *testing.T) {
+	e := PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive}
+	item := promptExampleItem(e)
+	if _, ok := item["resolvedBySuggestionId"]; !ok {
+		t.Error("resolvedBySuggestionId attribute missing; want explicit NULL")
+	}
+	if _, isNull := item["resolvedBySuggestionId"].(*types.AttributeValueMemberNULL); !isNull {
+		t.Errorf("resolvedBySuggestionId = %T, want NULL", item["resolvedBySuggestionId"])
+	}
+	got := itemToPromptExample(item)
+	if got.ResolvedBySuggestionID != nil {
+		t.Errorf("ResolvedBySuggestionID = %v, want nil", got.ResolvedBySuggestionID)
+	}
+}
+
+// TestSuggestionRoundTrip_ProblemExampleKeys checks PromptSuggestion.ProblemExampleKeys —
+// the JSON-encoded []ResolvedExampleKey handlePromptSuggestionApply parses to know which
+// examples to mark resolved — round-trips through MarshalMap/UnmarshalMap untouched (it's
+// an opaque string field as far as DynamoDB is concerned; the JSON structure itself is
+// exercised by recategorize_test.go's TestProblemExampleKeys).
+func TestSuggestionRoundTrip_ProblemExampleKeys(t *testing.T) {
+	want := PromptSuggestion{
+		ID: 9, PromptID: 5, Status: "pending",
+		ProblemExampleKeys: `[{"promptId":5,"verdict":"false_positive","createdAt":"2026-07-01 12:00:00","id":3}]`,
+	}
+	item := mustMarshalMap(want)
+	got := unmarshalItem[PromptSuggestion](item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
 	}
 }
