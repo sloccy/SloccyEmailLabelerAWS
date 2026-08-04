@@ -428,11 +428,11 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	applyWriteJob(t.Context(), store, job)
 
 	// Verify history was written.
-	history, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &accID, Limit: 10})
+	page, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &accID, Limit: 10})
 	if err != nil {
 		t.Fatalf("GetHistoryFiltered: %v", err)
 	}
-	if len(history) == 0 {
+	if len(page.Rows) == 0 {
 		t.Error("expected history row after processEmail")
 	}
 
@@ -544,9 +544,9 @@ func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
 	applyWriteJob(t.Context(), store, job)
 
-	history, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
+	page, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
 	found := false
-	for _, h := range history {
+	for _, h := range page.Rows {
 		if h.MessageID == "nomatch1" {
 			found = true
 		}
@@ -726,12 +726,12 @@ func TestClaimMessages_ExactlyOnceUnderRace(t *testing.T) {
 	if llmClient.calls != 1 {
 		t.Errorf("expected exactly 1 ClassifyEmailBatch call, got %d", llmClient.calls)
 	}
-	history, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &account.ID, Limit: 10})
+	page, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &account.ID, Limit: 10})
 	if err != nil {
 		t.Fatalf("GetHistoryFiltered: %v", err)
 	}
-	if len(history) != 1 {
-		t.Errorf("expected exactly 1 history row, got %d", len(history))
+	if len(page.Rows) != 1 {
+		t.Errorf("expected exactly 1 history row, got %d", len(page.Rows))
 	}
 }
 

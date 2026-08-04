@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -272,4 +273,73 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 			t.Error("improve flex select should be enabled when improve tier is flex")
 		}
 	})
+}
+
+// ============================================================
+// History pagination (handleHistory helpers)
+// ============================================================
+//
+// handleHistory itself isn't exercised end-to-end here: server.store is a concrete
+// *db.Store (not db.StoreIface), so it can't take a db.FakeStore without a much wider
+// interface than this change needs — server.go calls ~40 distinct *db.Store methods, and
+// GetHistoryFiltered's own pagination correctness is already covered directly against
+// db.FakeStore in db/history_page_test.go. What's tested here is the handler-local logic
+// that sits around that call: the page-size/ceiling math and the sentinel URL builder.
+
+func TestHistoryPageLimit(t *testing.T) {
+	tests := []struct {
+		name               string
+		pageSize, maxLimit int
+		loaded             int64
+		wantLimit          int64
+		wantCeilingHit     bool
+	}{
+		{"first page, plenty of room", 50, 500, 0, 50, false},
+		{"final partial page clamps to what's left", 50, 500, 480, 20, false},
+		{"exactly one row of room left", 50, 500, 499, 1, false},
+		{"ceiling already reached", 50, 500, 500, 0, true},
+		{"ceiling already exceeded", 50, 500, 600, 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			limit, ceilingHit := historyPageLimit(tc.pageSize, tc.maxLimit, tc.loaded)
+			if limit != tc.wantLimit || ceilingHit != tc.wantCeilingHit {
+				t.Errorf("historyPageLimit(%d, %d, %d) = (%d, %v), want (%d, %v)",
+					tc.pageSize, tc.maxLimit, tc.loaded, limit, ceilingHit, tc.wantLimit, tc.wantCeilingHit)
+			}
+		})
+	}
+}
+
+func TestHistoryNextURL(t *testing.T) {
+	q := url.Values{
+		"account_id": {"7"},
+		"subject":    {"invoice"},
+	}
+
+	got := historyNextURL(q, "2026-08-01 09:12:03#00000000000000000017", 50)
+
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("historyNextURL produced an unparseable URL %q: %v", got, err)
+	}
+	if parsed.Path != "/fragments/history" {
+		t.Errorf("path = %q, want /fragments/history", parsed.Path)
+	}
+	vals := parsed.Query()
+	if vals.Get("account_id") != "7" || vals.Get("subject") != "invoice" {
+		t.Errorf("existing filters not preserved: %v", vals)
+	}
+	if vals.Get("cursor") != "2026-08-01 09:12:03#00000000000000000017" {
+		t.Errorf("cursor = %q", vals.Get("cursor"))
+	}
+	if vals.Get("loaded") != "50" {
+		t.Errorf("loaded = %q, want 50", vals.Get("loaded"))
+	}
+
+	// q itself must be untouched — handleHistory reads filters from it earlier in the
+	// same request and must not see cursor/loaded bleed back into that read.
+	if _, ok := q["cursor"]; ok {
+		t.Error("historyNextURL must not mutate its q argument")
+	}
 }

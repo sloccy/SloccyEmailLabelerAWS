@@ -257,32 +257,105 @@ func (s *FakeStore) ListExamplesByVerdict(_ context.Context, promptID int64, ver
 
 func (s *FakeStore) RecordLlmDebug(_ context.Context, _ AddLlmDebugParams) error { return nil }
 
-func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) ([]CategorizationHistory, error) {
+// GetHistoryFiltered mirrors Store.GetHistoryFiltered's cursor-page contract: newest
+// first (ts desc, id desc — the same order as the real store's SK), a cursor that
+// resumes strictly below a given SK, and a NextCursor that only goes empty once every
+// row below the cursor has actually been examined. Unlike the real store it doesn't
+// split work per account or per DynamoDB page (everything's already in memory), but the
+// examined/consumed bookkeeping is kept in step with it so tests exercise the same
+// short-page and cursor-advance-without-a-match behavior a sparse filter produces there.
+func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (HistoryPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var result []CategorizationHistory
-	for _, h := range s.history {
-		if f.AccountID != nil && h.AccountID != *f.AccountID {
-			continue
-		}
-		if f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID) {
-			continue
-		}
-		if f.Unmatched && h.PromptID != nil {
-			continue
-		}
-		if f.SubjectQ != "" && !strings.Contains(h.Subject, f.SubjectQ) {
-			continue
-		}
-		if f.SenderQ != "" && !strings.Contains(h.Sender, f.SenderQ) {
-			continue
-		}
-		result = append(result, *h)
+
+	pageSize := f.Limit
+	if pageSize <= 0 {
+		pageSize = 50
 	}
-	if f.Limit > 0 && int64(len(result)) > f.Limit {
-		result = result[:f.Limit]
+
+	var accountIDs []int64
+	if f.AccountID != nil {
+		accountIDs = []int64{*f.AccountID}
+	} else {
+		seenAcct := map[int64]bool{}
+		for _, h := range s.history {
+			if !seenAcct[h.AccountID] {
+				seenAcct[h.AccountID] = true
+				accountIDs = append(accountIDs, h.AccountID)
+			}
+		}
 	}
-	return result, nil
+
+	byTsIDDesc := func(rows []*CategorizationHistory) func(i, j int) bool {
+		return func(i, j int) bool {
+			if rows[i].Timestamp != rows[j].Timestamp {
+				return rows[i].Timestamp > rows[j].Timestamp
+			}
+			return rows[i].ID > rows[j].ID
+		}
+	}
+
+	// Per account: sort newest-first, apply the cursor bound, then cap at pageSize — this
+	// mirrors Store.GetHistoryFiltered's per-account ddb.Query(Limit: pageSize), which is
+	// what actually bounds work per request there. Capping only the *merged* list (as an
+	// earlier version of this fake did) doesn't reproduce that: it lets one call walk an
+	// unbounded number of items in-memory looking for pageSize matches, silently defeating
+	// the short/empty-page behavior a sparse filter produces against the real store.
+	var all []*CategorizationHistory
+	moreBeyondFetched := false
+	for _, aid := range accountIDs {
+		var acctRows []*CategorizationHistory
+		for _, h := range s.history {
+			if h.AccountID == aid {
+				acctRows = append(acctRows, h)
+			}
+		}
+		sort.Slice(acctRows, byTsIDDesc(acctRows))
+		if f.Cursor != "" {
+			cut := 0
+			for cut < len(acctRows) && tsKey(acctRows[cut].Timestamp, acctRows[cut].ID) >= f.Cursor {
+				cut++
+			}
+			acctRows = acctRows[cut:]
+		}
+		if int64(len(acctRows)) > pageSize {
+			moreBeyondFetched = true // this account's partition has more past what we took
+			acctRows = acctRows[:pageSize]
+		}
+		all = append(all, acctRows...)
+	}
+	sort.Slice(all, byTsIDDesc(all))
+
+	// Walk the merge applying the (in the real store, Go-only) filters, same as
+	// Store.GetHistoryFiltered: the cursor tracks the last item *examined*, not the last
+	// matched, so a resumed page can't skip or repeat rows this call didn't get to.
+	var filtered []CategorizationHistory
+	lastConsumedSK := ""
+	consumedAll := true
+	for i, h := range all {
+		lastConsumedSK = tsKey(h.Timestamp, h.ID)
+		switch {
+		case f.Unmatched && h.PromptID != nil:
+			continue
+		case f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID):
+			continue
+		case f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)):
+			continue
+		case f.SenderQ != "" && !strings.Contains(strings.ToLower(h.Sender), strings.ToLower(f.SenderQ)):
+			continue
+		}
+		filtered = append(filtered, *h)
+		if int64(len(filtered)) >= pageSize {
+			consumedAll = i == len(all)-1
+			break
+		}
+	}
+
+	nextCursor := ""
+	if !consumedAll || moreBeyondFetched {
+		nextCursor = lastConsumedSK
+	}
+	return HistoryPage{Rows: filtered, NextCursor: nextCursor}, nil
 }
 
 func (s *FakeStore) GetLabelRetention(_ context.Context, accountID int64) ([]LabelRetention, error) {

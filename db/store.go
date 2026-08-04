@@ -1245,59 +1245,89 @@ func (s *Store) GetHistoryLlmResponse(ctx context.Context, id int64) (string, er
 	return row.LlmResponse, nil
 }
 
-func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]CategorizationHistory, error) {
+// HistoryPage is one page of GetHistoryFiltered results plus a cursor to resume from.
+// NextCursor is an opaque SK ("ts#paddedID") to pass back as HistoryFilter.Cursor for
+// the next page; "" means no more data.
+type HistoryPage struct {
+	Rows       []CategorizationHistory
+	NextCursor string
+}
+
+// GetHistoryFiltered returns one page (f.Limit rows, or the codebase default of 50 if
+// unset) of history, newest first, optionally scoped to one account and filtered by
+// prompt/unmatched/subject/sender.
+//
+// Each account gets exactly one bounded Query — never queryAll, which would read an
+// entire (up to 30-day) partition per request; see ListExamplesByVerdict's doc comment
+// for why queryAll defeats a Limit. Unmatched/PromptID are pushed into DynamoDB as a
+// FilterExpression; SubjectQ/SenderQ are case-insensitive substring matches, which
+// DynamoDB's case-sensitive contains() can't express, so they're applied in Go after the
+// merge. Because a FilterExpression (like any post-Limit filter) can shrink a page below
+// f.Limit — or empty it out entirely, for a sparse search term — callers paginating via
+// NextCursor should be prepared for short or empty pages that still have more after them;
+// NextCursor is only "" once every account's partition is truly exhausted at this cursor.
+func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (HistoryPage, error) {
 	var accountIDs []int64
 	if f.AccountID != nil {
 		accountIDs = []int64{*f.AccountID}
 	} else {
 		accs, err := s.ListAccounts(ctx)
 		if err != nil {
-			return nil, err
+			return HistoryPage{}, err
 		}
 		for _, a := range accs {
 			accountIDs = append(accountIDs, a.ID)
 		}
 	}
 
-	// With no text/prompt filter to apply in Go, each account's query can be capped at
-	// f.Limit directly in DynamoDB: per-account results are already newest-first, so the
-	// merged top f.Limit across accounts is still exact. Filtered queries (subject/sender
-	// substring, prompt id, unmatched) still read the full partition since matches can be
-	// sparse and a DynamoDB-side Limit would cut off pre-filter, not post-filter.
-	unfiltered := !f.Unmatched && f.PromptID == nil && f.SubjectQ == "" && f.SenderQ == ""
+	pageSize := f.Limit
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+
+	keyCond := "PK = :pk"
+	if f.Cursor != "" {
+		keyCond += " AND SK < :cur"
+	}
+	var filterExpr *string
+	filterVals := map[string]types.AttributeValue{}
+	switch {
+	case f.Unmatched:
+		filterExpr = aws.String("attribute_not_exists(promptId)")
+	case f.PromptID != nil:
+		filterExpr = aws.String("promptId = :pid")
+		filterVals[":pid"] = nv(*f.PromptID)
+	}
 
 	var all []CategorizationHistory
+	// moreBeyondFetched is true if any account's Query was cut off by Limit rather than
+	// running out of items — i.e. that account's partition has more data past what was
+	// fetched here, so the overall result can't be "done" even if every fetched item gets
+	// consumed below.
+	moreBeyondFetched := false
 	for _, aid := range accountIDs {
-		var items []map[string]types.AttributeValue
-		var err error
-		if unfiltered && f.Limit > 0 {
-			var out *dynamodb.QueryOutput
-			out, err = s.ddb.Query(ctx, &dynamodb.QueryInput{
-				TableName:              aws.String(s.table),
-				KeyConditionExpression: aws.String("PK = :pk"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					exprPK: sv(pkHistory(aid)),
-				},
-				ScanIndexForward: aws.Bool(false),
-				Limit:            aws.Int32(i32(f.Limit)),
-			})
-			if out != nil {
-				items = out.Items
-			}
-		} else {
-			items, err = s.queryAll(ctx, &dynamodb.QueryInput{
-				TableName:              aws.String(s.table),
-				KeyConditionExpression: aws.String("PK = :pk"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					exprPK: sv(pkHistory(aid)),
-				},
-				ScanIndexForward: aws.Bool(false),
-			})
+		vals := map[string]types.AttributeValue{exprPK: sv(pkHistory(aid))}
+		if f.Cursor != "" {
+			vals[":cur"] = sv(f.Cursor)
 		}
+		for k, v := range filterVals {
+			vals[k] = v
+		}
+		out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(s.table),
+			KeyConditionExpression:    aws.String(keyCond),
+			FilterExpression:          filterExpr,
+			ExpressionAttributeValues: vals,
+			ScanIndexForward:          aws.Bool(false),
+			Limit:                     aws.Int32(i32(pageSize)),
+		})
 		if err != nil {
 			continue
 		}
-		for _, it := range items {
+		if out.LastEvaluatedKey != nil {
+			moreBeyondFetched = true
+		}
+		for _, it := range out.Items {
 			h := itemToHistory(it)
 			// Strip llmResponse for list view (return sentinel if exists)
 			llmR := h.LlmResponse
@@ -1309,7 +1339,8 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 		}
 	}
 
-	// Sort all results newest first
+	// Merge-sort newest first — same order as the SK each row came from, so walking this
+	// list in order and cutting at any point yields a valid resume cursor.
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Timestamp != all[j].Timestamp {
 			return all[i].Timestamp > all[j].Timestamp
@@ -1317,27 +1348,35 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]Cate
 		return all[i].ID > all[j].ID
 	})
 
-	// Apply filters in Go
+	// Walk the merge, applying the Go-only text filters, until pageSize matches or the
+	// merged list runs out. The cursor tracks the last item *examined* here (matched or
+	// not) — not the last matched row — so a resumed page picks up exactly where this one
+	// left off instead of skipping or repeating unexamined rows.
 	var filtered []CategorizationHistory
-	for _, h := range all {
-		if f.Unmatched && h.PromptID != nil {
-			continue
-		}
-		if f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID) {
-			continue
-		}
+	lastConsumedSK := ""
+	consumedAll := true
+	for i, h := range all {
 		if f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)) {
+			lastConsumedSK = tsKey(h.Timestamp, h.ID)
 			continue
 		}
 		if f.SenderQ != "" && !strings.Contains(strings.ToLower(h.Sender), strings.ToLower(f.SenderQ)) {
+			lastConsumedSK = tsKey(h.Timestamp, h.ID)
 			continue
 		}
 		filtered = append(filtered, h)
-		if f.Limit > 0 && int64(len(filtered)) >= f.Limit {
+		lastConsumedSK = tsKey(h.Timestamp, h.ID)
+		if int64(len(filtered)) >= pageSize {
+			consumedAll = i == len(all)-1
 			break
 		}
 	}
-	return filtered, nil
+
+	nextCursor := ""
+	if !consumedAll || moreBeyondFetched {
+		nextCursor = lastConsumedSK
+	}
+	return HistoryPage{Rows: filtered, NextCursor: nextCursor}, nil
 }
 
 // TurnaroundSample is one LLM latency data point (one per processed email) used to build
@@ -2659,6 +2698,9 @@ type HistoryFilter struct {
 	SubjectQ  string
 	SenderQ   string
 	Limit     int64
+	// Cursor resumes a previous GetHistoryFiltered page: only rows with SK strictly less
+	// than this are considered. "" starts from the newest row. See HistoryPage.NextCursor.
+	Cursor string
 }
 
 // ============================================================

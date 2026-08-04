@@ -24,7 +24,7 @@ type StoreIface interface {
 	BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error
 	RecordLlmDebug(ctx context.Context, e AddLlmDebugParams) error
 
-	GetHistoryFiltered(ctx context.Context, f HistoryFilter) ([]CategorizationHistory, error)
+	GetHistoryFiltered(ctx context.Context, f HistoryFilter) (HistoryPage, error)
 
 	GetLabelRetention(ctx context.Context, accountID int64) ([]LabelRetention, error)
 	AddLabelRetention(ctx context.Context, arg AddLabelRetentionParams) error

@@ -1,5 +1,4 @@
-{{if .}}
-  {{range .}}
+{{range .Rows}}
   <tr>
     <td class="col-select">
       {{if .MessageID}}
@@ -45,10 +44,20 @@
       </button>
     </td>
   </tr>
-  {{end}}
-{{else}}
+{{end}}
+{{if and (not .Rows) .FirstPage}}
 <tr><td colspan="8"><div class="text-center text-muted py-5">
   <div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
   No matching history found.
 </div></td></tr>
+{{end}}
+{{if .NextURL}}
+<tr hx-get="{{.NextURL}}" hx-trigger="revealed" hx-swap="outerHTML" hx-include="#hist-filter-form">
+  <td colspan="8" class="text-center py-3"><span class="spinner-border spinner-border-sm text-muted" aria-hidden="true"></span></td>
+</tr>
+{{end}}
+{{if .Truncated}}
+<tr><td colspan="8" class="text-center text-muted small py-3">
+  Showing the first {{.MaxLimit}} results &mdash; narrow your filters to see more.
+</td></tr>
 {{end}}
