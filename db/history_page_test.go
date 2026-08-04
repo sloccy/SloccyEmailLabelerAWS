@@ -9,14 +9,13 @@ import (
 // BatchInsertProcessingResults (whose Timestamp is always Now()) so tests can control
 // exact timestamps and ids — needed to build interleaved, multi-account fixtures for
 // cursor-pagination tests.
-func seedHistoryRow(s *FakeStore, id, accountID int64, ts, subject, sender string, promptID *int64) {
+func seedHistoryRow(s *FakeStore, id, accountID int64, ts, subject, sender string) {
 	s.history = append(s.history, &CategorizationHistory{
 		ID:        id,
 		Timestamp: ts,
 		AccountID: accountID,
 		Subject:   subject,
 		Sender:    sender,
-		PromptID:  promptID,
 	})
 }
 
@@ -29,10 +28,10 @@ func TestGetHistoryFiltered_CursorWalk_NoDuplicatesOrGaps(t *testing.T) {
 	accID, _ := s.UpsertAccount(t.Context(), UpsertAccountParams{Email: "walk@example.com"})
 
 	const n = 27
-	for i := int64(0); i < n; i++ {
+	for i := range n {
 		// Zero-padded seconds so lexicographic == chronological order, matching tsKey.
 		ts := "2026-08-01 00:00:" + padSeconds(i)
-		seedHistoryRow(s, i+1, accID, ts, "subject", "sender@example.com", nil)
+		seedHistoryRow(s, int64(i)+1, accID, ts, "subject", "sender@example.com")
 	}
 
 	var walked []CategorizationHistory
@@ -86,13 +85,13 @@ func TestGetHistoryFiltered_SparseFilterTerminates(t *testing.T) {
 	accID, _ := s.UpsertAccount(t.Context(), UpsertAccountParams{Email: "sparse@example.com"})
 
 	const n = 40
-	for i := int64(0); i < n; i++ {
+	for i := range n {
 		ts := "2026-08-01 00:01:" + padSeconds(i%60)
 		subject := "newsletter digest"
 		if i == 3 || i == 35 { // sparse matches, spread across the dataset
 			subject = "Special Offer Inside"
 		}
-		seedHistoryRow(s, i+1, accID, ts, subject, "sender@example.com", nil)
+		seedHistoryRow(s, int64(i)+1, accID, ts, subject, "sender@example.com")
 	}
 
 	var matched []CategorizationHistory
@@ -133,9 +132,9 @@ func TestGetHistoryFiltered_MultiAccountMergeOrder(t *testing.T) {
 	acc2, _ := s.UpsertAccount(t.Context(), UpsertAccountParams{Email: "acc2@example.com"})
 
 	// Interleaved: acc2's row sits chronologically between acc1's two rows.
-	seedHistoryRow(s, 1, acc1, "2026-08-01 00:00:03", "a-newest", "s", nil)
-	seedHistoryRow(s, 2, acc2, "2026-08-01 00:00:02", "b-middle", "s", nil)
-	seedHistoryRow(s, 3, acc1, "2026-08-01 00:00:01", "a-oldest", "s", nil)
+	seedHistoryRow(s, 1, acc1, "2026-08-01 00:00:03", "a-newest", "s")
+	seedHistoryRow(s, 2, acc2, "2026-08-01 00:00:02", "b-middle", "s")
+	seedHistoryRow(s, 3, acc1, "2026-08-01 00:00:01", "a-oldest", "s")
 
 	page, err := s.GetHistoryFiltered(t.Context(), HistoryFilter{Limit: 10})
 	if err != nil {
@@ -154,6 +153,6 @@ func TestGetHistoryFiltered_MultiAccountMergeOrder(t *testing.T) {
 
 // padSeconds formats n as a two-digit, zero-padded string for building ordered
 // "HH:MM:SS"-style fixture timestamps.
-func padSeconds(n int64) string {
+func padSeconds(n int) string {
 	return fmt.Sprintf("%02d", n)
 }

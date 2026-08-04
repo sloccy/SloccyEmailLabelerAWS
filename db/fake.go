@@ -286,7 +286,7 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 		}
 	}
 
-	byTsIDDesc := func(rows []*CategorizationHistory) func(i, j int) bool {
+	byTSIDDesc := func(rows []*CategorizationHistory) func(i, j int) bool {
 		return func(i, j int) bool {
 			if rows[i].Timestamp != rows[j].Timestamp {
 				return rows[i].Timestamp > rows[j].Timestamp
@@ -301,7 +301,7 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 	// earlier version of this fake did) doesn't reproduce that: it lets one call walk an
 	// unbounded number of items in-memory looking for pageSize matches, silently defeating
 	// the short/empty-page behavior a sparse filter produces against the real store.
-	var all []*CategorizationHistory
+	all := make([]*CategorizationHistory, 0, int(pageSize)*len(accountIDs))
 	moreBeyondFetched := false
 	for _, aid := range accountIDs {
 		var acctRows []*CategorizationHistory
@@ -310,7 +310,7 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 				acctRows = append(acctRows, h)
 			}
 		}
-		sort.Slice(acctRows, byTsIDDesc(acctRows))
+		sort.Slice(acctRows, byTSIDDesc(acctRows))
 		if f.Cursor != "" {
 			cut := 0
 			for cut < len(acctRows) && tsKey(acctRows[cut].Timestamp, acctRows[cut].ID) >= f.Cursor {
@@ -324,7 +324,7 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 		}
 		all = append(all, acctRows...)
 	}
-	sort.Slice(all, byTsIDDesc(all))
+	sort.Slice(all, byTSIDDesc(all))
 
 	// Walk the merge applying the (in the real store, Go-only) filters, same as
 	// Store.GetHistoryFiltered: the cursor tracks the last item *examined*, not the last
