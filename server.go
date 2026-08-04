@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"mime"
 	"net/http"
 	"net/url"
@@ -920,10 +921,7 @@ func historyPageLimit(pageSize, maxLimit int, loaded int64) (limit int64, ceilin
 	if remaining <= 0 {
 		return 0, true
 	}
-	limit = int64(pageSize)
-	if limit > remaining {
-		limit = remaining
-	}
+	limit = min(int64(pageSize), remaining)
 	return limit, false
 }
 
@@ -933,9 +931,7 @@ func historyPageLimit(pageSize, maxLimit int, loaded int64) (limit int64, ceilin
 // filters the caller already read from it.
 func historyNextURL(q url.Values, cursor string, loaded int64) string {
 	next := url.Values{}
-	for k, v := range q {
-		next[k] = v
-	}
+	maps.Copy(next, q)
 	next.Set("cursor", cursor)
 	next.Set("loaded", strconv.FormatInt(loaded, 10))
 	return "/fragments/history?" + next.Encode()

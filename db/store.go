@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"sort"
@@ -796,22 +797,41 @@ func (s *Store) UpdateLastScan(ctx context.Context, id int64) error {
 // Conditioned to only ever move it forward: two pushes for the same account can race
 // (push.go has no cross-invocation lock around this update), and an unconditional SET
 // would let the slower one clobber a newer id with a stale one, causing re-listing of
-// already-processed history on the next pass. Gmail history ids are decimal strings
-// compared as strings here — fine in practice since digit-length only grows on ~10-year
-// timescales — so this deliberately doesn't parse them as numbers.
+// already-processed history on the next pass.
+//
+// The advance-only check is done on watchHistNum, a second N-type attribute written
+// alongside the S-type watchHist everything else reads (Account.WatchHistoryID,
+// push.go's strconv.ParseUint, gmailpkg.ListHistoryAddedMessageIDs) — not on watchHist
+// itself. Gmail history ids are decimal strings that grow a digit within weeks to months
+// of active use (they increment on every mailbox change, not just new mail), and
+// DynamoDB compares S-type attributes lexicographically: at a rollover like "9999999" ->
+// "10000000", "watchHist < :h" would evaluate true even though "10000000" is the larger,
+// newer id, permanently rejecting every future advance. watchHistNum sidesteps that by
+// comparing as DynamoDB N (numeric) instead. Existing accounts have no watchHistNum yet,
+// so attribute_not_exists(watchHistNum) is true on their first write here — same "never
+// seen" idiom ClaimMessages uses for attrLeaseExp — seeding it correctly with no
+// migration step.
 func (s *Store) UpdateAccountWatch(ctx context.Context, arg UpdateAccountWatchParams) error {
+	hn, perr := strconv.ParseUint(arg.HistoryID, 10, 64)
+	if perr != nil {
+		return fmt.Errorf("invalid history id %q: %w", arg.HistoryID, perr)
+	}
+	if hn > math.MaxInt64 {
+		return fmt.Errorf("history id %q exceeds int64 range", arg.HistoryID)
+	}
 	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table),
 		Key: map[string]types.AttributeValue{
 			"PK": sv("ACCOUNT"),
 			"SK": sv(padID(arg.ID)),
 		},
-		UpdateExpression: aws.String("SET watchHist = :h, watchExp = :e"),
+		UpdateExpression: aws.String("SET watchHist = :h, watchHistNum = :hn, watchExp = :e"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":h": sv(arg.HistoryID),
-			":e": nv(arg.Expiration),
+			":h":  sv(arg.HistoryID),
+			":hn": nv(int64(hn)), // bounds-checked above
+			":e":  nv(arg.Expiration),
 		},
-		ConditionExpression: aws.String("attribute_not_exists(watchHist) OR watchHist < :h"),
+		ConditionExpression: aws.String("attribute_not_exists(watchHistNum) OR watchHistNum < :hn"),
 	})
 	if err != nil {
 		var ccf *types.ConditionalCheckFailedException
@@ -1310,9 +1330,7 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 		if f.Cursor != "" {
 			vals[":cur"] = sv(f.Cursor)
 		}
-		for k, v := range filterVals {
-			vals[k] = v
-		}
+		maps.Copy(vals, filterVals)
 		out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
 			TableName:                 aws.String(s.table),
 			KeyConditionExpression:    aws.String(keyCond),

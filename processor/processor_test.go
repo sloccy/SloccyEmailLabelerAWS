@@ -667,6 +667,7 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 // mechanism exists to prevent.
 type countingLLMClient struct {
 	*llm.FakeClient
+
 	mu    sync.Mutex
 	calls int
 }
@@ -700,9 +701,7 @@ func TestClaimMessages_ExactlyOnceUnderRace(t *testing.T) {
 	var totalClaimed int
 	const racers = 8
 	for range racers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			claimed, err := store.ClaimMessages(t.Context(), account.ID, []string{msg.ID})
 			if err != nil {
 				t.Errorf("ClaimMessages: %v", err)
@@ -716,7 +715,7 @@ func TestClaimMessages_ExactlyOnceUnderRace(t *testing.T) {
 			}
 			_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
 			applyWriteJob(t.Context(), store, job)
-		}()
+		})
 	}
 	wg.Wait()
 
