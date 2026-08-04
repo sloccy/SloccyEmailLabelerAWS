@@ -52,7 +52,7 @@
 </div></td></tr>
 {{end}}
 {{if .NextURL}}
-<tr hx-get="{{.NextURL}}" hx-trigger="revealed" hx-swap="outerHTML" hx-include="#hist-filter-form">
+<tr hx-get="{{.NextURL}}" hx-trigger="intersect once" hx-swap="outerHTML" hx-include="#hist-filter-form">
   <td colspan="8" class="text-center py-3"><span class="spinner-border spinner-border-sm text-muted" aria-hidden="true"></span></td>
 </tr>
 {{end}}
