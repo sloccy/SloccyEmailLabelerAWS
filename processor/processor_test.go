@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -346,12 +347,17 @@ func TestProcessEmail_LLMError(t *testing.T) {
 
 	modifies, trashIDs, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
 
-	// On LLM error, processEmail returns nil and does NOT mark the message processed.
+	// On LLM error, processEmail returns nil and releases (rather than confirms) the
+	// claim taken before classification, so the message becomes claimable again instead
+	// of being marked processed.
 	if len(modifies) != 0 || len(trashIDs) != 0 {
 		t.Errorf("expected nil on LLM error, got modifies=%v trash=%v", modifies, trashIDs)
 	}
-	if job.messageID != "" {
-		t.Errorf("expected empty messageID (not marked processed) on LLM error, got %q", job.messageID)
+	if !job.release {
+		t.Errorf("expected release=true on LLM error")
+	}
+	if job.messageID != msg.ID {
+		t.Errorf("expected messageID %q so the release targets the right claim, got %q", msg.ID, job.messageID)
 	}
 }
 
@@ -648,6 +654,84 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 	}
 	if len(unprocessed) != 0 {
 		t.Errorf("expected all %d messages marked processed, still unprocessed: %v", n, unprocessed)
+	}
+}
+
+// ============================================================
+// Claim leases — exactly-once classification under overlapping invocations
+// ============================================================
+
+// countingLLMClient wraps *llm.FakeClient to count ClassifyEmailBatch calls, so the test
+// below can assert the LLM was invoked exactly once for a message two callers race on —
+// the actual bug (duplicate Bedrock calls from overlapping Lambda invocations) this claim
+// mechanism exists to prevent.
+type countingLLMClient struct {
+	*llm.FakeClient
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingLLMClient) ClassifyEmailBatch(ctx context.Context, logger llm.StoreLogger, email llm.Email, prompts []llm.Prompt, model, tier, reasoningOverride string, debug bool) (llm.ClassifyResult, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.FakeClient.ClassifyEmailBatch(ctx, logger, email, prompts, model, tier, reasoningOverride, debug)
+}
+
+// TestClaimMessages_ExactlyOnceUnderRace reproduces the reported bug directly: two
+// concurrent callers both see the same message as unprocessed (as they would when a push
+// notification and an overlapping scan race), both attempt to claim it, and only one may
+// win. This mirrors the claim step processMessageIDs runs before classification
+// (processor.go) — without needing a live Gmail service, since processEmail takes an
+// already-fetched gmailpkg.Message and the claim itself lives entirely in the store.
+func TestClaimMessages_ExactlyOnceUnderRace(t *testing.T) {
+	store := newTestStore(t)
+	llmClient := &countingLLMClient{FakeClient: llm.NewFakeClient(`{"1": true}`)}
+
+	account := newTestAccount()
+	msg := gmailpkg.Message{ID: "race1", Subject: "Race", Sender: "news@test.com", Body: "content"}
+	prompts := []db.Prompt{
+		{ID: 1, Name: "NL", LabelName: "newsletters", Active: 1, Instructions: "label nl"},
+	}
+	labelCache := map[string]string{"newsletters": "L1"}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var totalClaimed int
+	const racers = 8
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claimed, err := store.ClaimMessages(t.Context(), account.ID, []string{msg.ID})
+			if err != nil {
+				t.Errorf("ClaimMessages: %v", err)
+				return
+			}
+			mu.Lock()
+			totalClaimed += len(claimed)
+			mu.Unlock()
+			if len(claimed) == 0 {
+				return // lost the race; a real caller would stop here too
+			}
+			_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+			applyWriteJob(t.Context(), store, job)
+		}()
+	}
+	wg.Wait()
+
+	if totalClaimed != 1 {
+		t.Errorf("expected exactly 1 of %d racers to win the claim, got %d", racers, totalClaimed)
+	}
+	if llmClient.calls != 1 {
+		t.Errorf("expected exactly 1 ClassifyEmailBatch call, got %d", llmClient.calls)
+	}
+	history, err := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{AccountID: &account.ID, Limit: 10})
+	if err != nil {
+		t.Fatalf("GetHistoryFiltered: %v", err)
+	}
+	if len(history) != 1 {
+		t.Errorf("expected exactly 1 history row, got %d", len(history))
 	}
 }
 

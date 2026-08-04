@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // FakeStore is an in-memory StoreIface implementation for tests.
@@ -13,12 +14,15 @@ import (
 type FakeStore struct {
 	mu sync.Mutex
 
-	accounts    map[int64]*Account
-	emailToID   map[string]int64
-	settings    map[string]string
-	history     []*CategorizationHistory
-	examples    []*PromptExample
-	processed   map[int64]map[string]bool
+	accounts  map[int64]*Account
+	emailToID map[string]int64
+	settings  map[string]string
+	history   []*CategorizationHistory
+	examples  []*PromptExample
+	// processed mirrors the DynamoDB "PROC#" item's state machine: no entry means never
+	// claimed, a zero time.Time means confirmed (matches "no leaseExp attribute" in
+	// production), and a non-zero time is a claim's lease expiry.
+	processed   map[int64]map[string]time.Time
 	labelRet    map[int64][]LabelRetention
 	labelExempt map[int64][]LabelExemption
 	retention   map[int64]AccountRetention
@@ -31,7 +35,7 @@ func NewFake() *FakeStore {
 		accounts:    make(map[int64]*Account),
 		emailToID:   make(map[string]int64),
 		settings:    make(map[string]string),
-		processed:   make(map[int64]map[string]bool),
+		processed:   make(map[int64]map[string]time.Time),
 		labelRet:    make(map[int64][]LabelRetention),
 		labelExempt: make(map[int64][]LabelExemption),
 		retention:   make(map[int64]AccountRetention),
@@ -145,13 +149,53 @@ func (s *FakeStore) FilterUnprocessed(_ context.Context, accountID int64, messag
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pm := s.processed[accountID]
+	now := time.Now()
 	var out []string
 	for _, id := range messageIDs {
-		if pm == nil || !pm[id] {
-			out = append(out, id)
+		exp, ok := pm[id]
+		if !ok || (!exp.IsZero() && !exp.After(now)) {
+			out = append(out, id) // never seen, or an expired (reclaimable) lease
 		}
 	}
 	return out, nil
+}
+
+// ClaimMessages mirrors Store.ClaimMessages: wins each id whose entry is absent, an
+// expired lease, or — matching ClaimMessages' actual condition, which only checks the
+// lease, not confirmation — never overwrites a confirmed (zero-time) entry.
+func (s *FakeStore) ClaimMessages(_ context.Context, accountID int64, messageIDs []string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.processed[accountID] == nil {
+		s.processed[accountID] = make(map[string]time.Time)
+	}
+	pm := s.processed[accountID]
+	now := time.Now()
+	claimed := make([]string, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		exp, ok := pm[id]
+		if ok && (exp.IsZero() || exp.After(now)) {
+			continue // confirmed, or an active lease owned by someone else
+		}
+		pm[id] = now.Add(claimLeaseSeconds * time.Second)
+		claimed = append(claimed, id)
+	}
+	return claimed, nil
+}
+
+// ReleaseClaim mirrors Store.ReleaseClaim: only removes a live claim, never a confirmed
+// (zero-time) marker.
+func (s *FakeStore) ReleaseClaim(_ context.Context, accountID int64, messageID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pm := s.processed[accountID]
+	if pm == nil {
+		return nil
+	}
+	if exp, ok := pm[messageID]; ok && !exp.IsZero() {
+		delete(pm, messageID)
+	}
+	return nil
 }
 
 func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error {
@@ -183,9 +227,9 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 	}
 	if messageID != "" {
 		if s.processed[accountID] == nil {
-			s.processed[accountID] = make(map[string]bool)
+			s.processed[accountID] = make(map[string]time.Time)
 		}
-		s.processed[accountID][messageID] = true
+		s.processed[accountID][messageID] = time.Time{} // confirmed
 	}
 	return nil
 }
