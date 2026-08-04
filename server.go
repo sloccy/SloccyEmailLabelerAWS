@@ -822,12 +822,34 @@ type historyRow struct {
 	HasLlmResponse bool
 }
 
+// historyTableView is what history_table.html renders: one page of rows plus enough to
+// drive infinite scroll. NextURL is the sentinel row's hx-get target — "" means either
+// this is the last page or HistoryMaxLimit (Truncated) was reached, and no sentinel
+// should be rendered. FirstPage gates the "No matching history found" empty state, so an
+// empty *later* page (a sparse filter can legitimately return zero matches on a given
+// page — see GetHistoryFiltered's doc comment) doesn't render it mid-scroll.
+type historyTableView struct {
+	Rows      []historyRow
+	NextURL   string
+	FirstPage bool
+	Truncated bool
+	MaxLimit  int // only meaningful when Truncated; shown in the terminal row's message
+}
+
 func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
 
+	firstPage := q.Get("cursor") == ""
+	var loaded int64
+	if v := q.Get("loaded"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			loaded = n
+		}
+	}
+
 	filter := db.HistoryFilter{
-		Limit: int64(s.cfg.HistoryMaxLimit),
+		Cursor: q.Get("cursor"),
 	}
 	if v := q.Get("account_id"); v != "" {
 		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -844,15 +866,23 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	filter.SubjectQ = q.Get("subject")
 	filter.SenderQ = q.Get("sender")
 
-	rows, err := s.store.GetHistoryFiltered(ctx, filter)
+	view := historyTableView{FirstPage: firstPage, MaxLimit: s.cfg.HistoryMaxLimit}
+	limit, ceilingHit := historyPageLimit(s.cfg.HistoryPageSize, s.cfg.HistoryMaxLimit, loaded)
+	if ceilingHit {
+		view.Truncated = true
+		s.fragmentResponse(w, "history_table.html", view, "")
+		return
+	}
+	filter.Limit = limit
+
+	page, err := s.store.GetHistoryFiltered(ctx, filter)
 	if err != nil {
 		slog.Error("history query", "err", err)
-		rows = nil
 	}
 
-	views := make([]historyRow, len(rows))
-	for i, h := range rows {
-		views[i] = historyRow{
+	view.Rows = make([]historyRow, len(page.Rows))
+	for i, h := range page.Rows {
+		view.Rows[i] = historyRow{
 			ID:             h.ID,
 			AccountID:      h.AccountID,
 			MessageID:      h.MessageID,
@@ -865,10 +895,50 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 			HasLlmResponse: h.LlmResponse != "",
 		}
 		if h.Actions != "" {
-			views[i].ExtraActions = strings.Split(h.Actions, ",")
+			view.Rows[i].ExtraActions = strings.Split(h.Actions, ",")
 		}
 	}
-	s.fragmentResponse(w, "history_table.html", views, "")
+
+	newLoaded := loaded + int64(len(page.Rows))
+	if page.NextCursor != "" {
+		if newLoaded >= int64(s.cfg.HistoryMaxLimit) {
+			view.Truncated = true
+		} else {
+			view.NextURL = historyNextURL(q, page.NextCursor, newLoaded)
+		}
+	}
+	s.fragmentResponse(w, "history_table.html", view, "")
+}
+
+// historyPageLimit decides this request's DynamoDB Limit given the configured page size,
+// the HistoryMaxLimit ceiling on rows loaded across an entire scroll session, and how
+// many rows have already been loaded so far. ceilingHit means the ceiling was already
+// reached before this request — the caller should render a Truncated terminal row
+// without querying at all, rather than a (potentially zero-size) Limit.
+func historyPageLimit(pageSize, maxLimit int, loaded int64) (limit int64, ceilingHit bool) {
+	remaining := int64(maxLimit) - loaded
+	if remaining <= 0 {
+		return 0, true
+	}
+	limit = int64(pageSize)
+	if limit > remaining {
+		limit = remaining
+	}
+	return limit, false
+}
+
+// historyNextURL builds the infinite-scroll sentinel's hx-get target: the current
+// request's query values with cursor/loaded overwritten to resume after this page. q is
+// not mutated — url.Values is a map, so mutating it in place would also change the
+// filters the caller already read from it.
+func historyNextURL(q url.Values, cursor string, loaded int64) string {
+	next := url.Values{}
+	for k, v := range q {
+		next[k] = v
+	}
+	next.Set("cursor", cursor)
+	next.Set("loaded", strconv.FormatInt(loaded, 10))
+	return "/fragments/history?" + next.Encode()
 }
 
 func (s *server) handleTroubleshooting(w http.ResponseWriter, r *http.Request) {

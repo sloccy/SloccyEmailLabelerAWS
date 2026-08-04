@@ -25,6 +25,11 @@ Parameters:
   HistoryMaxLimit:
     Type: Number
     Default: 500
+  # Rows fetched per history-page request (infinite scroll on the History tab).
+  # HistoryMaxLimit above is now the ceiling across all pages loaded, not a single fetch.
+  HistoryPageSize:
+    Type: Number
+    Default: 50
   # ARN of the SSM SecureString parameter holding the Google OAuth credentials JSON.
   # Create with: aws ssm put-parameter --name /ollamail/credentials --type SecureString --value "$(cat credentials.json)"
   CredentialsSsmArn:
@@ -98,6 +103,7 @@ Globals:
         EMAIL_BODY_TRUNCATION: !Ref EmailBodyTruncation
         LOG_RETENTION_DAYS: !Ref LogRetentionDays
         HISTORY_MAX_LIMIT: !Ref HistoryMaxLimit
+        HISTORY_PAGE_SIZE: !Ref HistoryPageSize
         # Name of the SSM SecureString the app reads at runtime for Google OAuth creds.
         CREDENTIALS_SSM_PARAM: /ollamail/credentials
         # Gmail push wiring (empty = disabled). Web/scan use the topic to register/renew

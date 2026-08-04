@@ -15,6 +15,7 @@ type Config struct {
 	EmailBodyTrunc     int
 	LogRetentionDays   int
 	HistoryMaxLimit    int
+	HistoryPageSize    int
 	DebugLogging       bool
 	Mode               string // "web", "scan", or "push"
 
@@ -46,6 +47,7 @@ func loadConfig() Config {
 		EmailBodyTrunc:     getEnvInt("EMAIL_BODY_TRUNCATION", 3000),
 		LogRetentionDays:   getEnvInt("LOG_RETENTION_DAYS", 30),
 		HistoryMaxLimit:    getEnvInt("HISTORY_MAX_LIMIT", 500),
+		HistoryPageSize:    getEnvInt("HISTORY_PAGE_SIZE", 50),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
 		Mode:               getEnv("MODE", "web"),
 
