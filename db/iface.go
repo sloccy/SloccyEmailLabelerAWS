@@ -19,6 +19,8 @@ type StoreIface interface {
 	UpdateLastScan(ctx context.Context, id int64) error
 
 	FilterUnprocessed(ctx context.Context, accountID int64, messageIDs []string) ([]string, error)
+	ClaimMessages(ctx context.Context, accountID int64, messageIDs []string) ([]string, error)
+	ReleaseClaim(ctx context.Context, accountID int64, messageID string) error
 	BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error
 	RecordLlmDebug(ctx context.Context, e AddLlmDebugParams) error
 

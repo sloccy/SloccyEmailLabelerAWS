@@ -792,11 +792,35 @@ func (s *Store) UpdateLastScan(ctx context.Context, id int64) error {
 	})
 }
 
+// UpdateAccountWatch advances the account's stored Gmail history-id watermark.
+// Conditioned to only ever move it forward: two pushes for the same account can race
+// (push.go has no cross-invocation lock around this update), and an unconditional SET
+// would let the slower one clobber a newer id with a stale one, causing re-listing of
+// already-processed history on the next pass. Gmail history ids are decimal strings
+// compared as strings here — fine in practice since digit-length only grows on ~10-year
+// timescales — so this deliberately doesn't parse them as numbers.
 func (s *Store) UpdateAccountWatch(ctx context.Context, arg UpdateAccountWatchParams) error {
-	return s.updateItem(ctx, "ACCOUNT", padID(arg.ID), "SET watchHist = :h, watchExp = :e", nil, map[string]types.AttributeValue{
-		":h": sv(arg.HistoryID),
-		":e": nv(arg.Expiration),
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv("ACCOUNT"),
+			"SK": sv(padID(arg.ID)),
+		},
+		UpdateExpression: aws.String("SET watchHist = :h, watchExp = :e"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":h": sv(arg.HistoryID),
+			":e": nv(arg.Expiration),
+		},
+		ConditionExpression: aws.String("attribute_not_exists(watchHist) OR watchHist < :h"),
 	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if isConditionFailed(err, &ccf) {
+			return nil // a newer history id is already stored; ignore the stale advance
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ToggleAccount(ctx context.Context, id int64) (int64, error) {
@@ -1636,29 +1660,84 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 // Processed emails
 // ============================================================
 
-func (s *Store) MarkProcessed(ctx context.Context, arg MarkProcessedParams) error {
-	if arg.MessageID == "" {
-		return nil
+// claimLeaseSeconds bounds how long a claimed-but-unconfirmed message blocks other
+// invocations from reclaiming it. Matches the scan/push Lambda timeout (template.yaml),
+// so a lease can never expire while its owning invocation is still able to do work; a
+// hard crash instead leaves the message to retry after this lease elapses (or at the
+// next lookback scan, whichever comes first).
+const claimLeaseSeconds = 900
+
+// attrLeaseExp is the "PROC#" item's lease-expiry attribute (epoch seconds). Present
+// and in the future: another invocation owns this message, still classifying it.
+// Present and in the past: the owner crashed; reclaimable. Absent: either never seen
+// (free to claim) or fully processed (BatchInsertProcessingResults writes the confirmed
+// marker without this attribute).
+const attrLeaseExp = "leaseExp"
+
+// ClaimMessages attempts to reserve each of messageIDs for classification by this
+// invocation, so that concurrent invocations racing on the same account never both pay
+// for an LLM call on the same email. Each id gets a conditional PutItem that succeeds
+// only if the "PROC#" marker doesn't exist yet or its lease has expired; the condition
+// is evaluated strongly-consistent by DynamoDB, unlike the FilterUnprocessed pre-filter,
+// so it is the authoritative gate. Returns just the ids this call actually won.
+func (s *Store) ClaimMessages(ctx context.Context, accountID int64, messageIDs []string) ([]string, error) {
+	now := time.Now().UTC().Unix()
+	claimed := make([]string, 0, len(messageIDs))
+	for _, mid := range messageIDs {
+		_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(s.table),
+			Item: map[string]types.AttributeValue{
+				"PK":         sv(pkProcessed(accountID)),
+				"SK":         sv(mid),
+				attrLeaseExp: nv(now + claimLeaseSeconds),
+				attrTTL:      nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
+			},
+			ConditionExpression: aws.String("attribute_not_exists(PK) OR " + attrLeaseExp + " < :now"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":now": nv(now),
+			},
+		})
+		if err != nil {
+			var ccf *types.ConditionalCheckFailedException
+			if isConditionFailed(err, &ccf) {
+				continue // another invocation already owns (or confirmed) this message
+			}
+			return claimed, err
+		}
+		claimed = append(claimed, mid)
 	}
-	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+	return claimed, nil
+}
+
+// ReleaseClaim gives up a lease taken by ClaimMessages, e.g. after an LLM error, so the
+// message is immediately eligible for retry instead of waiting out the full lease. The
+// attribute_exists(leaseExp) condition guarantees this can never delete a confirmed
+// marker — only claims have a leaseExp attribute — so a release racing a concurrent
+// confirm is always safe.
+func (s *Store) ReleaseClaim(ctx context.Context, accountID int64, messageID string) error {
+	_, err := s.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			"PK":    sv(pkProcessed(arg.AccountID)),
-			"SK":    sv(arg.MessageID),
-			attrTTL: nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
+		Key: map[string]types.AttributeValue{
+			"PK": sv(pkProcessed(accountID)),
+			"SK": sv(messageID),
 		},
-		ConditionExpression: aws.String("attribute_not_exists(PK)"),
+		ConditionExpression: aws.String("attribute_exists(" + attrLeaseExp + ")"),
 	})
 	if err != nil {
 		var ccf *types.ConditionalCheckFailedException
 		if isConditionFailed(err, &ccf) {
-			return nil // already marked
+			return nil // already confirmed or already released
 		}
 		return err
 	}
 	return nil
 }
 
+// FilterUnprocessed is a cheap, eventually-consistent pre-filter ahead of ClaimMessages:
+// it keeps the common case (nothing new since the last pass) off the write path. It is
+// only an optimization, not the dedup gate — ClaimMessages' conditional write is — so an
+// item with an expired lease must still be reported unprocessed here, letting
+// ClaimMessages reclaim it.
 func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageIDs []string) ([]string, error) {
 	if len(messageIDs) == 0 {
 		return nil, nil
@@ -1670,13 +1749,14 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 			"SK": sv(mid),
 		}
 	}
+	now := time.Now().UTC().Unix()
 	processed := map[string]bool{}
 	// BatchGetItem in chunks of 100
 	for i := 0; i < len(keys); i += 100 {
 		end := min(i+100, len(keys))
 		out, err := s.ddb.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 			RequestItems: map[string]types.KeysAndAttributes{
-				s.table: {Keys: keys[i:end]},
+				s.table: {Keys: keys[i:end], ProjectionExpression: aws.String("SK, " + attrLeaseExp)},
 			},
 		})
 		if err != nil {
@@ -1684,6 +1764,13 @@ func (s *Store) FilterUnprocessed(ctx context.Context, accountID int64, messageI
 		}
 		for _, it := range out.Responses[s.table] {
 			mid := getStr(it, "SK")
+			if lease, ok := it[attrLeaseExp]; ok {
+				if n, ok := lease.(*types.AttributeValueMemberN); ok {
+					if exp, perr := strconv.ParseInt(n.Value, 10, 64); perr == nil && exp <= now {
+						continue // lease expired: not processed, still a claimable candidate
+					}
+				}
+			}
 			processed[mid] = true
 		}
 	}
@@ -1738,13 +1825,17 @@ func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntr
 			items = append(items, promptExampleItem(e))
 		}
 	}
+	if messageID != "" {
+		// Overwrite our own claim with a confirmed marker (no leaseExp attribute), folded
+		// into the same batch rather than a separate MarkProcessed call.
+		items = append(items, map[string]types.AttributeValue{
+			"PK":    sv(pkProcessed(accountID)),
+			"SK":    sv(messageID),
+			attrTTL: nv(ttlDays(7)),
+		})
+	}
 	if len(items) > 0 {
 		if err := s.batchPut(ctx, items); err != nil {
-			return err
-		}
-	}
-	if messageID != "" {
-		if err := s.MarkProcessed(ctx, MarkProcessedParams{AccountID: accountID, MessageID: messageID}); err != nil {
 			return err
 		}
 	}
@@ -2449,11 +2540,6 @@ type UpdateAccountWatchParams struct {
 type UpsertAccountParams struct {
 	Email           string
 	CredentialsJSON string
-}
-
-type MarkProcessedParams struct {
-	AccountID int64
-	MessageID string
 }
 
 type GetLogsRangeParams struct {

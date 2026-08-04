@@ -361,13 +361,17 @@ Resources:
       MemorySize: 128
       # 900s = Lambda's hard max. Flex-tier Bedrock requests are lower-priority and can queue
       # for minutes, so the old 120s cap killed runs mid-classification; this gives a full
-      # backlog room to drain. Any overflow past 15 min is safe — scans dedupe processed
-      # emails in DynamoDB and the next 2 AM run picks up where this one left off.
+      # backlog room to drain. Any overflow past 15 min is safe — a message claimed but not
+      # confirmed by this run keeps its lease until it expires (see db.ClaimMessages), then
+      # the next 2 AM run (or an overlapping push) picks it back up.
       Timeout: 900
       # NOTE: ReservedConcurrentExecutions omitted — this account's Lambda concurrency
       # quota is too low to reserve (would drop unreserved below the required minimum of 10).
-      # Overlap is safe: scans dedupe processed emails in DynamoDB. Re-add `ReservedConcurrentExecutions: 1`
-      # after requesting a concurrency-limit increase via Service Quotas.
+      # Overlap is safe: messages are claimed via a conditional DynamoDB write before
+      # classification (db.ClaimMessages), so only one concurrent invocation ever pays for
+      # the LLM call on a given message — not just "dedupe after the fact". Re-add
+      # `ReservedConcurrentExecutions: 1` after requesting a concurrency-limit increase via
+      # Service Quotas.
       LoggingConfig:
         LogGroup: !Ref ScanFunctionLogGroup
       Environment:
@@ -390,8 +394,10 @@ Resources:
       MemorySize: 128
       # 900s = Lambda's hard max. Classification is global (see ClassifyTier), so a real-time
       # push can also land on the flex tier and queue for minutes; the old 120s cap risked
-      # killing it mid-classification. Safe to run long: history-driven dedup makes a
-      # re-delivered or overlapping push idempotent.
+      # killing it mid-classification. Safe to run long: a re-delivered or overlapping push is
+      # made idempotent by the history-id watermark (cheap skip) plus the per-message claim
+      # lease in DynamoDB (db.ClaimMessages), which is what actually stops two overlapping
+      # invocations from both paying for the LLM call on the same email.
       Timeout: 900
       # Lambda Web Adapter layer — see WebFunction above for why this is needed.
       Layers:

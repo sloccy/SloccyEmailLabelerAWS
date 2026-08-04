@@ -192,7 +192,7 @@ func ProcessAccountHistory(ctx context.Context, store db.StoreIface, llmClient l
 // any new messages, classifies them and applies label actions. Shared by the lookback scan
 // (ProcessAccount) and the push history path (ProcessAccountHistory).
 func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.ClientIface, account db.Account, svc *gmailpkg.Client, prompts []db.Prompt, messageIDs []string, cfg ProcessConfig) error {
-	// Filter out already-processed
+	// Filter out already-processed (cheap pre-filter; see FilterUnprocessed doc comment)
 	unprocessed, err := store.FilterUnprocessed(ctx, account.ID, messageIDs)
 	if err != nil {
 		return fmt.Errorf("filter unprocessed: %w", err)
@@ -201,6 +201,21 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 		if !cfg.SuppressEmptyLog {
 			store.Log(logInfo, fmt.Sprintf("[%s] No new emails to process.", account.Email))
 		}
+		_ = store.UpdateLastScan(ctx, account.ID)
+		return nil
+	}
+
+	// Claim is the authoritative dedup gate: a strongly-consistent conditional write that
+	// only one concurrent invocation can win per message id. Anything not claimed here is
+	// already owned (or was just confirmed) by another invocation, so it's dropped rather
+	// than reprocessed. A message claimed but never reaching processEmail below (Gmail
+	// fetch failure, context cancellation) simply keeps its lease and self-heals once that
+	// lease expires — no separate cleanup needed.
+	unprocessed, err = store.ClaimMessages(ctx, account.ID, unprocessed)
+	if err != nil {
+		return fmt.Errorf("claim messages: %w", err)
+	}
+	if len(unprocessed) == 0 {
 		_ = store.UpdateLastScan(ctx, account.ID)
 		return nil
 	}
@@ -302,23 +317,42 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 
 // writeJob carries one email's DynamoDB writes so they can be applied by the single
 // serial writer in processMessageIDs instead of inline inside the classify goroutine.
-// messageID == "" means "don't mark processed" (the LLM-error retry case); llmDebug == nil
-// means skip the (comparatively large) LLM-debug write entirely. examples is the passive
-// confirmed_positive rows for whichever prompts this email matched — see processEmail.
+// release == true means "give up the claim taken before classification" (the LLM-error
+// retry case) rather than confirm it; llmDebug == nil means skip the (comparatively
+// large) LLM-debug write entirely. examples is the passive confirmed_positive rows for
+// whichever prompts this email matched — see processEmail.
 type writeJob struct {
 	accountID int64
 	logs      []db.LogEntry
 	history   []db.HistoryEntry
 	examples  []db.PromptExample
 	messageID string
+	release   bool
 	llmDebug  *db.AddLlmDebugParams
 }
 
 // applyWriteJob persists one writeJob. Errors are logged, not propagated — matching the
 // prior inline behavior where a DB write failure doesn't block or retry email processing.
 func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
-	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.examples, job.accountID, job.messageID); err != nil {
+	// Passing "" here (rather than job.messageID) means: write the logs/history/examples
+	// collected so far, but never touch the "PROC#" marker via this call — for a release,
+	// that decision belongs solely to the ReleaseClaim call below, not to whatever
+	// messageID happens to be non-empty.
+	confirmID := job.messageID
+	if job.release {
+		confirmID = ""
+	}
+	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.examples, job.accountID, confirmID); err != nil {
 		slog.Error("db write failed", "err", err)
+	}
+	if job.release {
+		// Runs even if the invocation's own ctx is being torn down (e.g. Lambda deadline
+		// hit right after the LLM error) — otherwise the release would be dropped and the
+		// message would sit on its claim until the lease expires instead of retrying now.
+		if err := store.ReleaseClaim(context.WithoutCancel(ctx), job.accountID, job.messageID); err != nil {
+			slog.Error("release claim failed", "err", err)
+		}
+		return
 	}
 	if job.llmDebug != nil {
 		if err := store.RecordLlmDebug(ctx, *job.llmDebug); err != nil {
@@ -365,8 +399,9 @@ func processEmail(
 
 	if llmErr != nil {
 		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
-		// Don't mark processed (messageID left ""); will retry.
-		return nil, nil, writeJob{accountID: account.ID, logs: logs}
+		// Release the claim taken before classification instead of confirming it, so the
+		// message is immediately eligible for retry rather than waiting out the full lease.
+		return nil, nil, writeJob{accountID: account.ID, logs: logs, messageID: msg.ID, release: true}
 	}
 
 	// Computed once and reused for every matched prompt below — msg.Body is already in
