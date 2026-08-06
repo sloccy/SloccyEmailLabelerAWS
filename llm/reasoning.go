@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
@@ -65,78 +64,73 @@ func reasoningOff(modelID, override string) reasoningDirective {
 	return d
 }
 
-// reasoningEffortRegistryEntry pairs a case-insensitive model-id substring with the
-// non-off SettingImproveReasoningEffort values that model family actually distinguishes
-// (levels) and the AdditionalModelRequestFields shape for each. Unlike reasoningRegistry
-// (which only ever turns reasoning *off*), this table turns it *on* — used by the improve
-// call, which unlike classify benefits from letting a capable model actually think before
-// proposing a rule rewrite (see SettingImproveReasoningEffort). levels is also what the
-// Settings UI renders as options, so it must list only what the family actually does
-// something different for — not just what its API happens to accept without erroring.
-type reasoningEffortRegistryEntry struct {
-	substr string
-	levels []string
-	fields func(effort string) map[string]any
+// reasoningEffortExempt lists case-insensitive model-id substrings verified live against
+// Bedrock to NOT honor additionalModelRequestFields.reasoning_config — every other model is
+// assumed to support it (see reasoningEffortSupported). Confirmed exceptions, both via a
+// before/after Converse comparison (baseline vs. reasoning_config:"high", checking for a
+// ReasoningContent block in the response):
+//   - nvidia.nemotron-nano-9b-v2: field silently ignored, output identical to baseline.
+//     (Contrast nvidia.nemotron-super-3-120b, same vendor, which DOES respond — this is a
+//     model-size quirk, not a family-wide one, so the substring is deliberately narrow.)
+//   - mistral.magistral-small-2509: reasons unconditionally inline in the visible text
+//     (never as a structured ReasoningContent block), unaffected by the field either way.
+//
+// A new entry here needs the same live comparison, not a guess.
+var reasoningEffortExempt = []string{
+	"nemotron-nano",
+	"magistral",
 }
 
-// reasoningEffortRegistry is a maintained capability map, same spirit as
-// reasoningRegistry above: a model swap needing a new entry here is expected, not a bug.
-// An unmatched model id (or ReasoningEffortOff) resolves to nil fields — a safe no-op.
-var reasoningEffortRegistry = []reasoningEffortRegistryEntry{
-	// GLM-5 on Bedrock takes additionalModelRequestFields.reasoning_config as a bare
-	// string, forwarded to the model as its native "reasoning_effort" parameter. Verified
-	// live against zai.glm-5 in us-east-1: the API itself accepts "none"/"low"/"medium"/
-	// "high" (confirmed via the ValidationException message when an invalid value like
-	// "xhigh" or "minimal" is sent, which lists the accepted enum), but only "high"
-	// actually turns reasoning on — "none"/"low"/"medium" were all indistinguishable from
-	// omitting the field entirely (same 2-token output, no ReasoningContent block),
-	// while "high" alone produced a real ~1600-character reasoning trace and ~500 output
-	// tokens. So although the API has four accepted values, the model only has two
-	// observable behaviors — this is presented as on/off, not a ladder, and "on" is the
-	// only level that maps to a non-nil field.
-	{substr: "glm", levels: []string{ReasoningEffortOn}, fields: func(string) map[string]any {
-		return map[string]any{"reasoning_config": "high"}
-	}},
-}
-
-// ReasoningEffortLevels returns the non-off SettingImproveReasoningEffort values modelID's
-// family actually distinguishes, looked up by case-insensitive substring match against
-// reasoningEffortRegistry. Returns nil for an unrecognized model — the Settings UI reads
-// this as "reasoning effort isn't controllable for this model" and disables the control
-// rather than offering choices that would silently do nothing.
-func ReasoningEffortLevels(modelID string) []string {
+// reasoningEffortSupported reports whether modelID is expected to honor
+// additionalModelRequestFields.reasoning_config:"high" — true unless modelID matches
+// reasoningEffortExempt. Verified broadly, not universally: sweeping every reasoning-capable
+// chat model available in this account's Bedrock catalog, 9 of 12 spanning DeepSeek,
+// Zhipu/GLM (5, 4.7, 4.7-flash), Moonshot/Kimi, MiniMax, Alibaba/Qwen3, NVIDIA Nemotron (the
+// larger variant), and OpenAI gpt-oss all turned on visible chain-of-thought for this exact
+// field/value regardless of vendor. That consistency across unrelated model providers is
+// itself evidence Bedrock translates this specific field server-side rather than every
+// vendor happening to use the identical native parameter name — GLM-5's own
+// ValidationException on a malformed value once named the backend param "reasoning_effort"
+// for a request that sent "reasoning_config", i.e. Bedrock renamed it in transit. So an
+// unverified model defaults to "assume it works"; ImprovePromptInstructions'
+// ValidationException retry is the safety net for a model where that assumption is wrong.
+func reasoningEffortSupported(modelID string) bool {
 	lower := strings.ToLower(modelID)
-	for _, e := range reasoningEffortRegistry {
-		if strings.Contains(lower, e.substr) {
-			return e.levels
+	for _, s := range reasoningEffortExempt {
+		if strings.Contains(lower, s) {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
-// reasoningEffortFields returns the AdditionalModelRequestFields map that turns reasoning
-// on at the given effort for modelID, looked up by case-insensitive substring match
-// against reasoningEffortRegistry. Returns nil for ReasoningEffortOff, an unrecognized
-// model id, or an effort outside that family's levels — all safe no-ops, matching
-// reasoningOff's own "unmatched is a no-op, not an error" behavior. Callers must not treat
-// a nil result here as license to fall back to reasoningOff: asking for reasoning and
-// suppressing it are opposite intents, so an unsupported effort should leave the model at
-// its own default, not invert into suppression.
-func reasoningEffortFields(modelID, effort string) map[string]any {
-	if effort == "" || effort == ReasoningEffortOff {
+// ReasoningEffortLevels returns the non-off SettingImproveReasoningEffort values modelID
+// supports — today always []string{ReasoningEffortOn} for a supported model (see
+// reasoningEffortSupported), since no model in reasoningEffortExempt's sibling set has been
+// verified to have a real graduated ladder rather than a bare on/off switch (GLM-5
+// specifically: "none"/"low"/"medium" were all indistinguishable from omitting the field,
+// only "high" did anything — see reasoningEffortFields). Returns nil for an exempt model —
+// the Settings UI reads that as "reasoning effort isn't controllable here" and disables the
+// control rather than offering a choice that would silently do nothing.
+func ReasoningEffortLevels(modelID string) []string {
+	if !reasoningEffortSupported(modelID) {
 		return nil
 	}
-	lower := strings.ToLower(modelID)
-	for _, e := range reasoningEffortRegistry {
-		if !strings.Contains(lower, e.substr) {
-			continue
-		}
-		if !slices.Contains(e.levels, effort) {
-			return nil
-		}
-		return e.fields(effort)
+	return []string{ReasoningEffortOn}
+}
+
+// reasoningEffortFields returns the AdditionalModelRequestFields map that turns reasoning on
+// for modelID at the given effort. Returns nil for ReasoningEffortOff, an exempt model, or
+// any effort other than ReasoningEffortOn — all safe no-ops, matching reasoningOff's own
+// "unmatched is a no-op, not an error" behavior. Callers must not treat a nil result here as
+// license to fall back to reasoningOff: asking for reasoning and suppressing it are opposite
+// intents, so an unsupported effort should leave the model at its own default, not invert
+// into suppression.
+func reasoningEffortFields(modelID, effort string) map[string]any {
+	if effort != ReasoningEffortOn || !reasoningEffortSupported(modelID) {
+		return nil
 	}
-	return nil
+	return map[string]any{"reasoning_config": "high"}
 }
 
 // detectReasoning reports whether a classify response contains reasoning/

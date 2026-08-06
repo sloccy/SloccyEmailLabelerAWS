@@ -57,7 +57,7 @@
           {{end}}
         </select>
         {{else}}
-        <div class="small text-muted mt-1">Not supported for the current prompt improver model ({{.ImproveModel}}) — reasoning stays at whatever that model defaults to. Switch to a model this app has a verified reasoning-effort mapping for (currently GLM) to control it.</div>
+        <div class="small text-muted mt-1">Not supported for the current prompt improver model ({{.ImproveModel}}) — this model is known to ignore the reasoning request, so reasoning stays at whatever it defaults to.</div>
         <select class="form-select form-select-sm mt-2" style="max-width:200px;" disabled>
           <option>Not supported</option>
         </select>

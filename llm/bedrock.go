@@ -107,20 +107,14 @@ const (
 	SettingImproveReasoningEffort = "improve_reasoning_effort"
 )
 
-// Values for SettingImproveReasoningEffort. Not every model family distinguishes all of
-// these — see reasoningEffortRegistry (reasoning.go) for what each family actually
-// supports; ReasoningEffortLevels reports it, and the Settings UI renders only that
-// model's levels rather than always offering all four.
+// Values for SettingImproveReasoningEffort. Every reasoning-capable model this project has
+// tested on Bedrock exposes reasoning_config as a bare on/off switch, not a real graduated
+// ladder (see reasoningEffortSupported, reasoning.go, for the live-verified sweep across
+// vendors), so the vocabulary is deliberately just two values rather than a Low/Medium/High
+// ladder the UI can't actually back for any known model.
 const (
 	ReasoningEffortOff = "off"
-	// ReasoningEffortOn is for a family whose reasoning toggle is genuinely binary (e.g.
-	// GLM-5 — verified live: "low"/"medium" don't observably change its output vs. leaving
-	// the field unset, only "high" does, so it's exposed as one on/off choice rather than a
-	// ladder it doesn't really have).
-	ReasoningEffortOn     = "on"
-	ReasoningEffortLow    = "low"
-	ReasoningEffortMedium = "medium"
-	ReasoningEffortHigh   = "high"
+	ReasoningEffortOn  = "on"
 )
 
 // Values for SettingClassifyTier and SettingImproveTier.
@@ -999,12 +993,12 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 
 	out, err := converse(fields)
 	if err != nil && fields != nil {
-		// reasoningEffortRegistry's field shapes are verified against live Bedrock as of
-		// writing (see the glm entry's comment), but that's still an unvalidated passthrough
-		// field per Bedrock's own contract — a future model swap or provider-side change
-		// could make a previously-good shape start failing. Rather than let that take down
-		// every improve call, retry once with the field dropped: reasoning silently stays
-		// off (loud in the log instead), but the suggestion still gets generated.
+		// reasoningEffortSupported (reasoning.go) defaults an unrecognized model to "assume
+		// reasoning_config works" based on a broad but not exhaustive live sweep — a model
+		// outside that sweep, or a provider-side change to one inside it, can still reject
+		// this unvalidated passthrough field. Rather than let that take down every improve
+		// call, retry once with the field dropped: reasoning silently stays off (loud in the
+		// log instead), but the suggestion still gets generated.
 		var ve *types.ValidationException
 		if errors.As(err, &ve) {
 			slog.Warn("improve call rejected reasoning fields, retrying without them", "model", model, "effort", effort, "err", err)
