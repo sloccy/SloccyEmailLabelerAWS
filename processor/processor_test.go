@@ -250,8 +250,8 @@ func newTestAccount() db.Account {
 }
 
 func TestProcessEmail_MatchedPrompt(t *testing.T) {
-	// LLM returns {"1": true} — prompt 1 matches.
-	llmClient := newLLMServer(t, `{"1": true}`)
+	// LLM returns {"m": [1]} — prompt 1 matches.
+	llmClient := newLLMServer(t, `{"m": [1]}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "msg1", Subject: "Newsletter", Sender: "news@test.com", Body: "content"}
@@ -283,7 +283,7 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 }
 
 func TestProcessEmail_NoMatch(t *testing.T) {
-	llmClient := newLLMServer(t, `{"1": false}`)
+	llmClient := newLLMServer(t, `{"m": []}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "msg2", Subject: "Regular", Sender: "user@test.com"}
@@ -319,7 +319,7 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 
 func TestProcessEmail_StopProcessing(t *testing.T) {
 	// Both prompts match, but prompt 1 has StopProcessing=1.
-	llmClient := newLLMServer(t, `{"1": true, "2": true}`)
+	llmClient := newLLMServer(t, `{"m": [1, 2]}`)
 
 	account := newTestAccount()
 	msg := gmailpkg.Message{ID: "stop1", Subject: "Test"}

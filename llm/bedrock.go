@@ -386,9 +386,9 @@ type ImproveRequest struct {
 // by buildUserTurn instead — see classifyPayload. Splitting it this way is the proper
 // Converse idiom; the pre-cleanup version crammed all of this into a single user message
 // (an artifact of the earlier Ollama single-prompt-string port).
-const classifySystemPrompt = `You are an email classification assistant. You will be given a numbered list of rules and an email. For each rule, decide whether the label should be applied to that email.
+const classifySystemPrompt = `You are an email classification assistant. You will be given a numbered list of rules and an email. Decide which rules apply to the email.
 
-Respond with a single JSON object and nothing else. Include exactly one boolean key per rule number, even when the answer is false — do not omit any rule.
+Respond with a single JSON object and nothing else: {"m": [rule numbers that apply]}. List only the numbers of rules that apply, in ascending order. Use {"m": []} when no rule applies.
 Output ONLY that JSON object. Do not include any explanation, reasoning, preamble, "<think>" block, or markdown code fences before or after it.`
 
 // buildUserTurn renders the per-call data (rules, a count-matched example, and the
@@ -401,38 +401,34 @@ func buildUserTurn(email Email, prompts []Prompt) string {
 	}
 	rulesText := sb.String()
 
-	// The example covers every rule number, not just the first couple — this prompt is
-	// the model's only signal for the expected output shape (Converse tool-use isn't
-	// attempted; see reasoning.go for why several model families this project has run
-	// don't support it there), so a partial example would leave it guessing whether to
-	// include keys for the rules it omitted.
-	exampleParts := make([]string, len(prompts))
-	for i := range exampleParts {
-		exampleParts[i] = fmt.Sprintf(`"%d": false`, i+1)
-	}
-
 	body := email.Body
 	if body == "" {
 		body = email.Snippet
 	}
 	body = strings.ReplaceAll(body, "\r", "")
 
+	// The example is a fixed constant regardless of rule count — this prompt is the
+	// model's only signal for the expected output shape (Converse tool-use isn't
+	// attempted; see reasoning.go for why several model families this project has run
+	// don't support it there), but the {"m": [...]} match-list contract doesn't need a
+	// per-rule slot to demonstrate, unlike the old per-rule boolean map it replaced.
 	return fmt.Sprintf(`Rules:
 %s
-Example (with a rule for every number, matching the count above): {%s}
+Example (rule 1 applies, no others): {"m": [1]}
 
 Email:
 From: %s
 Subject: %s
 Body:
 %s`,
-		rulesText, strings.Join(exampleParts, ", "),
-		email.Sender, email.Subject, body)
+		rulesText, email.Sender, email.Subject, body)
 }
 
 // mapKeysToResults converts a {"1": true, "2": false, ...} map (1-based rule index →
-// verdict) into the prompt-ID-keyed result map ClassifyEmailBatch returns. Shared by
-// both the tool-use and text-fallback decode paths.
+// verdict) into the prompt-ID-keyed result map ClassifyEmailBatch returns. This is the
+// legacy response shape classifySystemPrompt asked for before the {"m": [...]} match-list
+// contract; parseClassifyResponse falls back to it for older stored responses and models
+// that don't follow the current instruction.
 func mapKeysToResults(parsed map[string]any, prompts []Prompt) map[int64]bool {
 	results := make(map[int64]bool, len(prompts))
 	for k, v := range parsed {
@@ -444,6 +440,44 @@ func mapKeysToResults(parsed map[string]any, prompts []Prompt) map[int64]bool {
 		if idx >= 0 && idx < len(prompts) {
 			b, _ := v.(bool)
 			results[prompts[idx].ID] = b
+		}
+	}
+	return results
+}
+
+// parseClassifyResponse decodes either response shape: the compact {"m": [2, 5]}
+// match-list contract classifySystemPrompt now asks for, or the legacy {"1": true,
+// "2": false} per-rule boolean map that older stored responses (and models that ignore
+// the current instruction) may still produce. Both mean the same thing, since an absent
+// prompt ID is already read as false by the caller — mapKeysToResults never populated a
+// key for rules the model omitted either.
+func parseClassifyResponse(parsed map[string]any, prompts []Prompt) map[int64]bool {
+	matches, ok := parsed["m"].([]any)
+	if !ok {
+		return mapKeysToResults(parsed, prompts)
+	}
+
+	results := make(map[int64]bool, len(prompts))
+	for _, p := range prompts {
+		results[p.ID] = false
+	}
+	for _, m := range matches {
+		var idx int
+		switch v := m.(type) {
+		case float64:
+			idx = int(v)
+		case string:
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				continue
+			}
+			idx = n
+		default:
+			continue
+		}
+		idx-- // 1-based -> 0-based
+		if idx >= 0 && idx < len(prompts) {
+			results[prompts[idx].ID] = true
 		}
 	}
 	return results
@@ -613,7 +647,10 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 	// when asked to suppress it (see reasoning.go) — some don't honor the suppression
 	// directive on every call. MaxTokens is sized to absorb that rather than truncate a
 	// response mid-stream; it's a ceiling, not a target, so it costs nothing when the
-	// model finishes well under it.
+	// model finishes well under it. The len(prompts)*12 scaling predates the {"m": [...]}
+	// match-list response (which stays a handful of tokens regardless of rule count) and
+	// is now purely headroom for a rule-count-proportional wall of suppressed CoT, not a
+	// sizing of the expected answer.
 	maxTokens := int32(3000)
 	if n := len(prompts) * 12; n > 3000 {
 		maxTokens = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
@@ -725,7 +762,7 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 		return res, &Error{Msg: fmt.Sprintf("LLM parse error: %v", err)}
 	}
 
-	res.Results = mapKeysToResults(parsed, prompts)
+	res.Results = parseClassifyResponse(parsed, prompts)
 	return res, nil
 }
 
