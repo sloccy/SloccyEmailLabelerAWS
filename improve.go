@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -141,7 +142,7 @@ func (r *improveRunner) runOne(ctx context.Context, t improveTarget) {
 			return
 		}
 		if !done {
-			r.writeFailure(ctx, t.SuggestionID, fmt.Errorf("worker deadline exceeded before a result was written"))
+			r.writeFailure(ctx, t.SuggestionID, errors.New("worker deadline exceeded before a result was written"))
 		}
 	}()
 
