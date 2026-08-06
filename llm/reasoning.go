@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
@@ -65,13 +66,16 @@ func reasoningOff(modelID, override string) reasoningDirective {
 }
 
 // reasoningEffortRegistryEntry pairs a case-insensitive model-id substring with the
-// AdditionalModelRequestFields shape that model family expects for a non-off reasoning
-// effort. Unlike reasoningRegistry (which only ever turns reasoning *off*), this table
-// turns it *on* at a given effort — used by the improve call, which unlike classify
-// benefits from letting a capable model actually think before proposing a rule rewrite
-// (see SettingImproveReasoningEffort).
+// non-off SettingImproveReasoningEffort values that model family actually distinguishes
+// (levels) and the AdditionalModelRequestFields shape for each. Unlike reasoningRegistry
+// (which only ever turns reasoning *off*), this table turns it *on* — used by the improve
+// call, which unlike classify benefits from letting a capable model actually think before
+// proposing a rule rewrite (see SettingImproveReasoningEffort). levels is also what the
+// Settings UI renders as options, so it must list only what the family actually does
+// something different for — not just what its API happens to accept without erroring.
 type reasoningEffortRegistryEntry struct {
 	substr string
+	levels []string
 	fields func(effort string) map[string]any
 }
 
@@ -79,29 +83,58 @@ type reasoningEffortRegistryEntry struct {
 // reasoningRegistry above: a model swap needing a new entry here is expected, not a bug.
 // An unmatched model id (or ReasoningEffortOff) resolves to nil fields — a safe no-op.
 var reasoningEffortRegistry = []reasoningEffortRegistryEntry{
-	// GLM-5 on Bedrock exposes reasoning as a bare on/off switch via
-	// additionalModelRequestFields.reasoning_config — there is no separate
-	// low/medium/high; every non-off effort maps to the same "high" value AWS'
-	// documentation shows. See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html.
-	{substr: "glm", fields: func(string) map[string]any {
+	// GLM-5 on Bedrock takes additionalModelRequestFields.reasoning_config as a bare
+	// string, forwarded to the model as its native "reasoning_effort" parameter. Verified
+	// live against zai.glm-5 in us-east-1: the API itself accepts "none"/"low"/"medium"/
+	// "high" (confirmed via the ValidationException message when an invalid value like
+	// "xhigh" or "minimal" is sent, which lists the accepted enum), but only "high"
+	// actually turns reasoning on — "none"/"low"/"medium" were all indistinguishable from
+	// omitting the field entirely (same 2-token output, no ReasoningContent block),
+	// while "high" alone produced a real ~1600-character reasoning trace and ~500 output
+	// tokens. So although the API has four accepted values, the model only has two
+	// observable behaviors — this is presented as on/off, not a ladder, and "on" is the
+	// only level that maps to a non-nil field.
+	{substr: "glm", levels: []string{ReasoningEffortOn}, fields: func(string) map[string]any {
 		return map[string]any{"reasoning_config": "high"}
 	}},
 }
 
+// ReasoningEffortLevels returns the non-off SettingImproveReasoningEffort values modelID's
+// family actually distinguishes, looked up by case-insensitive substring match against
+// reasoningEffortRegistry. Returns nil for an unrecognized model — the Settings UI reads
+// this as "reasoning effort isn't controllable for this model" and disables the control
+// rather than offering choices that would silently do nothing.
+func ReasoningEffortLevels(modelID string) []string {
+	lower := strings.ToLower(modelID)
+	for _, e := range reasoningEffortRegistry {
+		if strings.Contains(lower, e.substr) {
+			return e.levels
+		}
+	}
+	return nil
+}
+
 // reasoningEffortFields returns the AdditionalModelRequestFields map that turns reasoning
 // on at the given effort for modelID, looked up by case-insensitive substring match
-// against reasoningEffortRegistry. Returns nil for ReasoningEffortOff or an unrecognized
-// model id — both safe no-ops, matching reasoningOff's own "unmatched is a no-op, not an
-// error" behavior.
+// against reasoningEffortRegistry. Returns nil for ReasoningEffortOff, an unrecognized
+// model id, or an effort outside that family's levels — all safe no-ops, matching
+// reasoningOff's own "unmatched is a no-op, not an error" behavior. Callers must not treat
+// a nil result here as license to fall back to reasoningOff: asking for reasoning and
+// suppressing it are opposite intents, so an unsupported effort should leave the model at
+// its own default, not invert into suppression.
 func reasoningEffortFields(modelID, effort string) map[string]any {
 	if effort == "" || effort == ReasoningEffortOff {
 		return nil
 	}
 	lower := strings.ToLower(modelID)
 	for _, e := range reasoningEffortRegistry {
-		if strings.Contains(lower, e.substr) {
-			return e.fields(effort)
+		if !strings.Contains(lower, e.substr) {
+			continue
 		}
+		if !slices.Contains(e.levels, effort) {
+			return nil
+		}
+		return e.fields(effort)
 	}
 	return nil
 }

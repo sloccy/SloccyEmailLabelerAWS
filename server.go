@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -702,6 +703,12 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier
 		"ReasoningDirective":     reasoningDirective,
 		"ImproveReplay":          improveReplay,
 		"ImproveReasoningEffort": improveReasoningEffort,
+		// ImproveReasoningLevels is what the effort <select> actually renders as options —
+		// not a fixed four values, but whatever llm.ReasoningEffortLevels reports the current
+		// ImproveModel's family actually distinguishes (see reasoningEffortRegistry). Empty
+		// means the model doesn't expose a controllable reasoning effort at all, and the
+		// template disables the control rather than offering choices that would no-op.
+		"ImproveReasoningLevels": llm.ReasoningEffortLevels(improveModel),
 		"Models":                 models,
 		"FlexModels":             llm.SortModelsByFlexCost(models),
 	}
@@ -817,11 +824,13 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReplay, Value: replayValue})
 
-	// Reasoning effort for the improve call: a fixed set of values, not free text like the
-	// classify reasoning-suppression override above, so garbage input is ignored the same
-	// way applyModelSetting ignores an unrecognized model id.
+	// Reasoning effort for the improve call: accepted values depend on improveModel's family
+	// (llm.ReasoningEffortLevels) — not a fixed four, since most families support none of
+	// them and GLM only really supports one. Anything else (including a level valid for a
+	// different model than the one now selected) is ignored the same way applyModelSetting
+	// ignores an unrecognized model id.
 	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
-	if v := r.FormValue("improve_reasoning_effort"); v == llm.ReasoningEffortOff || v == llm.ReasoningEffortLow || v == llm.ReasoningEffortMedium || v == llm.ReasoningEffortHigh {
+	if v := r.FormValue("improve_reasoning_effort"); v == llm.ReasoningEffortOff || slices.Contains(llm.ReasoningEffortLevels(improveModel), v) {
 		improveReasoningEffort = v
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReasoningEffort, Value: v})
 	}

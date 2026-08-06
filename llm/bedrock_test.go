@@ -561,6 +561,76 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 	}
 }
 
+// TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression guards the fix
+// for a real inversion bug: a non-off SettingImproveReasoningEffort that reasoningEffortFields
+// can't honor (here, "high" against Qwen — a family in reasoningEffortRegistry's world only
+// via reasoningRegistry, the *suppression* table, and "high" not being a level Qwen even has)
+// must leave the model at its own default. It must NOT fall through into reasoningOff and
+// inject the suppression system text — that would be answering "turn reasoning on" by turning
+// it off, the opposite of what was asked.
+func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t *testing.T) {
+	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortHigh}
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+	cl := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0", settings: settings}
+
+	_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+		PromptName:           "newsletter",
+		LabelName:            "News",
+		OriginalInstructions: "matches newsletters",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+	})
+	if err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+	}
+	for _, block := range fake.calls[0].System {
+		if txt, ok := block.(*types.SystemContentBlockMemberText); ok && strings.Contains(txt.Value, "/no_think") {
+			t.Errorf("system prompt contains the Qwen suppression switch %q — an unsupported effort request must not invert into suppression", txt.Value)
+		}
+	}
+	if fake.calls[0].AdditionalModelRequestFields != nil {
+		t.Errorf("AdditionalModelRequestFields = %v, want nil (effort unsupported for this model, nothing should be sent)", fake.calls[0].AdditionalModelRequestFields)
+	}
+}
+
+// TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields checks the fail-safe
+// for reasoningEffortRegistry drifting out of sync with what Bedrock actually accepts (it's
+// an unvalidated passthrough field, verified only at the time an entry was written): if the
+// fields-bearing Converse call is rejected with a ValidationException, the call must retry
+// once with the fields dropped rather than surface the error and leave the suggestion failed.
+func TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields(t *testing.T) {
+	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{nil, textOutput("rewritten instructions")},
+		errs:    []error{&types.ValidationException{Message: aws.String("unknown field reasoning_config")}, nil},
+	}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", settings: settings}
+
+	text, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+		PromptName:           "newsletter",
+		LabelName:            "News",
+		OriginalInstructions: "matches newsletters",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+	})
+	if err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v, want the retry to succeed", err)
+	}
+	if text == "" {
+		t.Errorf("got empty rewritten instructions, want the second call's output")
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("expected 2 Converse calls (initial + retry), got %d", len(fake.calls))
+	}
+	if fake.calls[0].AdditionalModelRequestFields == nil {
+		t.Errorf("first call should have sent reasoning fields")
+	}
+	if fake.calls[1].AdditionalModelRequestFields != nil {
+		t.Errorf("retry call AdditionalModelRequestFields = %v, want nil (dropped after ValidationException)", fake.calls[1].AdditionalModelRequestFields)
+	}
+}
+
 // TestReplayAgainstExamples_UsesClassifyModelNotImproveModel is the load-bearing test for
 // ReplayAgainstExamples: the whole point of replay is to answer "will the model that
 // actually labels production mail apply this rule correctly?", which only holds if it's
