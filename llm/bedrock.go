@@ -973,16 +973,25 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	}
 
 	converse := func(f document.Interface) (*bedrockruntime.ConverseOutput, error) {
+		// 2048 when reasoning is off/suppressed: with a 60-word target in the system prompt,
+		// anything near that signals a truncation or a suppression failure, not a
+		// legitimately long answer — worth keeping tight as that signal. But when reasoning
+		// fields are actually being sent (f != nil), 2048 is the wrong side of that same
+		// argument: it's a token budget for the *final answer*, and a model that's genuinely
+		// thinking spends most of its budget on the reasoning trace first (observed up to
+		// ~2000 chars of it against real models), so a 2048 ceiling truncates mid-thought
+		// before the model ever reaches the answer — the improve call comes back with an
+		// empty suggestion, not a short one. 16384 gives the thinking room to finish.
+		maxTokens := int32(2048)
+		if f != nil {
+			maxTokens = 16384
+		}
 		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
 			ModelId:  aws.String(model),
 			System:   sys,
 			Messages: msgs,
 			InferenceConfig: &types.InferenceConfiguration{
-				// 2048, not the old 16384: that ceiling existed only to absorb chain-of-thought
-				// padding from a reasoning model. With reasoning suppressed above and a 60-word
-				// target in the system prompt, anything near 2048 tokens signals a truncation
-				// or a suppression failure, not a legitimately long answer.
-				MaxTokens:   aws.Int32(2048),
+				MaxTokens:   aws.Int32(maxTokens),
 				Temperature: aws.Float32(0.4),
 			},
 			ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
@@ -1009,12 +1018,13 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		return "", nil, err
 	}
 	if out.StopReason == types.StopReasonMaxTokens {
-		// The 2048 ceiling is sized for a 60-word rule, not chain-of-thought padding (see
-		// the comment above) — hitting it means either reasoning suppression/effort
-		// selection above isn't actually working for this model, or the model ignored
-		// improveSystemPrompt's length constraint. Either way the stored suggestion below
-		// is a silent truncation, not a complete rule, so this is worth a log line even
-		// though sanitizeRuleText can't distinguish it from a normal response.
+		// converse's 2048/16384 split (see its comment) is sized for the common case either
+		// way — hitting the ceiling regardless means either reasoning suppression/effort
+		// selection above isn't actually working for this model, the model ignored
+		// improveSystemPrompt's length constraint, or (reasoning on) the model's thinking
+		// itself ran unusually long. Either way the stored suggestion below is a silent
+		// truncation, not a complete rule, so this is worth a log line even though
+		// sanitizeRuleText can't distinguish it from a normal response.
 		slog.Warn("improve call hit max_tokens", "model", model, "effort", effort)
 	}
 	suggestion := sanitizeRuleText(extractText(out.Output))
