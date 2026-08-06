@@ -631,6 +631,50 @@ func TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields(t *te
 	if fake.calls[1].AdditionalModelRequestFields != nil {
 		t.Errorf("retry call AdditionalModelRequestFields = %v, want nil (dropped after ValidationException)", fake.calls[1].AdditionalModelRequestFields)
 	}
+	if got := aws.ToInt32(fake.calls[1].InferenceConfig.MaxTokens); got != 2048 {
+		t.Errorf("retry call MaxTokens = %d, want 2048 (reasoning fields dropped, so back to the tight non-reasoning ceiling)", got)
+	}
+}
+
+// TestImprovePromptInstructions_MaxTokensFollowsReasoningState guards the fix for a real
+// truncation bug found while sweeping other models: 2048 tokens is enough for the ~60-word
+// answer improveSystemPrompt asks for, but a model that's actually reasoning spends most of
+// that budget on the reasoning trace first (observed up to ~2000 chars of it against real
+// Bedrock models) and hits the ceiling before ever writing an answer — confirmed live
+// against qwen3-32b and zai.glm-4.7-flash, both of which came back with StopReasonMaxTokens
+// and zero answer text at a 2048-equivalent budget. MaxTokens must scale up whenever
+// reasoning fields are actually being sent, and back down when they're not.
+func TestImprovePromptInstructions_MaxTokensFollowsReasoningState(t *testing.T) {
+	cases := []struct {
+		name     string
+		settings Settings
+		model    string
+		want     int32
+	}{
+		{"reasoning off: tight ceiling", &fixedSettings{}, "zai.glm-5", 2048},
+		{"reasoning on: room for thinking", &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}, "zai.glm-5", 16384},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+			cl := &Client{br: fake, defaultModel: c.model, settings: c.settings}
+			_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+				PromptName:           "newsletter",
+				LabelName:            "News",
+				OriginalInstructions: "matches newsletters",
+				ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+			})
+			if err != nil {
+				t.Fatalf("ImprovePromptInstructions error: %v", err)
+			}
+			if len(fake.calls) != 1 {
+				t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+			}
+			if got := aws.ToInt32(fake.calls[0].InferenceConfig.MaxTokens); got != c.want {
+				t.Errorf("MaxTokens = %d, want %d", got, c.want)
+			}
+		})
+	}
 }
 
 // TestReplayAgainstExamples_UsesClassifyModelNotImproveModel is the load-bearing test for
