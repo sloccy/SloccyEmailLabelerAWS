@@ -49,6 +49,43 @@ func TestReasoningOff_NoMatchNoOverrideIsZero(t *testing.T) {
 	}
 }
 
+func TestReasoningEffortFields_OffIsNoop(t *testing.T) {
+	if got := reasoningEffortFields("zai.glm-5", ReasoningEffortOff); got != nil {
+		t.Errorf("reasoningEffortFields(glm, off) = %#v, want nil", got)
+	}
+	if got := reasoningEffortFields("zai.glm-5", ""); got != nil {
+		t.Errorf("reasoningEffortFields(glm, \"\") = %#v, want nil (empty treated same as off)", got)
+	}
+}
+
+func TestReasoningEffortFields_UnrecognizedModelIsNoop(t *testing.T) {
+	if got := reasoningEffortFields("meta.llama3-1-70b-instruct-v1:0", ReasoningEffortHigh); got != nil {
+		t.Errorf("reasoningEffortFields(unrecognized, high) = %#v, want nil", got)
+	}
+}
+
+// TestReasoningEffortFields_GLMBinaryToggle locks in GLM-5's Bedrock reasoning contract:
+// additionalModelRequestFields.reasoning_config is a bare on/off switch (AWS's own docs
+// only show "high"), not a graduated ladder — so every non-off effort this setting offers
+// must map to that same one "on" value, not to distinct per-level fields that don't exist
+// on this model family.
+func TestReasoningEffortFields_GLMBinaryToggle(t *testing.T) {
+	for _, effort := range []string{ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh} {
+		got := reasoningEffortFields("zai.glm-5", effort)
+		want := map[string]any{"reasoning_config": "high"}
+		if len(got) != len(want) || got["reasoning_config"] != want["reasoning_config"] {
+			t.Errorf("reasoningEffortFields(glm, %q) = %#v, want %#v", effort, got, want)
+		}
+	}
+}
+
+func TestReasoningEffortFields_MatchIsCaseInsensitive(t *testing.T) {
+	got := reasoningEffortFields("ZAI.GLM-5", ReasoningEffortHigh)
+	if got == nil || got["reasoning_config"] != "high" {
+		t.Errorf("reasoningEffortFields(uppercased model id, high) = %#v, want reasoning_config=high", got)
+	}
+}
+
 func textOutputForDetect(text string) types.ConverseOutput {
 	return &types.ConverseOutputMemberMessage{
 		Value: types.Message{

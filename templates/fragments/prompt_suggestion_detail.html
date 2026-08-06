@@ -1,4 +1,13 @@
-<div class="card p-4" id="suggestion-detail-{{.ID}}">
+<div class="card p-4" id="suggestion-detail-{{.ID}}"
+  {{if eq .Status "generating"}}
+  {{/* Self-refresh while a background improve round is in flight — the improve worker
+       (improve.go) can take well over the suggestions list's own 60s poll interval
+       (templates/index.html) once replay validation is in the picture, and this card may
+       be the only thing open when the result lands. */}}
+  hx-get="/fragments/prompt-suggestions/{{.ID}}"
+  hx-trigger="every 10s"
+  hx-swap="outerHTML"
+  {{end}}>
   <div class="d-flex align-items-center justify-content-between mb-3 gap-2 flex-wrap">
     <div>
       <h6 class="mb-1 fw-bold">{{.PromptName}}</h6>

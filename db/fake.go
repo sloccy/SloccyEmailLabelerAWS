@@ -26,20 +26,28 @@ type FakeStore struct {
 	labelRet    map[int64][]LabelRetention
 	labelExempt map[int64][]LabelExemption
 	retention   map[int64]AccountRetention
+	// suggestions and suggestionClaimed back InsertPromptSuggestion/ClaimPromptSuggestion —
+	// enough of PromptSuggestion for db/claim_test.go's ClaimPromptSuggestion tests, not a
+	// full mirror of the real Store's suggestion methods (FinalizePromptSuggestion, etc.
+	// aren't needed on FakeStore; server.go uses the concrete *Store directly).
+	suggestions      map[int64]*PromptSuggestion
+	suggestionClaims map[int64]bool
 
 	counters map[string]int64
 }
 
 func NewFake() *FakeStore {
 	return &FakeStore{
-		accounts:    make(map[int64]*Account),
-		emailToID:   make(map[string]int64),
-		settings:    make(map[string]string),
-		processed:   make(map[int64]map[string]time.Time),
-		labelRet:    make(map[int64][]LabelRetention),
-		labelExempt: make(map[int64][]LabelExemption),
-		retention:   make(map[int64]AccountRetention),
-		counters:    make(map[string]int64),
+		accounts:         make(map[int64]*Account),
+		emailToID:        make(map[string]int64),
+		settings:         make(map[string]string),
+		processed:        make(map[int64]map[string]time.Time),
+		labelRet:         make(map[int64][]LabelRetention),
+		labelExempt:      make(map[int64][]LabelExemption),
+		retention:        make(map[int64]AccountRetention),
+		suggestions:      make(map[int64]*PromptSuggestion),
+		suggestionClaims: make(map[int64]bool),
+		counters:         make(map[string]int64),
 	}
 }
 
@@ -405,4 +413,34 @@ func (s *FakeStore) SetGlobalRetention(_ context.Context, arg SetGlobalRetention
 	defer s.mu.Unlock()
 	s.retention[arg.AccountID] = AccountRetention(arg)
 	return nil
+}
+
+// InsertPromptSuggestion mirrors Store.InsertPromptSuggestion — enough of it for
+// ClaimPromptSuggestion's own tests to have a row to claim.
+func (s *FakeStore) InsertPromptSuggestion(_ context.Context, arg InsertPromptSuggestionParams) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.nextID("suggestions")
+	s.suggestions[id] = &PromptSuggestion{
+		ID: id, CreatedAt: Now(), UpdatedAt: Now(),
+		PromptID: arg.PromptID, TriggerKind: arg.TriggerKind,
+		MessageID: arg.MessageID, EmailSubject: arg.EmailSubject, EmailSender: arg.EmailSender,
+		EmailBodySnapshot: arg.EmailBodySnapshot, OriginalInstructions: arg.OriginalInstructions,
+		SuggestedInstructions: arg.SuggestedInstructions, ConversationJSON: arg.ConversationJSON,
+		Status: arg.Status,
+	}
+	return id, nil
+}
+
+// ClaimPromptSuggestion mirrors Store.ClaimPromptSuggestion: wins the claim only the first
+// time for a given id, matching the real conditional-write's
+// attribute_not_exists(claimedAt) gate.
+func (s *FakeStore) ClaimPromptSuggestion(_ context.Context, id int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.suggestionClaims[id] {
+		return false, nil
+	}
+	s.suggestionClaims[id] = true
+	return true, nil
 }

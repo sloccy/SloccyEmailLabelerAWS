@@ -64,6 +64,48 @@ func reasoningOff(modelID, override string) reasoningDirective {
 	return d
 }
 
+// reasoningEffortRegistryEntry pairs a case-insensitive model-id substring with the
+// AdditionalModelRequestFields shape that model family expects for a non-off reasoning
+// effort. Unlike reasoningRegistry (which only ever turns reasoning *off*), this table
+// turns it *on* at a given effort — used by the improve call, which unlike classify
+// benefits from letting a capable model actually think before proposing a rule rewrite
+// (see SettingImproveReasoningEffort).
+type reasoningEffortRegistryEntry struct {
+	substr string
+	fields func(effort string) map[string]any
+}
+
+// reasoningEffortRegistry is a maintained capability map, same spirit as
+// reasoningRegistry above: a model swap needing a new entry here is expected, not a bug.
+// An unmatched model id (or ReasoningEffortOff) resolves to nil fields — a safe no-op.
+var reasoningEffortRegistry = []reasoningEffortRegistryEntry{
+	// GLM-5 on Bedrock exposes reasoning as a bare on/off switch via
+	// additionalModelRequestFields.reasoning_config — there is no separate
+	// low/medium/high; every non-off effort maps to the same "high" value AWS'
+	// documentation shows. See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html.
+	{substr: "glm", fields: func(string) map[string]any {
+		return map[string]any{"reasoning_config": "high"}
+	}},
+}
+
+// reasoningEffortFields returns the AdditionalModelRequestFields map that turns reasoning
+// on at the given effort for modelID, looked up by case-insensitive substring match
+// against reasoningEffortRegistry. Returns nil for ReasoningEffortOff or an unrecognized
+// model id — both safe no-ops, matching reasoningOff's own "unmatched is a no-op, not an
+// error" behavior.
+func reasoningEffortFields(modelID, effort string) map[string]any {
+	if effort == "" || effort == ReasoningEffortOff {
+		return nil
+	}
+	lower := strings.ToLower(modelID)
+	for _, e := range reasoningEffortRegistry {
+		if strings.Contains(lower, e.substr) {
+			return e.fields(effort)
+		}
+	}
+	return nil
+}
+
 // detectReasoning reports whether a classify response contains reasoning/
 // chain-of-thought content despite the reasoning directive — either as a dedicated
 // Converse ReasoningContent block, or as an inline "<think>...</think>" span in the

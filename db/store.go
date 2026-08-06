@@ -2247,6 +2247,35 @@ func itemToSuggestion(it map[string]types.AttributeValue) PromptSuggestion {
 	return unmarshalItem[PromptSuggestion](it)
 }
 
+// generatingStaleAfter bounds how long a suggestion may sit in "generating" before
+// GetPromptSuggestion/ListPromptSuggestions treat it as failed instead of showing an
+// infinite spinner. The improve worker (see improve.go's improveRunner) derives its own
+// deadline from the invoking Lambda's remaining time and always writes a terminal status
+// before returning — either normally, via its deferred failure write, or via
+// server.failDispatch when the async hand-off to the worker never happened at all. This is
+// the backstop for whatever slips past all three: an invocation killed by something other
+// than its own deadline (e.g. an account-level throttle), or an operational gap this
+// session hasn't hit yet. Read-only — the stored row is untouched, so a genuinely-
+// still-running call within the window is unaffected, and a caller that wants the raw
+// stored status (e.g. attributevalue_test.go's wire-format round-trip checks) still gets
+// it by calling itemToSuggestion directly instead of through these two methods.
+const generatingStaleAfter = 20 * time.Minute
+
+func withGeneratingStaleness(sg PromptSuggestion) PromptSuggestion {
+	if sg.Status != SuggestionStatusGenerating {
+		return sg
+	}
+	updated, err := time.Parse(tsLayout, sg.UpdatedAt)
+	if err != nil || time.Since(updated) < generatingStaleAfter {
+		return sg
+	}
+	sg.Status = SuggestionStatusFailed
+	if sg.UserComment == "" {
+		sg.UserComment = "Timed out waiting for a result — try regenerating."
+	}
+	return sg
+}
+
 func suggestionItem(id int64, ts string, arg InsertPromptSuggestionParams) map[string]types.AttributeValue {
 	return keyedItem(PromptSuggestion{
 		ID:                    id,
@@ -2287,7 +2316,7 @@ func (s *Store) GetPromptSuggestion(ctx context.Context, id int64) (PromptSugges
 	if item == nil {
 		return PromptSuggestion{}, fmt.Errorf("suggestion not found: %d", id)
 	}
-	return itemToSuggestion(item), nil
+	return withGeneratingStaleness(itemToSuggestion(item)), nil
 }
 
 func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, error) {
@@ -2304,7 +2333,7 @@ func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, 
 	}
 	var result []PromptSuggestion
 	for _, it := range items {
-		s := itemToSuggestion(it)
+		s := withGeneratingStaleness(itemToSuggestion(it))
 		if s.Status == SuggestionStatusApplied || s.Status == SuggestionStatusDismissed {
 			continue
 		}
@@ -2399,6 +2428,43 @@ func (s *Store) MarkPromptSuggestionGenerating(ctx context.Context, id int64) er
 
 func (s *Store) DismissPromptSuggestion(ctx context.Context, id int64) error {
 	return s.setSuggestionStatus(ctx, id, SuggestionStatusDismissed)
+}
+
+// attrClaimedAt marks a suggestion row as claimed by an improve-worker invocation — see
+// ClaimPromptSuggestion.
+const attrClaimedAt = "claimedAt"
+
+// ClaimPromptSuggestion marks a suggestion row as claimed by an improve-worker invocation
+// (improveRunner.runOne, improve.go). The MODE=improve Lambda is invoked async (Event),
+// which AWS automatically retries up to twice on error; without this, a retry after a
+// partial failure would redo (and re-bill) the same improve+replay round from scratch
+// instead of skipping a suggestion an earlier attempt already claimed. The conditional
+// UpdateItem only succeeds the first time for a given id — same
+// attribute_not_exists(...)-gated pattern ClaimMessages uses for the per-message lease,
+// just without a lease *expiry*: an improve round is a single bounded call, not a
+// long-lived worker loop, so there's nothing here for a crashed claimant to hand back the
+// way ReleaseClaim does for ClaimMessages.
+func (s *Store) ClaimPromptSuggestion(ctx context.Context, id int64) (bool, error) {
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv("SUGGESTION"),
+			"SK": sv(padID(id)),
+		},
+		UpdateExpression:    aws.String("SET " + attrClaimedAt + " = :ca"),
+		ConditionExpression: aws.String("attribute_not_exists(" + attrClaimedAt + ")"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":ca": sv(Now()),
+		},
+	})
+	if err != nil {
+		var ccf *types.ConditionalCheckFailedException
+		if isConditionFailed(err, &ccf) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // MarkExamplesResolved sets resolvedBySuggestionId on each of the given examples — called

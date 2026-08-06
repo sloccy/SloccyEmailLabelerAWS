@@ -37,6 +37,13 @@ func main() {
 		})
 	case "push":
 		runPush(cfg)
+	case "improve":
+		// Invoked async (Event) by WebFunction's dispatchImprove — see improve.go and
+		// ImproveFunction in template.yaml for why this work moved out of a goroutine
+		// inside WebFunction and into its own Lambda invocation.
+		store, llmClient, _ := buildDeps(cfg)
+		runner := newImproveRunner(store, llmClient, &cfg)
+		lambda.Start(runner.handle)
 	default:
 		runWeb(cfg)
 	}

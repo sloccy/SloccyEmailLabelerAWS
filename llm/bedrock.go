@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"regexp"
@@ -34,6 +35,19 @@ import (
 // after the Converse call returns (parsing, logging, DynamoDB writes) runs in well under a
 // second, so only a 30s margin is reserved for it rather than a full minute.
 const bedrockHTTPTimeout = 14*time.Minute + 30*time.Second
+
+// improveCallTimeout bounds a single ImprovePromptInstructions call. Unlike classify
+// (many short calls, fine to let bedrockHTTPTimeout be the only cap) or a queued flex-tier
+// request (genuinely needs minutes), one improve call is a single short rule rewrite —
+// this is the real latency cap for it, well under bedrockHTTPTimeout, so a stuck call
+// fails fast enough for the improve worker's own deadline margin (see improveWorkerMargin,
+// improve.go) to still have room to write a terminal status.
+const improveCallTimeout = 120 * time.Second
+
+// replayCallTimeout bounds a single classify call inside ReplayAgainstExamples. Replay
+// fans out one call per example (up to ~30) concurrently; without a per-call cap, one
+// stuck call would hold up the whole batch until bedrockHTTPTimeout, not just itself.
+const replayCallTimeout = 90 * time.Second
 
 // LogLevelTimeout is the db.Log level written when a Converse call is aborted by
 // bedrockHTTPTimeout, so the dashboard can count these over a rolling window.
@@ -85,6 +99,23 @@ const (
 	// resolveSetting — replay is orchestrated by the caller (which example set to use, when
 	// to run it), not by Client itself, so there's no per-call resolution to centralize here.
 	SettingImproveReplay = "improve_replay"
+	// SettingImproveReasoningEffort selects how hard the improve model is allowed to
+	// think before answering, for model families that expose a real effort ladder rather
+	// than the blunt on/off reasoningOff (reasoning.go) suppresses. Resolved via
+	// resolveSetting, defaulting to ReasoningEffortOff; see reasoningEffortFields for the
+	// per-family field mapping.
+	SettingImproveReasoningEffort = "improve_reasoning_effort"
+)
+
+// Values for SettingImproveReasoningEffort. Not every model family distinguishes all of
+// these — e.g. GLM's Bedrock reasoning_config is a bare on/off switch, so
+// reasoningEffortFields maps every non-off value to the same "high" — but the setting
+// itself stays a single ladder so the Settings UI doesn't need a per-model control.
+const (
+	ReasoningEffortOff    = "off"
+	ReasoningEffortLow    = "low"
+	ReasoningEffortMedium = "medium"
+	ReasoningEffortHigh   = "high"
 )
 
 // Values for SettingClassifyTier and SettingImproveTier.
@@ -888,6 +919,12 @@ func buildImproveUserTurn(req ImproveRequest) string {
 }
 
 func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error) {
+	// See improveCallTimeout's doc comment: this is the real latency cap for one improve
+	// call, tighter than the blanket bedrockHTTPTimeout the underlying HTTP client also
+	// enforces.
+	ctx, cancel := context.WithTimeout(ctx, improveCallTimeout)
+	defer cancel()
+
 	model := c.resolveModel(ctx, SettingImproveModel)
 	var msgs []types.Message
 
@@ -909,13 +946,18 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		msgs = append(msgs, userMessage(firstTurnMsg))
 	}
 
-	// Reasoning suppression (see reasoning.go) was previously classify-only; the improve
-	// model is just as capable of emitting chain-of-thought padding as the classify model,
-	// and improveSystemPrompt now depends on getting a single short line back, not a
-	// paragraph wrapped in a <think> block.
+	// Reasoning: off by default (see improveSystemPrompt's target of one short line, not a
+	// paragraph wrapped in a <think> block), same suppression classify uses (reasoning.go).
+	// SettingImproveReasoningEffort (Settings UI) can turn it back on at a given effort for
+	// a model family that exposes a real ladder — reasoningEffortFields, not reasoningOff,
+	// then decides the request fields, since asking for reasoning and suppressing it are
+	// mutually exclusive intents for the same call.
 	sys := systemBlock(improveSystemPrompt)
 	var fields document.Interface
-	if d := reasoningOff(model, ""); !d.isZero() {
+	effort := c.resolveSetting(ctx, SettingImproveReasoningEffort, ReasoningEffortOff)
+	if ef := reasoningEffortFields(model, effort); ef != nil {
+		fields = document.NewLazyDocument(ef)
+	} else if d := reasoningOff(model, ""); !d.isZero() {
 		if d.system != "" {
 			sys = append(sys, sysText(d.system))
 		}
@@ -942,6 +984,15 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	})
 	if err != nil {
 		return "", nil, err
+	}
+	if out.StopReason == types.StopReasonMaxTokens {
+		// The 2048 ceiling is sized for a 60-word rule, not chain-of-thought padding (see
+		// the comment above) — hitting it means either reasoning suppression/effort
+		// selection above isn't actually working for this model, or the model ignored
+		// improveSystemPrompt's length constraint. Either way the stored suggestion below
+		// is a silent truncation, not a complete rule, so this is worth a log line even
+		// though sanitizeRuleText can't distinguish it from a normal response.
+		slog.Warn("improve call hit max_tokens", "model", model, "effort", effort)
 	}
 	suggestion := sanitizeRuleText(extractText(out.Output))
 
@@ -1005,18 +1056,22 @@ type ReplayResult struct {
 //
 // This is the one place in the improve flow that's easy to get backwards: every other
 // Bedrock call in ImprovePromptInstructions/streamGenerate resolves SettingImproveModel,
-// and this function is invoked from deep inside that same flow (recategorize.go's
-// runImproveSuggestions). It must call ResolveClassifySettings — never resolveModel(ctx,
-// SettingImproveModel) — resolved once here and reused across every example, exactly as
-// ResolveClassifySettings' own doc comment directs for a batch of calls.
+// and this function is invoked from deep inside that same flow
+// (improveRunner.improveAndFinalizeSuggestion, improve.go). It must call
+// ResolveClassifySettings — never resolveModel(ctx, SettingImproveModel) — resolved once
+// here and reused across every example, exactly as ResolveClassifySettings' own doc
+// comment directs for a batch of calls.
+//
+// concurrency <= 0 means unbounded: every example is classified at once, no semaphore.
+// The MODE=improve worker (improve.go) always passes 0 — it runs inside its own 900s/1024MB
+// Lambda invocation with no live HTTP request sharing the budget, so there's no reason to
+// throttle a call fan-out that newBedrockRetryer's adaptive rate limiting already
+// backpressures. A positive value still throttles, for any other caller that does need it.
 func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, candidateInstructions string, examples []ReplayExample, concurrency int) ReplayResult {
 	model, tier, reasoningOverride := c.ResolveClassifySettings(ctx)
 	result := ReplayResult{Model: model}
 	if len(examples) == 0 {
 		return result
-	}
-	if concurrency < 1 {
-		concurrency = 1
 	}
 
 	// candidatePrompt is a placeholder — the candidate rule isn't a saved db.Prompt, just
@@ -1030,15 +1085,26 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 		errored bool
 	}
 	outcomes := make([]outcome, len(examples))
-	sem := make(chan struct{}, concurrency)
+	var sem chan struct{}
+	if concurrency > 0 {
+		sem = make(chan struct{}, concurrency)
+	}
 	var wg sync.WaitGroup
 
 	for i, ex := range examples {
-		sem <- struct{}{}
+		if sem != nil {
+			sem <- struct{}{}
+		}
 		wg.Go(func() {
-			defer func() { <-sem }()
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			// See replayCallTimeout's doc comment: bounds this one example's classify call
+			// so a single stuck call can't hold up the whole batch until bedrockHTTPTimeout.
+			callCtx, cancel := context.WithTimeout(ctx, replayCallTimeout)
+			defer cancel()
 			email := Email{Sender: ex.Sender, Subject: ex.Subject, Body: ex.Excerpt}
-			res, err := c.ClassifyEmailBatch(ctx, store, email, candidatePrompt, model, tier, reasoningOverride, false)
+			res, err := c.ClassifyEmailBatch(callCtx, store, email, candidatePrompt, model, tier, reasoningOverride, false)
 			if err != nil {
 				outcomes[i] = outcome{ex: ex, errored: true}
 				return

@@ -107,3 +107,50 @@ func TestClaimMessages_ExpiredLeaseIsReclaimable(t *testing.T) {
 		t.Fatalf("expected m1 to be reclaimable after its lease expired, got %v", reclaimed)
 	}
 }
+
+// TestClaimPromptSuggestion_SecondClaimBlocked verifies the core dedup gate
+// ClaimPromptSuggestion (improveRunner.runOne's caller, improve.go) relies on: the
+// MODE=improve worker Lambda is invoked async (Event), which AWS automatically retries up
+// to twice on error, so a second claim attempt for the same suggestion id must lose —
+// otherwise a retry would redo (and re-bill) the same improve+replay round from scratch.
+func TestClaimPromptSuggestion_SecondClaimBlocked(t *testing.T) {
+	s := NewFake()
+	sid, err := s.InsertPromptSuggestion(t.Context(), InsertPromptSuggestionParams{
+		PromptID: 1, TriggerKind: TriggerKindFalseNegative, Status: SuggestionStatusGenerating,
+	})
+	if err != nil {
+		t.Fatalf("InsertPromptSuggestion: %v", err)
+	}
+
+	first, err := s.ClaimPromptSuggestion(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("first ClaimPromptSuggestion: %v", err)
+	}
+	if !first {
+		t.Fatalf("expected first claim to win suggestion %d", sid)
+	}
+
+	second, err := s.ClaimPromptSuggestion(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("second ClaimPromptSuggestion: %v", err)
+	}
+	if second {
+		t.Fatalf("expected second claim on the same suggestion to be blocked")
+	}
+}
+
+// TestClaimPromptSuggestion_DifferentSuggestionsIndependent checks that claiming one
+// suggestion doesn't block a claim on a different one — the condition is scoped to a
+// single item, not some shared state.
+func TestClaimPromptSuggestion_DifferentSuggestionsIndependent(t *testing.T) {
+	s := NewFake()
+	sid1, _ := s.InsertPromptSuggestion(t.Context(), InsertPromptSuggestionParams{PromptID: 1, Status: SuggestionStatusGenerating})
+	sid2, _ := s.InsertPromptSuggestion(t.Context(), InsertPromptSuggestionParams{PromptID: 2, Status: SuggestionStatusGenerating})
+
+	if claimed, err := s.ClaimPromptSuggestion(t.Context(), sid1); err != nil || !claimed {
+		t.Fatalf("claim sid1: claimed=%v err=%v", claimed, err)
+	}
+	if claimed, err := s.ClaimPromptSuggestion(t.Context(), sid2); err != nil || !claimed {
+		t.Fatalf("claim sid2: claimed=%v err=%v", claimed, err)
+	}
+}

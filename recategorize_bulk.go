@@ -426,9 +426,9 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// One suggestion per flagged rule, not per email — the corpus (just written above)
-	// already carries every touched message's examples, so runImproveSuggestions needs
+	// already carries every touched message's examples, so the improve worker needs
 	// nothing email-specific to run; it reads the corpus fresh via selectExamplesForPrompt.
-	suggestionIDs := make(map[int64]int64, len(improveSet))
+	var targets []improveTarget
 	for pid := range improveSet {
 		p, ok := promptByID[pid]
 		if !ok {
@@ -447,11 +447,14 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 			slog.Error("bulk recategorize: insert generating suggestion", "prompt_id", pid, "err", err)
 			continue
 		}
-		suggestionIDs[pid] = sid
+		targets = append(targets, improveTarget{
+			SuggestionID:         sid,
+			PromptID:             p.ID,
+			OriginalInstructions: p.Instructions,
+			Note:                 note,
+		})
 	}
-	if len(suggestionIDs) > 0 {
-		go s.runImproveSuggestions(s.ctx, suggestionIDs, promptByID, note)
-	}
+	s.dispatchImprove(ctx, targets)
 
 	setHxTrigger(w, map[string]any{
 		triggerShowToast:              map[string]any{toastKeyMessage: fmt.Sprintf("Recategorized %d emails", len(selections)), jsonKeyType: toastTypeSuccess},
