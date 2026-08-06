@@ -17,7 +17,12 @@ type Config struct {
 	HistoryMaxLimit    int
 	HistoryPageSize    int
 	DebugLogging       bool
-	Mode               string // "web", "scan", or "push"
+	Mode               string // "web", "scan", "push", or "improve"
+
+	// ImproveFunctionName is the target of the async improve-worker hand-off (see
+	// server.dispatchImprove). Empty (local dev, tests) falls back to running the improve
+	// round in-process via a goroutine, same as before this was split into its own Lambda.
+	ImproveFunctionName string
 
 	// Gmail push (users.watch → Pub/Sub → PushFunction webhook).
 	PubSubTopic        string // projects/<proj>/topics/<name>; empty disables watch registration
@@ -50,6 +55,8 @@ func loadConfig() Config {
 		HistoryPageSize:    getEnvInt("HISTORY_PAGE_SIZE", 50),
 		DebugLogging:       getEnv("DEBUG_LOGGING", "0") == "1",
 		Mode:               getEnv("MODE", "web"),
+
+		ImproveFunctionName: getEnv("IMPROVE_FUNCTION_NAME", ""),
 
 		PubSubTopic:        getEnv("PUBSUB_TOPIC", ""),
 		PushAudience:       getEnv("PUSH_OIDC_AUDIENCE", ""),

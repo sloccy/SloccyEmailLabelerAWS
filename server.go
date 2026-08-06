@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
 	"github.com/sloccy/ollamail-aws/llm"
@@ -62,6 +64,16 @@ type server struct {
 	tmpl  *template.Template
 	mux   *http.ServeMux
 
+	// improver runs improve+replay rounds directly — used as the local-development/test
+	// fallback in dispatchImprove (improve.go) when improveLambda is nil. The MODE=improve
+	// worker Lambda builds its own separate instance in main.go; this one never runs in
+	// the deployed WebFunction path once ImproveFunctionName is set.
+	improver *improveRunner
+	// improveLambda invokes the MODE=improve worker asynchronously (see dispatchImprove).
+	// nil when cfg.ImproveFunctionName is unset (local dev, tests) or the AWS config
+	// couldn't be loaded — either way, dispatchImprove falls back to improver directly.
+	improveLambda *lambda.Client
+
 	// OAuth state: short-lived in-memory map (single instance, no need for persistent
 	// storage), keyed by the CSRF state token; carries the PKCE verifier for the exchange.
 	oauthMu    sync.Mutex
@@ -81,6 +93,18 @@ func newServer(ctx context.Context, store *db.Store, llmClient *llm.Client, auth
 		cfg:        cfg,
 		auth:       auth,
 		oauthState: make(map[string]oauthPending),
+		improver:   newImproveRunner(store, llmClient, cfg),
+	}
+	if cfg.ImproveFunctionName != "" {
+		if awsCfg, err := awsconfig.LoadDefaultConfig(ctx); err != nil {
+			// Not fatal: dispatchImprove falls back to running improve rounds in-process
+			// via s.improver when improveLambda is nil, same as an unset
+			// ImproveFunctionName — degraded (subject to the goroutine-freeze issue this
+			// worker exists to avoid), not broken.
+			slog.Error("load aws config for improve dispatch, falling back to in-process", "err", err)
+		} else {
+			s.improveLambda = lambda.NewFromConfig(awsCfg)
+		}
 	}
 
 	var err error
@@ -669,16 +693,17 @@ func modelAllowedForTier(m llm.ModelOption, tier string) bool {
 // the Standard selects (already sorted cheapest-first by ListAvailableModels); FlexModels is a
 // copy re-sorted by flex-tier cost (see llm.SortModelsByFlexCost) so the Flex selects sink their
 // own unpriced entries to the bottom instead of inheriting the standard-cost order.
-func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, improveReasoningEffort string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
-		"ClassifyModel":      classifyModel,
-		"ImproveModel":       improveModel,
-		"ClassifyTier":       classifyTier,
-		"ImproveTier":        improveTier,
-		"ReasoningDirective": reasoningDirective,
-		"ImproveReplay":      improveReplay,
-		"Models":             models,
-		"FlexModels":         llm.SortModelsByFlexCost(models),
+		"ClassifyModel":          classifyModel,
+		"ImproveModel":           improveModel,
+		"ClassifyTier":           classifyTier,
+		"ImproveTier":            improveTier,
+		"ReasoningDirective":     reasoningDirective,
+		"ImproveReplay":          improveReplay,
+		"ImproveReasoningEffort": improveReasoningEffort,
+		"Models":                 models,
+		"FlexModels":             llm.SortModelsByFlexCost(models),
 	}
 }
 
@@ -711,9 +736,10 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
 	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
 	improveReplay := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
+	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, models), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveReasoningEffort, models), "")
 }
 
 // applyTierSetting reads formKey from r's form; if it's a recognized tier ("standard" or
@@ -791,7 +817,16 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReplay, Value: replayValue})
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, models)
+	// Reasoning effort for the improve call: a fixed set of values, not free text like the
+	// classify reasoning-suppression override above, so garbage input is ignored the same
+	// way applyModelSetting ignores an unrecognized model id.
+	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
+	if v := r.FormValue("improve_reasoning_effort"); v == llm.ReasoningEffortOff || v == llm.ReasoningEffortLow || v == llm.ReasoningEffortMedium || v == llm.ReasoningEffortHigh {
+		improveReasoningEffort = v
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReasoningEffort, Value: v})
+	}
+
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveReasoningEffort, models)
 	s.fragmentResponse(w, "settings_form.html", data, "Settings saved")
 }
 
@@ -1560,7 +1595,7 @@ func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView 
 func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestion, promptName string) suggestionView {
 	view := toSuggestionView(sg, promptName)
 
-	examples := s.selectExamplesForPrompt(ctx, sg.PromptID)
+	examples := selectExamplesForPrompt(ctx, s.store, sg.PromptID)
 	labels := map[string]string{
 		db.VerdictFalseNegative:     "Missed it (should have matched)",
 		db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
@@ -1623,11 +1658,11 @@ func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Req
 }
 
 // handlePromptSuggestionRegenerate kicks off a fresh improve+replay round for an existing
-// suggestion, in the background: see regeneratePromptSuggestion (recategorize.go) for why
-// this can't run synchronously in the request once replay is in the picture. Returns the
-// same 'generating' view the detail page already renders with a spinner for a brand-new
-// suggestion (prompt_suggestion_detail.html); the suggestions list's existing 60s poll
-// (templates/index.html) picks up the finished result, no new client-side polling needed.
+// suggestion, async via the improve worker (see dispatchImprove, improve.go) — a full round
+// (improve call plus ~30 replay classify calls) can't run synchronously in the request.
+// Returns the same 'generating' view the detail page already renders with a spinner for a
+// brand-new suggestion (prompt_suggestion_detail.html); its own poll while generating (see
+// prompt_suggestion_detail.html) picks up the finished result.
 func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http.Request) {
 	id, ok := requireID(w, r)
 	if !ok {
@@ -1660,7 +1695,13 @@ func (s *server) handlePromptSuggestionRegenerate(w http.ResponseWriter, r *http
 		http.Error(w, "regenerate failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	go s.regeneratePromptSuggestion(s.ctx, id, p, sg.OriginalInstructions, conv, userComment)
+	s.dispatchImprove(ctx, []improveTarget{{
+		SuggestionID:         id,
+		PromptID:             sg.PromptID,
+		OriginalInstructions: sg.OriginalInstructions,
+		PriorConversation:    conv,
+		UserComment:          userComment,
+	}})
 
 	view := toSuggestionView(sg, p.Name)
 	view.Status = db.SuggestionStatusGenerating

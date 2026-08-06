@@ -220,6 +220,16 @@ Resources:
                   - ssm:PutParameter
                   - ssm:DeleteParameter
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ollamail/accounts/*
+              # WebFunction hands prompt-improvement work off to ImproveFunction via an
+              # async (Event) Invoke — see ImproveFunction below for why that work can't
+              # run as a goroutine inside WebFunction anymore. Fixed ARN, not !GetAtt
+              # ImproveFunction.Arn: ImproveFunction uses this same LambdaRole, so !GetAtt
+              # here would create the same LambdaRole→...→LambdaRole cycle documented on
+              # ScanFunction's FunctionName below — this is that same workaround.
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-improve
 
   # ----------------------------------------------------------------
   # Web function — serves the management UI via Function URL
@@ -266,6 +276,11 @@ Resources:
           # Mirrors the AuthType !If above so the app can fail closed: when the URL is
           # public (cfaccess) but the CF vars are missing, runWeb refuses to start.
           AUTH_MODE: !If [CfAccessEnabled, cfaccess, iam]
+          # Target of the async improve-worker hand-off (see dispatchImprove in server.go).
+          # Fixed name, matching ImproveFunction's own FunctionName below and the IAM
+          # Resource ARN above — !Ref ImproveFunction would work too, but the fixed string
+          # keeps this in the same "no !GetAtt back into LambdaRole" family as the IAM entry.
+          IMPROVE_FUNCTION_NAME: !Sub ${AWS::StackName}-improve
 
   # SAM auto-generates these two public-invoke permissions only when
   # FunctionUrlConfig.AuthType is the literal string "NONE". WebFunction's AuthType
@@ -385,6 +400,45 @@ Resources:
           MODE: scan
 
   # ----------------------------------------------------------------
+  # Improve function — runs one prompt-improvement (+ optional replay validation) round
+  # per suggestion, invoked async (Event) by WebFunction's dispatchImprove (server.go).
+  #
+  # WHY THIS EXISTS: this work used to run in a bare `go` goroutine inside WebFunction.
+  # Lambda freezes an execution environment the instant its HTTP response is written, so
+  # that goroutine got no CPU and sat on an open Bedrock connection across freezes —
+  # bedrockHTTPTimeout (llm/bedrock.go, 14m30s) is wall-clock, so it kept ticking through
+  # the freeze and the call eventually aborted anyway; if the environment was reaped
+  # first, the goroutine died with nothing ever writing a terminal status, leaving the
+  # suggestion on "generating" forever. A real Lambda invocation of its own — frozen only
+  # after *it* returns — doesn't have that failure mode.
+  # ----------------------------------------------------------------
+  ImproveFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Runtime: provided.al2023
+      Handler: bootstrap
+      # Fixed name so LambdaRole's own lambda:InvokeFunction grant (above) and WebFunction's
+      # IMPROVE_FUNCTION_NAME can both reference it without !GetAtt — see the IAM policy
+      # comment for why !GetAtt would cycle back through this function's own role.
+      FunctionName: !Sub ${AWS::StackName}-improve
+      Role: !GetAtt LambdaRole.Arn
+      # 900s = Lambda's hard max. One round is one improve call plus, when replay
+      # validation is on (the default), up to ~30 classify calls fanned out concurrently
+      # (see llm.ReplayAgainstExamples) — each individually bounded well under a minute,
+      # but Bedrock's adaptive retryer (newBedrockRetryer) can still stack up under
+      # throttling. 1024MB (vs. WebFunction's 128MB) gives that fan-out real CPU instead of
+      # the ~1/12 vCPU slice 128MB buys.
+      Timeout: 900
+      MemorySize: 1024
+      LoggingConfig:
+        LogGroup: !Ref ImproveFunctionLogGroup
+      Environment:
+        Variables:
+          MODE: improve
+
+  # ----------------------------------------------------------------
   # Push function — public Function URL that receives Gmail Pub/Sub push
   # notifications. AuthType NONE because Pub/Sub can't sign SigV4; the app
   # instead validates the Google-signed OIDC token on every request.
@@ -441,6 +495,12 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: /ollamail/scan
+      RetentionInDays: !Ref LogRetentionDays
+
+  ImproveFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ollamail/improve
       RetentionInDays: !Ref LogRetentionDays
 
   PushFunctionLogGroup:

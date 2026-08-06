@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -651,6 +653,80 @@ func TestReplayAgainstExamples_ClassifyErrorExcludedNotFailed(t *testing.T) {
 	if len(res.Failures) != 0 {
 		t.Errorf("Failures = %+v, want none", res.Failures)
 	}
+}
+
+// trackingConverseAPI is a thread-safe fakeConverseAPI variant for tests that fan out
+// concurrent Converse calls — the plain fakeConverseAPI's unprotected slice append races
+// under concurrent callers. Tracks how many calls were ever in flight at once, which is
+// the observable signature of a semaphore actually limiting (or not limiting) concurrency.
+type trackingConverseAPI struct {
+	mu          sync.Mutex
+	calls       int
+	inFlight    int
+	maxInFlight int
+}
+
+func (f *trackingConverseAPI) Converse(_ context.Context, _ *bedrockruntime.ConverseInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
+	f.mu.Lock()
+	f.calls++
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+
+	time.Sleep(10 * time.Millisecond) // hold the "in flight" window open long enough to overlap
+
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+
+	return textOutput(`{"1": true}`), nil
+}
+
+func (f *trackingConverseAPI) ConverseStream(_ context.Context, _ *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error) {
+	return nil, errors.New("trackingConverseAPI: ConverseStream not implemented")
+}
+
+// TestReplayAgainstExamples_ConcurrencyZeroIsUnbounded locks in concurrency<=0's meaning:
+// every example is classified at once, no semaphore — the MODE=improve worker (improve.go)
+// always passes 0 now that replay runs inside its own Lambda invocation instead of a
+// goroutine sharing WebFunction's request budget. Asserts the fan-out actually overlaps
+// (maxInFlight > 1) as the behavioral difference from concurrency: 1, which — per
+// TestReplayAgainstExamples_UsesClassifyModelNotImproveModel and the other replay tests
+// above, all of which pass 1 for deterministic call ordering — must still serialize.
+func TestReplayAgainstExamples_ConcurrencyZeroIsUnbounded(t *testing.T) {
+	examples := make([]ReplayExample, 8)
+	for i := range examples {
+		examples[i] = ReplayExample{Verdict: "confirmed_positive", Sender: fmt.Sprintf("s%d@example.com", i), Subject: "x", Excerpt: "y", Want: true}
+	}
+
+	t.Run("concurrency 0 overlaps", func(t *testing.T) {
+		fake := &trackingConverseAPI{}
+		cl := &Client{br: fake, defaultModel: "m"}
+		res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 0)
+		if res.Total != 8 || res.Passed != 8 {
+			t.Errorf("Total/Passed = %d/%d, want 8/8", res.Total, res.Passed)
+		}
+		if fake.calls != 8 {
+			t.Errorf("calls = %d, want 8", fake.calls)
+		}
+		if fake.maxInFlight <= 1 {
+			t.Errorf("maxInFlight = %d, want >1 — concurrency<=0 should fan out unbounded, not serialize", fake.maxInFlight)
+		}
+	})
+
+	t.Run("concurrency 1 serializes", func(t *testing.T) {
+		fake := &trackingConverseAPI{}
+		cl := &Client{br: fake, defaultModel: "m"}
+		res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+		if res.Total != 8 || res.Passed != 8 {
+			t.Errorf("Total/Passed = %d/%d, want 8/8", res.Total, res.Passed)
+		}
+		if fake.maxInFlight != 1 {
+			t.Errorf("maxInFlight = %d, want exactly 1 for concurrency: 1", fake.maxInFlight)
+		}
+	})
 }
 
 // TestNewBedrockRetryer_RetriesClockSkewAndThrottling checks that the retryer built by
