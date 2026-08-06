@@ -108,11 +108,16 @@ const (
 )
 
 // Values for SettingImproveReasoningEffort. Not every model family distinguishes all of
-// these — e.g. GLM's Bedrock reasoning_config is a bare on/off switch, so
-// reasoningEffortFields maps every non-off value to the same "high" — but the setting
-// itself stays a single ladder so the Settings UI doesn't need a per-model control.
+// these — see reasoningEffortRegistry (reasoning.go) for what each family actually
+// supports; ReasoningEffortLevels reports it, and the Settings UI renders only that
+// model's levels rather than always offering all four.
 const (
-	ReasoningEffortOff    = "off"
+	ReasoningEffortOff = "off"
+	// ReasoningEffortOn is for a family whose reasoning toggle is genuinely binary (e.g.
+	// GLM-5 — verified live: "low"/"medium" don't observably change its output vs. leaving
+	// the field unset, only "high" does, so it's exposed as one on/off choice rather than a
+	// ladder it doesn't really have).
+	ReasoningEffortOn     = "on"
 	ReasoningEffortLow    = "low"
 	ReasoningEffortMedium = "medium"
 	ReasoningEffortHigh   = "high"
@@ -948,40 +953,64 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 
 	// Reasoning: off by default (see improveSystemPrompt's target of one short line, not a
 	// paragraph wrapped in a <think> block), same suppression classify uses (reasoning.go).
-	// SettingImproveReasoningEffort (Settings UI) can turn it back on at a given effort for
-	// a model family that exposes a real ladder — reasoningEffortFields, not reasoningOff,
-	// then decides the request fields, since asking for reasoning and suppressing it are
-	// mutually exclusive intents for the same call.
+	// SettingImproveReasoningEffort (Settings UI) can turn it back on for a model family
+	// that supports it. Deliberately NOT an if/else-if into reasoningOff: a non-off effort
+	// that reasoningEffortFields can't honor (unrecognized family, or an effort outside
+	// that family's levels) must leave the model at its own default, not fall through into
+	// suppression — turning reasoning on and suppressing it are opposite intents for the
+	// same call, and inverting one into the other silently would be worse than a no-op.
 	sys := systemBlock(improveSystemPrompt)
 	var fields document.Interface
 	effort := c.resolveSetting(ctx, SettingImproveReasoningEffort, ReasoningEffortOff)
-	if ef := reasoningEffortFields(model, effort); ef != nil {
-		fields = document.NewLazyDocument(ef)
-	} else if d := reasoningOff(model, ""); !d.isZero() {
-		if d.system != "" {
-			sys = append(sys, sysText(d.system))
+	switch {
+	case effort == "" || effort == ReasoningEffortOff:
+		if d := reasoningOff(model, ""); !d.isZero() {
+			if d.system != "" {
+				sys = append(sys, sysText(d.system))
+			}
+			if d.fields != nil {
+				fields = document.NewLazyDocument(d.fields)
+			}
 		}
-		if d.fields != nil {
-			fields = document.NewLazyDocument(d.fields)
-		}
+	case reasoningEffortFields(model, effort) != nil:
+		fields = document.NewLazyDocument(reasoningEffortFields(model, effort))
+	default:
+		slog.Warn("improve reasoning effort requested but unsupported for model", "model", model, "effort", effort)
 	}
 
-	out, err := c.br.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:  aws.String(model),
-		System:   sys,
-		Messages: msgs,
-		InferenceConfig: &types.InferenceConfiguration{
-			// 2048, not the old 16384: that ceiling existed only to absorb chain-of-thought
-			// padding from a reasoning model. With reasoning suppressed above and a 60-word
-			// target in the system prompt, anything near 2048 tokens signals a truncation
-			// or a suppression failure, not a legitimately long answer.
-			MaxTokens:   aws.Int32(2048),
-			Temperature: aws.Float32(0.4),
-		},
-		ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
-		AdditionalModelRequestFields: fields,
-		RequestMetadata:              requestMetadataFor("improve"),
-	})
+	converse := func(f document.Interface) (*bedrockruntime.ConverseOutput, error) {
+		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
+			ModelId:  aws.String(model),
+			System:   sys,
+			Messages: msgs,
+			InferenceConfig: &types.InferenceConfiguration{
+				// 2048, not the old 16384: that ceiling existed only to absorb chain-of-thought
+				// padding from a reasoning model. With reasoning suppressed above and a 60-word
+				// target in the system prompt, anything near 2048 tokens signals a truncation
+				// or a suppression failure, not a legitimately long answer.
+				MaxTokens:   aws.Int32(2048),
+				Temperature: aws.Float32(0.4),
+			},
+			ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
+			AdditionalModelRequestFields: f,
+			RequestMetadata:              requestMetadataFor("improve"),
+		})
+	}
+
+	out, err := converse(fields)
+	if err != nil && fields != nil {
+		// reasoningEffortRegistry's field shapes are verified against live Bedrock as of
+		// writing (see the glm entry's comment), but that's still an unvalidated passthrough
+		// field per Bedrock's own contract — a future model swap or provider-side change
+		// could make a previously-good shape start failing. Rather than let that take down
+		// every improve call, retry once with the field dropped: reasoning silently stays
+		// off (loud in the log instead), but the suggestion still gets generated.
+		var ve *types.ValidationException
+		if errors.As(err, &ve) {
+			slog.Warn("improve call rejected reasoning fields, retrying without them", "model", model, "effort", effort, "err", err)
+			out, err = converse(nil)
+		}
+	}
 	if err != nil {
 		return "", nil, err
 	}

@@ -64,25 +64,50 @@ func TestReasoningEffortFields_UnrecognizedModelIsNoop(t *testing.T) {
 	}
 }
 
-// TestReasoningEffortFields_GLMBinaryToggle locks in GLM-5's Bedrock reasoning contract:
-// additionalModelRequestFields.reasoning_config is a bare on/off switch (AWS's own docs
-// only show "high"), not a graduated ladder — so every non-off effort this setting offers
-// must map to that same one "on" value, not to distinct per-level fields that don't exist
-// on this model family.
+// TestReasoningEffortFields_GLMBinaryToggle locks in GLM-5's Bedrock reasoning contract,
+// verified live against zai.glm-5 in us-east-1: additionalModelRequestFields.reasoning_config
+// accepts "none"/"low"/"medium"/"high" without erroring, but only "high" produces an actual
+// ReasoningContent block — "none"/"low"/"medium" were all indistinguishable from omitting the
+// field. So this family is registered as a plain on/off switch (ReasoningEffortOn is its only
+// level), and "low"/"medium"/"high" — values a *different*, ladder-supporting family might use
+// — must NOT resolve to fields for GLM, since ReasoningEffortLevels is what the Settings UI
+// trusts to decide which options to even offer.
 func TestReasoningEffortFields_GLMBinaryToggle(t *testing.T) {
+	got := reasoningEffortFields("zai.glm-5", ReasoningEffortOn)
+	want := map[string]any{"reasoning_config": "high"}
+	if len(got) != len(want) || got["reasoning_config"] != want["reasoning_config"] {
+		t.Errorf("reasoningEffortFields(glm, on) = %#v, want %#v", got, want)
+	}
+
 	for _, effort := range []string{ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh} {
-		got := reasoningEffortFields("zai.glm-5", effort)
-		want := map[string]any{"reasoning_config": "high"}
-		if len(got) != len(want) || got["reasoning_config"] != want["reasoning_config"] {
-			t.Errorf("reasoningEffortFields(glm, %q) = %#v, want %#v", effort, got, want)
+		if got := reasoningEffortFields("zai.glm-5", effort); got != nil {
+			t.Errorf("reasoningEffortFields(glm, %q) = %#v, want nil (glm's only level is ReasoningEffortOn)", effort, got)
 		}
 	}
 }
 
+// TestReasoningEffortLevels_GLMIsOnOff checks the UI-facing side of the same contract: GLM's
+// levels must be exactly [on], not a four-value ladder it doesn't actually have.
+func TestReasoningEffortLevels_GLMIsOnOff(t *testing.T) {
+	got := ReasoningEffortLevels("zai.glm-5")
+	if len(got) != 1 || got[0] != ReasoningEffortOn {
+		t.Errorf("ReasoningEffortLevels(glm) = %#v, want [%q]", got, ReasoningEffortOn)
+	}
+}
+
+// TestReasoningEffortLevels_UnrecognizedModelIsNil checks the Settings UI's "disable the
+// control" signal: an unrecognized model must report no levels, not an empty-but-non-nil
+// slice that could render as an enabled-but-empty dropdown.
+func TestReasoningEffortLevels_UnrecognizedModelIsNil(t *testing.T) {
+	if got := ReasoningEffortLevels("meta.llama3-1-70b-instruct-v1:0"); got != nil {
+		t.Errorf("ReasoningEffortLevels(unrecognized) = %#v, want nil", got)
+	}
+}
+
 func TestReasoningEffortFields_MatchIsCaseInsensitive(t *testing.T) {
-	got := reasoningEffortFields("ZAI.GLM-5", ReasoningEffortHigh)
+	got := reasoningEffortFields("ZAI.GLM-5", ReasoningEffortOn)
 	if got == nil || got["reasoning_config"] != "high" {
-		t.Errorf("reasoningEffortFields(uppercased model id, high) = %#v, want reasoning_config=high", got)
+		t.Errorf("reasoningEffortFields(uppercased model id, on) = %#v, want reasoning_config=high", got)
 	}
 }
 

@@ -48,13 +48,20 @@
       </div>
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Prompt improver reasoning effort</div>
-        <div class="small text-muted mt-1">Off by default: chain-of-thought is suppressed on reasoning-capable models the same way classification suppresses it, since the improve prompt asks for a single short rule rewrite, not a reasoning trace. Turning this up lets a model family with a real effort ladder (e.g. GLM) think before answering — some models (GLM included) only expose a plain on/off switch on Bedrock, so any non-Off choice enables it at that model's single "on" level.</div>
+        {{if .ImproveReasoningLevels}}
+        <div class="small text-muted mt-1">Off by default: chain-of-thought is suppressed on reasoning-capable models the same way classification suppresses it, since the improve prompt asks for a single short rule rewrite, not a reasoning trace. Turning this on lets the current model ({{.ImproveModel}}) think before answering.</div>
         <select class="form-select form-select-sm mt-2" name="improve_reasoning_effort" style="max-width:200px;">
           <option value="off"{{if eq .ImproveReasoningEffort "off"}} selected{{end}}>Off</option>
-          <option value="low"{{if eq .ImproveReasoningEffort "low"}} selected{{end}}>Low</option>
-          <option value="medium"{{if eq .ImproveReasoningEffort "medium"}} selected{{end}}>Medium</option>
-          <option value="high"{{if eq .ImproveReasoningEffort "high"}} selected{{end}}>High</option>
+          {{range .ImproveReasoningLevels}}
+          <option value="{{.}}"{{if eq . $.ImproveReasoningEffort}} selected{{end}}>{{if eq . "on"}}On{{else if eq . "low"}}Low{{else if eq . "medium"}}Medium{{else if eq . "high"}}High{{else}}{{.}}{{end}}</option>
+          {{end}}
         </select>
+        {{else}}
+        <div class="small text-muted mt-1">Not supported for the current prompt improver model ({{.ImproveModel}}) — reasoning stays at whatever that model defaults to. Switch to a model this app has a verified reasoning-effort mapping for (currently GLM) to control it.</div>
+        <select class="form-select form-select-sm mt-2" style="max-width:200px;" disabled>
+          <option>Not supported</option>
+        </select>
+        {{end}}
       </div>
       <div class="py-3 px-4 setting-row">
         <div class="fw-medium">Reasoning suppression override</div>
