@@ -562,16 +562,17 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 }
 
 // TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression guards the fix
-// for a real inversion bug: a non-off SettingImproveReasoningEffort that reasoningEffortFields
-// can't honor (here, "high" against Qwen — a family in reasoningEffortRegistry's world only
-// via reasoningRegistry, the *suppression* table, and "high" not being a level Qwen even has)
-// must leave the model at its own default. It must NOT fall through into reasoningOff and
-// inject the suppression system text — that would be answering "turn reasoning on" by turning
-// it off, the opposite of what was asked.
+// for a real inversion bug, using the one model where it can actually happen:
+// nvidia.nemotron-nano-9b-v2 is both exempt from reasoningEffortFields (verified live to
+// ignore reasoning_config — see reasoningEffortExempt) AND matched by reasoningRegistry's
+// *suppression* table ("nemotron" -> "detailed thinking off", reasoningOff). Requesting
+// ReasoningEffortOn on this exact model must leave it at its own default — it must NOT fall
+// through into reasoningOff and inject the suppression text, which would answer "turn
+// reasoning on" by turning it off, the opposite of what was asked.
 func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t *testing.T) {
-	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortHigh}
+	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
 	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
-	cl := &Client{br: fake, defaultModel: "qwen.qwen3-32b-v1:0", settings: settings}
+	cl := &Client{br: fake, defaultModel: "nvidia.nemotron-nano-9b-v2", settings: settings}
 
 	_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
 		PromptName:           "newsletter",
@@ -586,8 +587,8 @@ func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t
 		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
 	}
 	for _, block := range fake.calls[0].System {
-		if txt, ok := block.(*types.SystemContentBlockMemberText); ok && strings.Contains(txt.Value, "/no_think") {
-			t.Errorf("system prompt contains the Qwen suppression switch %q — an unsupported effort request must not invert into suppression", txt.Value)
+		if txt, ok := block.(*types.SystemContentBlockMemberText); ok && strings.Contains(txt.Value, "detailed thinking off") {
+			t.Errorf("system prompt contains the Nemotron suppression switch %q — an unsupported effort request must not invert into suppression", txt.Value)
 		}
 	}
 	if fake.calls[0].AdditionalModelRequestFields != nil {
@@ -596,8 +597,9 @@ func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t
 }
 
 // TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields checks the fail-safe
-// for reasoningEffortRegistry drifting out of sync with what Bedrock actually accepts (it's
-// an unvalidated passthrough field, verified only at the time an entry was written): if the
+// for an unverified model's assumed reasoning_config support turning out to be wrong (see
+// reasoningEffortSupported's default-on design) — it's an unvalidated passthrough field, so
+// this can happen for any model outside the confirmed sweep. If the
 // fields-bearing Converse call is rejected with a ValidationException, the call must retry
 // once with the fields dropped rather than surface the error and leave the suggestion failed.
 func TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields(t *testing.T) {
