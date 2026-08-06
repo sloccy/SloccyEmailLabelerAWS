@@ -57,7 +57,7 @@ func (c *FakeClient) ClassifyEmailBatch(_ context.Context, _ StoreLogger, _ Emai
 	if err := json.Unmarshal([]byte(c.response), &parsed); err != nil {
 		return res, &Error{Msg: "fake parse error: " + err.Error()}
 	}
-	res.Results = mapKeysToResults(parsed, prompts)
+	res.Results = parseClassifyResponse(parsed, prompts)
 	return res, nil
 }
 

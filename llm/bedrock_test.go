@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -370,6 +371,92 @@ func TestClassifyEmailBatch_SingleSummaryLogLine(t *testing.T) {
 		if !strings.Contains(infoLines[0], want) {
 			t.Errorf("summary line missing %q: %s", want, infoLines[0])
 		}
+	}
+}
+
+func TestClassifyEmailBatch_ParsesMatchListResponse(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{
+			textOutput(`{"m": [2]}`),
+		},
+	}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
+	if err != nil {
+		t.Fatalf("ClassifyEmailBatch error: %v", err)
+	}
+	if res.Results[101] || !res.Results[102] {
+		t.Errorf("Results = %v, want {101:false, 102:true}", res.Results)
+	}
+}
+
+func TestClassifyEmailBatch_ParsesEmptyMatchList(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{
+			textOutput(`{"m": []}`),
+		},
+	}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	res, err := c.ClassifyEmailBatch(context.Background(), db.NewFake(), testEmail(), testPrompts(), c.defaultModel, TierStandard, "", false)
+	if err != nil {
+		t.Fatalf("ClassifyEmailBatch error: %v", err)
+	}
+	if res.Results[101] || res.Results[102] {
+		t.Errorf("Results = %v, want every prompt false", res.Results)
+	}
+}
+
+func TestParseClassifyResponse(t *testing.T) {
+	prompts := testPrompts() // IDs 101, 102
+
+	cases := []struct {
+		name string
+		raw  string
+		want map[int64]bool
+	}{
+		{"match list, one hit", `{"m": [2]}`, map[int64]bool{101: false, 102: true}},
+		{"match list, both", `{"m": [1, 2]}`, map[int64]bool{101: true, 102: true}},
+		{"match list, empty", `{"m": []}`, map[int64]bool{101: false, 102: false}},
+		{"match list, numeric string entries", `{"m": ["2"]}`, map[int64]bool{101: false, 102: true}},
+		{"match list, out-of-range and non-numeric entries ignored", `{"m": [0, 3, "x", 2]}`, map[int64]bool{101: false, 102: true}},
+		{"legacy boolean map", `{"1": true, "2": false}`, map[int64]bool{101: true, 102: false}},
+		{"legacy boolean map, partial", `{"2": true}`, map[int64]bool{102: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(c.raw), &parsed); err != nil {
+				t.Fatalf("json.Unmarshal(%q): %v", c.raw, err)
+			}
+			got := parseClassifyResponse(parsed, prompts)
+			// Legacy partial maps intentionally omit unset keys (see mapKeysToResults);
+			// the match-list path always seeds every prompt false first.
+			for id, want := range c.want {
+				if got[id] != want {
+					t.Errorf("parseClassifyResponse(%q)[%d] = %v, want %v", c.raw, id, got[id], want)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildUserTurn_ExampleIsConstantRegardlessOfRuleCount(t *testing.T) {
+	// The old per-rule boolean example grew with rule count; the {"m": [...]} contract's
+	// example doesn't need to, which is half of the token saving this format switch is for.
+	one := buildUserTurn(testEmail(), testPrompts()[:1])
+	many := buildUserTurn(testEmail(), []Prompt{
+		{ID: 1, Name: "a", Instructions: "x"},
+		{ID: 2, Name: "b", Instructions: "y"},
+		{ID: 3, Name: "c", Instructions: "z"},
+		{ID: 4, Name: "d", Instructions: "w"},
+		{ID: 5, Name: "e", Instructions: "v"},
+	})
+	const wantExample = `Example (rule 1 applies, no others): {"m": [1]}`
+	if !strings.Contains(one, wantExample) {
+		t.Errorf("buildUserTurn with 1 rule missing constant example %q:\n%s", wantExample, one)
+	}
+	if !strings.Contains(many, wantExample) {
+		t.Errorf("buildUserTurn with 5 rules missing constant example %q:\n%s", wantExample, many)
 	}
 }
 
