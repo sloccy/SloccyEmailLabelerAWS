@@ -127,8 +127,21 @@ func Truncate(s string, maxChars int) string {
 	return s[:maxChars]
 }
 
-// CollapseExcerpt joins s's whitespace-separated fields with single spaces and truncates to
-// maxRunes — turns a raw (possibly multi-line, multi-space) email body into a compact,
+// CollapseWhitespace joins s's whitespace-separated fields with single spaces, eliminating
+// multi-line/multi-space runs without truncating. strings.Fields splits on unicode.IsSpace,
+// which also catches U+00A0 (non-breaking space) — marketing HTML commonly chains &nbsp;
+// entities as manual spacing/padding, and decodes them to literal NBSP runs that survive
+// cleanInvisibles and per-line TrimSpace untouched. Separately, extractText emits one line
+// per closing tag rather than per block element, so heavily inline-styled prose (every word
+// wrapped in its own <span>/<b>/<a>) fragments into many one-word lines. Both are pure noise
+// to an LLM classifier — no information lost, tokens and readability both improved by
+// collapsing them back to normal prose.
+func CollapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// CollapseExcerpt collapses whitespace (see CollapseWhitespace) and truncates to maxRunes,
+// rune-safely — turns a raw (possibly multi-line, multi-space) email body into a compact,
 // single-line excerpt safe to store and display. Not a substitute for Truncate: Truncate is
 // a byte-length cutoff with no whitespace collapsing and no UTF-8-rune safety (fine for a
 // log preview, risky for content meant to be stored and re-rendered — a byte cutoff can
@@ -137,7 +150,7 @@ func Truncate(s string, maxChars int) string {
 // rather than in either of those packages — both already import gmail, and this avoids a
 // main<->processor import cycle that duplicating it in each would otherwise require.
 func CollapseExcerpt(s string, maxRunes int) string {
-	s = strings.Join(strings.Fields(s), " ")
+	s = CollapseWhitespace(s)
 	r := []rune(s)
 	if len(r) > maxRunes {
 		r = r[:maxRunes]

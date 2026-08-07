@@ -460,6 +460,45 @@ func TestBuildUserTurn_ExampleIsConstantRegardlessOfRuleCount(t *testing.T) {
 	}
 }
 
+func TestStripURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bare URL", "https://example.com/track?utm_source=x", " "},
+		{"URL mid-sentence, surrounding words don't fuse", "click here https://example.com/a/b to unsubscribe", "click here   to unsubscribe"},
+		{"http (non-https) URL", "see http://example.com for details", "see   for details"},
+		{"no URL is a no-op", "just plain text, no links here", "just plain text, no links here"},
+		{"empty input", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stripURLs(c.in)
+			if got != c.want {
+				t.Errorf("stripURLs(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuildUserTurn_BodyCleanedOfLineFragmentationAndURLs(t *testing.T) {
+	// buildUserTurn should turn extractText's one-word-per-line output, NBSP padding, and a
+	// visible tracking URL back into flowing, URL-free prose before it reaches the model —
+	// none of that carries classification signal, and it's pure token/quality noise as-is.
+	email := testEmail()
+	email.Body = "Hello\nworld\nfrom\nour\u00a0\u00a0team. https://example.com/track?utm_source=newsletter&utm_campaign=x Unsubscribe here."
+	turn := buildUserTurn(email, testPrompts())
+
+	if strings.Contains(turn, "https://") || strings.Contains(turn, "http://") {
+		t.Errorf("buildUserTurn should strip URLs from the body, got:\n%s", turn)
+	}
+	const wantBody = "Hello world from our team. Unsubscribe here."
+	if !strings.Contains(turn, wantBody) {
+		t.Errorf("buildUserTurn body not collapsed to flowing prose; want it to contain %q, got:\n%s", wantBody, turn)
+	}
+}
+
 // ---- extractJSONObject ----
 
 func TestSanitizeRuleText(t *testing.T) {
