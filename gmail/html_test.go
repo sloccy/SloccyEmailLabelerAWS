@@ -1,6 +1,9 @@
 package gmail
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCleanInvisibles(t *testing.T) {
 	const wantFoobar = "foobar"
@@ -89,6 +92,30 @@ func TestExtractText(t *testing.T) {
 			got := extractText(tc.input)
 			if got != tc.want {
 				t.Errorf("extractText(%q)\n  got  %q\n  want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCollapseWhitespace(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"collapses newlines and extra spaces", "Hello\n\nworld   there", "Hello world there"},
+		{"one word per line, as extractText produces for heavily inline-styled HTML", "Hello\nworld\nfrom\nour\nteam", "Hello world from our team"},
+		{"NBSP padding runs collapse like ordinary spaces", "Hello    world", "Hello world"},
+		{"mixed tabs and newlines", "Hello\t\n\tworld", "Hello world"},
+		{"no truncation, unlike CollapseExcerpt", strings.Repeat("word ", 20), strings.TrimSpace(strings.Repeat("word ", 20))},
+		{"shorter than any limit is untouched", "hi", "hi"},
+		{"empty input", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := CollapseWhitespace(c.in)
+			if got != c.want {
+				t.Errorf("CollapseWhitespace(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

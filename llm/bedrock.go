@@ -26,6 +26,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
+
+	gmailpkg "github.com/sloccy/ollamail-aws/gmail"
 )
 
 // bedrockHTTPTimeout is the HTTP client read-timeout for Bedrock calls. Flex-tier requests
@@ -391,6 +393,21 @@ const classifySystemPrompt = `You are an email classification assistant. You wil
 Respond with a single JSON object and nothing else: {"m": [rule numbers that apply]}. List only the numbers of rules that apply, in ascending order. Use {"m": []} when no rule applies.
 Output ONLY that JSON object. Do not include any explanation, reasoning, preamble, "<think>" block, or markdown code fences before or after it.`
 
+// classifyURLRe matches an http(s) URL for stripping from the email body sent to the
+// classify prompt. Visible URL text in marketing/redirect-heavy email is pure noise for
+// classification — rules key off sender, subject, and prose content, not link targets — and
+// long tracking URLs (utm_* params, etc.) can consume a disproportionate share of the fixed
+// truncation budget. Only visible link *text* ever reaches here; href attribute values are
+// already excluded upstream by gmail/html.go's extractText.
+var classifyURLRe = regexp.MustCompile(`https?://\S+`)
+
+// stripURLs removes URLs from s, replacing each with a single space so the surrounding words
+// don't fuse together. Callers should follow with gmail.CollapseWhitespace to normalize the
+// space left behind.
+func stripURLs(s string) string {
+	return classifyURLRe.ReplaceAllString(s, " ")
+}
+
 // buildUserTurn renders the per-call data (rules, a count-matched example, and the
 // email) as the classify user turn. The role and output-format contract are invariant
 // across calls and live in classifySystemPrompt instead.
@@ -401,11 +418,18 @@ func buildUserTurn(email Email, prompts []Prompt) string {
 	}
 	rulesText := sb.String()
 
+	// The body is often HTML-derived prose fragmented into one-word-per-line runs by
+	// extractText's per-tag newlines, plus NBSP-padding and visible tracking URLs — all
+	// artifacts of the extraction pipeline with no classification signal. Cleaned up here
+	// (rather than upstream in the gmail package) to keep the blast radius scoped to the
+	// classify prompt only; Email.Body itself, and every other consumer of it, is untouched.
 	body := email.Body
 	if body == "" {
 		body = email.Snippet
 	}
 	body = strings.ReplaceAll(body, "\r", "")
+	body = stripURLs(body)
+	body = gmailpkg.CollapseWhitespace(body)
 
 	// The example is a fixed constant regardless of rule count — this prompt is the
 	// model's only signal for the expected output shape (Converse tool-use isn't
