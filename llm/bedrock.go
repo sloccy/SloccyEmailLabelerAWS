@@ -107,6 +107,48 @@ const (
 	// resolveSetting, defaulting to ReasoningEffortOff; see reasoningEffortFields for the
 	// per-family field mapping.
 	SettingImproveReasoningEffort = "improve_reasoning_effort"
+	// SettingImproveMaxRounds caps how many improve->replay rounds one suggestion may run
+	// (improveRunner's improve loop, improve.go) before finalizing whichever round scored
+	// best. Read directly via db.Store.GetSetting from improve.go, the same pattern as
+	// SettingImproveReplay — the loop is orchestrated by the caller (which examples to
+	// replay against, when to stop), not by this Client, so there's no per-call resolution
+	// to centralize here. Meaningless with replay disabled: with no score to iterate on,
+	// the loop always runs exactly one round regardless of this value.
+	SettingImproveMaxRounds = "improve_max_rounds"
+	// SettingImproveExampleCap caps how many examples per verdict selectExamplesForImprove
+	// (improve.go) curates for the improve prompt itself — small and token-bounded, unlike
+	// SettingReplayExampleCap below. Read directly via db.Store.GetSetting, same
+	// caller-orchestrated pattern as SettingImproveMaxRounds.
+	SettingImproveExampleCap = "improve_example_cap"
+	// SettingReplayExampleCap caps how many examples per verdict ReplayAgainstExamples
+	// (called from improve.go's improveAndFinalizeSuggestion) scores a candidate rule
+	// against — deliberately independent of and larger than SettingImproveExampleCap,
+	// since replay doesn't cost prompt tokens the way the improve call does, just one
+	// classify call per example. A bigger, more representative sample here means a much
+	// less noisy pass/fail score, at the cost of more classify calls during replay.
+	// Meaningless with replay disabled (SettingImproveReplay).
+	SettingReplayExampleCap = "replay_example_cap"
+)
+
+// ImproveMaxRoundsDefault/ImproveMaxRoundsCap bound SettingImproveMaxRounds: unset (or
+// unparsable) falls back to the default; anything above the cap is clamped down to it. A
+// cap exists because each extra round costs one improve call plus a full replay fan-out
+// (up to ~30 classify calls) — see improveRunner.improveMaxRounds, improve.go.
+const (
+	ImproveMaxRoundsDefault = 3
+	ImproveMaxRoundsCap     = 5
+)
+
+// ImproveExampleCapDefault/ImproveExampleCapMax bound SettingImproveExampleCap — the small,
+// token-bounded set the improve prompt itself sees. ReplayExampleCapDefault/
+// ReplayExampleCapMax bound SettingReplayExampleCap — deliberately much larger, since
+// replay's cost is classify calls, not prompt tokens; see improve.go's sampleExamples for
+// the selection policy that fills either cap.
+const (
+	ImproveExampleCapDefault = 12
+	ImproveExampleCapMax     = 20
+	ReplayExampleCapDefault  = 40
+	ReplayExampleCapMax      = 100
 )
 
 // Values for SettingImproveReasoningEffort. Every reasoning-capable model this project has
@@ -141,9 +183,33 @@ type ModelOption struct {
 
 // converseAPI is the subset of *bedrockruntime.Client used for chat calls. Narrowing to
 // an interface lets tests substitute a fake without a network round-trip.
+//
+// ConverseStream returns *bedrockruntime.ConverseStreamEventStream rather than the SDK's
+// own *bedrockruntime.ConverseStreamOutput: that wrapper's event-stream reader is an
+// unexported field with no public constructor, so a test fake could never produce one —
+// only the real SDK client can. ConverseStreamEventStream, by contrast, is explicitly
+// documented by the SDK as constructible via NewConverseStreamEventStream "for testing and
+// mocking," with an exported Reader field. Unwrapping one layer here (see bedrockAdapter)
+// is what keeps streamGenerate and ImprovePromptInstructions fakeable end to end.
 type converseAPI interface {
 	Converse(ctx context.Context, params *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
-	ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error)
+	ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error)
+}
+
+// bedrockAdapter adapts *bedrockruntime.Client to converseAPI — see converseAPI's doc
+// comment for why ConverseStream needs to unwrap the SDK's output to its event stream.
+type bedrockAdapter struct{ c *bedrockruntime.Client }
+
+func (a bedrockAdapter) Converse(ctx context.Context, params *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
+	return a.c.Converse(ctx, params, optFns...)
+}
+
+func (a bedrockAdapter) ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error) {
+	out, err := a.c.ConverseStream(ctx, params, optFns...)
+	if err != nil {
+		return nil, err
+	}
+	return out.GetStream(), nil
 }
 
 // Client wraps the Bedrock runtime client with per-call model resolution.
@@ -218,7 +284,7 @@ func NewClient(settings Settings, defaultModel string) *Client {
 		panic(fmt.Sprintf("bedrock: load aws config: %v", err))
 	}
 	return &Client{
-		br:           bedrockruntime.NewFromConfig(cfg),
+		br:           bedrockAdapter{c: bedrockruntime.NewFromConfig(cfg)},
 		awsCfg:       cfg,
 		defaultModel: defaultModel,
 		settings:     settings,
@@ -343,7 +409,12 @@ type ClassifyResult struct {
 
 type StreamChunk struct {
 	Text string
-	Err  error
+	// Reasoning carries a chain-of-thought delta, kept separate from Text so a caller
+	// can render (or discard) thinking output independently of the answer it's building
+	// toward — see ImprovePromptInstructions and streamGenerate, both of which forward
+	// ContentBlockDeltaMemberReasoningContent text here rather than mixing it into Text.
+	Reasoning string
+	Err       error
 }
 
 type ChatMessage struct {
@@ -358,6 +429,12 @@ type ExampleRef struct {
 	Sender  string
 	Subject string
 	Excerpt string
+	// Recurred marks an example whose problem an earlier applied suggestion already
+	// claimed to fix, and it happened again — see db.PromptExample.Recurred, which this is
+	// copied from. formatExampleRefs renders it as a "[RECURRED]" prefix so the improver
+	// can tell "first time seeing this" apart from "already tried once and failed," which
+	// calls for a bigger rewrite than a small wording tweak.
+	Recurred bool
 }
 
 // ImproveRequest carries a rule and its labeled-example corpus into ImprovePromptInstructions,
@@ -376,6 +453,13 @@ type ImproveRequest struct {
 	UserNote             string
 	PriorConversation    []ChatMessage
 	UserComment          string
+	// PastAttempts is this rule's earlier live versions (excluding the current one —
+	// OriginalInstructions already shows that), oldest evidence discarded first by the
+	// caller (see improve.go's attemptsForPrompt). Rendered by buildImproveUserTurn's PAST
+	// ATTEMPTS section, capped at maxAttemptLines — this is the improve loop's cross-
+	// session memory: without it, every round starts from a blank slate and can re-propose
+	// a phrasing this exact rule already tried and already failed.
+	PastAttempts []AttemptRef
 }
 
 // ============================================================
@@ -836,7 +920,7 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 		}
 	}
 
-	out, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+	stream, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:  aws.String(model),
 		System:   sys,
 		Messages: []types.Message{userMessage(userMsg)},
@@ -851,18 +935,31 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 	if err != nil {
 		return err
 	}
-
-	stream := out.GetStream()
 	defer func() { _ = stream.Close() }()
 
 	for event := range stream.Events() {
 		switch e := event.(type) {
 		case *types.ConverseStreamOutputMemberContentBlockDelta:
-			if d, ok := e.Value.Delta.(*types.ContentBlockDeltaMemberText); ok && d.Value != "" {
-				select {
-				case ch <- StreamChunk{Text: d.Value}:
-				case <-ctx.Done():
-					return ctx.Err()
+			switch d := e.Value.Delta.(type) {
+			case *types.ContentBlockDeltaMemberText:
+				if d.Value != "" {
+					select {
+					case ch <- StreamChunk{Text: d.Value}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			case *types.ContentBlockDeltaMemberReasoningContent:
+				// Same thinking view ImprovePromptInstructions streams — the builder call
+				// uses this system prompt's own reasoning suppression above, but a model
+				// that leaks a ReasoningContent block anyway is worth showing rather than
+				// silently dropping (matches ImprovePromptInstructions' behavior).
+				if rt, ok := d.Value.(*types.ReasoningContentBlockDeltaMemberText); ok && rt.Value != "" {
+					select {
+					case ch <- StreamChunk{Reasoning: rt.Value}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
 			}
 		case *types.ConverseStreamOutputMemberMessageStop:
@@ -922,6 +1019,7 @@ const improveSystemPrompt = `You rewrite email-classification rules. Output only
 - Keep the original scope. Never widen a narrow rule into a catch-all.
 - Never cite a sender, subject, or body phrase from the examples. Generalize to the category.
 - Plain declarative prose. No bullets, headings, markdown, quotes, or hedging.
+- If PAST ATTEMPTS are shown, do not restate one of them. They already failed.
 
 A small model with no reasoning applies this rule to one email at a time.
 It must be decidable from the email alone.`
@@ -930,14 +1028,20 @@ It must be decidable from the email alone.`
 // for the improve user turn, one call per ImproveRequest slice (ShouldMatch/ShouldNotMatch/
 // AlreadyCorrect). Returns "" for an empty slice so buildImproveUserTurn can omit the
 // section entirely rather than print an empty heading — matters most for a brand-new rule
-// with no corpus yet, where the prompt otherwise still has to read coherently.
+// with no corpus yet, where the prompt otherwise still has to read coherently. A recurring
+// example (r.Recurred — see ExampleRef's doc comment) gets a "[RECURRED] " prefix: three
+// tokens, only on the lines that matter, rather than a whole extra section.
 func formatExampleRefs(refs []ExampleRef) string {
 	if len(refs) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	for _, r := range refs {
-		fmt.Fprintf(&sb, "- %s | %s | %s\n", r.Sender, r.Subject, r.Excerpt)
+		prefix := ""
+		if r.Recurred {
+			prefix = "[RECURRED] "
+		}
+		fmt.Fprintf(&sb, "- %s%s | %s | %s\n", prefix, r.Sender, r.Subject, r.Excerpt)
 	}
 	return sb.String()
 }
@@ -948,12 +1052,17 @@ func buildImproveUserTurn(req ImproveRequest) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "RULE: %s   LABEL: %s\n\nCURRENT:\n%s\n", req.PromptName, req.LabelName, req.OriginalInstructions)
 
+	if s := formatAttempts(req.PastAttempts); s != "" {
+		fmt.Fprintf(&sb, "\nPAST ATTEMPTS (already tried on this rule; each still had problems — do not repeat them):\n%s", s)
+	}
+
 	// Each clause of the closing instruction is only meaningful if its section was
 	// actually printed above — a brand-new rule with no corpus yet would otherwise get a
 	// closing line that references three example groups that don't exist ("every SHOULD
 	// MATCH matches" with no SHOULD MATCH section anywhere above it), which is confusing
 	// rather than merely redundant. goals collects only the clauses that apply.
 	var goals []string
+	var anyRecurred bool
 	if s := formatExampleRefs(req.ShouldMatch); s != "" {
 		fmt.Fprintf(&sb, "\nSHOULD MATCH (missed these):\n%s", s)
 		goals = append(goals, "every SHOULD MATCH matches")
@@ -966,19 +1075,83 @@ func buildImproveUserTurn(req ImproveRequest) string {
 		fmt.Fprintf(&sb, "\nALREADY CORRECT (do not break these):\n%s", s)
 		goals = append(goals, "every ALREADY CORRECT still matches")
 	}
+	for _, refs := range [][]ExampleRef{req.ShouldMatch, req.ShouldNotMatch, req.AlreadyCorrect} {
+		for _, r := range refs {
+			if r.Recurred {
+				anyRecurred = true
+			}
+		}
+	}
 	if req.UserNote != "" {
 		fmt.Fprintf(&sb, "\nUSER NOTE: %s\n", req.UserNote)
 	}
 
 	if len(goals) > 0 {
 		fmt.Fprintf(&sb, "\nRewrite CURRENT so %s.", strings.Join(goals, ", "))
+		if anyRecurred {
+			sb.WriteString(" The [RECURRED] cases survived an earlier rewrite — a small wording tweak will not fix them; change what the rule actually checks for.")
+		}
 	} else {
 		sb.WriteString("\nRewrite CURRENT to be clearer and more precise, preserving its exact scope and intent.")
 	}
 	return sb.String()
 }
 
-func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error) {
+// AttemptRef is one earlier version of this rule, shown to the improver as evidence of
+// what was already tried — see ImproveRequest.PastAttempts and buildImproveUserTurn's PAST
+// ATTEMPTS section, and improve.go's attemptsForPrompt for how these are built from
+// db.PromptVersion.
+type AttemptRef struct {
+	Instructions string
+	// Passed/Total is the evidence for this attempt. Total == 0 means no evidence at all
+	// (a manual edit with replay off, or a version too new to have accrued any observed
+	// corrections yet) — formatAttempts omits that attempt entirely rather than render a
+	// misleading "0/0", the same convention ReplayTotal == 0 uses elsewhere in this
+	// package's callers.
+	Passed, Total int
+}
+
+// maxAttemptLines caps how many PAST ATTEMPTS this codebase will ever show the improver —
+// deliberately small, in line with this repo's recent token-compression commits (rule
+// generation and classify responses were both cut for the same reason). Each attempt costs
+// roughly one rule's worth of tokens (~85), so even the cap is a small fraction of a corpus
+// turn's ~3,000 tokens.
+const maxAttemptLines = 3
+
+// formatAttempts renders req.PastAttempts as numbered "N. "text" -> P/T" lines, skipping
+// any attempt with no evidence (Total == 0) and stopping at maxAttemptLines. Returns "" for
+// an empty or all-skipped list, so buildImproveUserTurn can omit the section entirely —
+// same empty-section convention formatExampleRefs uses.
+func formatAttempts(attempts []AttemptRef) string {
+	var sb strings.Builder
+	n := 0
+	for _, a := range attempts {
+		if a.Total == 0 {
+			continue
+		}
+		if n >= maxAttemptLines {
+			break
+		}
+		n++
+		text := a.Instructions
+		if len(text) > 200 {
+			text = text[:200]
+		}
+		fmt.Fprintf(&sb, "%d. %q -> scored %d/%d\n", n, text, a.Passed, a.Total)
+	}
+	return sb.String()
+}
+
+// ImproveSink receives incremental deltas from a streaming ImprovePromptInstructions call
+// — Text for the answer as it's written, Reasoning for chain-of-thought on a model with
+// reasoning turned on. nil means no one is watching; the call still streams (identical
+// cost/latency to a non-streaming Converse) and the deltas are simply discarded. Passing a
+// sink here rather than adding a second, streaming-only function keeps the max_tokens
+// 2048/16384 split, the reasoning-fields ValidationException retry, sanitizeRuleText, and
+// the conversation-building below in one place instead of forked between two call shapes.
+type ImproveSink func(StreamChunk)
+
+func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest, sink ImproveSink) (string, []ChatMessage, error) {
 	// See improveCallTimeout's doc comment: this is the real latency cap for one improve
 	// call, tighter than the blanket bedrockHTTPTimeout the underlying HTTP client also
 	// enforces.
@@ -1033,7 +1206,17 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		slog.Warn("improve reasoning effort requested but unsupported for model", "model", model, "effort", effort)
 	}
 
-	converse := func(f document.Interface) (*bedrockruntime.ConverseOutput, error) {
+	emit := func(chunk StreamChunk) {
+		if sink != nil {
+			sink(chunk)
+		}
+	}
+
+	// stream runs one ConverseStream call and accumulates its answer text. emitted reports
+	// whether any delta at all reached the sink — used below to gate the ValidationException
+	// retry, since that retry must never re-run after a partial answer has already been
+	// shown to the caller.
+	stream := func(f document.Interface) (answer string, stopReason types.StopReason, emitted bool, err error) {
 		// 2048 when reasoning is off/suppressed: with a 60-word target in the system prompt,
 		// anything near that signals a truncation or a suppression failure, not a
 		// legitimately long answer — worth keeping tight as that signal. But when reasoning
@@ -1047,7 +1230,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		if f != nil {
 			maxTokens = 16384
 		}
-		return c.br.Converse(ctx, &bedrockruntime.ConverseInput{
+		es, streamErr := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 			ModelId:  aws.String(model),
 			System:   sys,
 			Messages: msgs,
@@ -1059,27 +1242,59 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			AdditionalModelRequestFields: f,
 			RequestMetadata:              requestMetadataFor("improve"),
 		})
+		if streamErr != nil {
+			return "", "", false, streamErr
+		}
+		defer func() { _ = es.Close() }()
+
+		var sb strings.Builder
+		for event := range es.Events() {
+			switch e := event.(type) {
+			case *types.ConverseStreamOutputMemberContentBlockDelta:
+				switch d := e.Value.Delta.(type) {
+				case *types.ContentBlockDeltaMemberText:
+					if d.Value != "" {
+						sb.WriteString(d.Value)
+						emitted = true
+						emit(StreamChunk{Text: d.Value})
+					}
+				case *types.ContentBlockDeltaMemberReasoningContent:
+					if rt, ok := d.Value.(*types.ReasoningContentBlockDeltaMemberText); ok && rt.Value != "" {
+						emitted = true
+						emit(StreamChunk{Reasoning: rt.Value})
+					}
+				}
+			case *types.ConverseStreamOutputMemberMessageStop:
+				stopReason = e.Value.StopReason
+			}
+		}
+		if streamErr := es.Err(); streamErr != nil {
+			return sb.String(), stopReason, emitted, streamErr
+		}
+		return sb.String(), stopReason, emitted, nil
 	}
 
-	out, err := converse(fields)
-	if err != nil && fields != nil {
+	answer, stopReason, emitted, err := stream(fields)
+	if err != nil && fields != nil && !emitted {
 		// reasoningEffortSupported (reasoning.go) defaults an unrecognized model to "assume
 		// reasoning_config works" based on a broad but not exhaustive live sweep — a model
 		// outside that sweep, or a provider-side change to one inside it, can still reject
 		// this unvalidated passthrough field. Rather than let that take down every improve
 		// call, retry once with the field dropped: reasoning silently stays off (loud in the
-		// log instead), but the suggestion still gets generated.
+		// log instead), but the suggestion still gets generated. Gated on !emitted: once any
+		// delta has reached the sink, a retry would replay a second (different) answer on
+		// top of a partial one the caller has already seen — surface the error instead.
 		var ve *types.ValidationException
 		if errors.As(err, &ve) {
 			slog.Warn("improve call rejected reasoning fields, retrying without them", "model", model, "effort", effort, "err", err)
-			out, err = converse(nil)
+			answer, stopReason, _, err = stream(nil)
 		}
 	}
 	if err != nil {
 		return "", nil, err
 	}
-	if out.StopReason == types.StopReasonMaxTokens {
-		// converse's 2048/16384 split (see its comment) is sized for the common case either
+	if stopReason == types.StopReasonMaxTokens {
+		// stream's 2048/16384 split (see its comment) is sized for the common case either
 		// way — hitting the ceiling regardless means either reasoning suppression/effort
 		// selection above isn't actually working for this model, the model ignored
 		// improveSystemPrompt's length constraint, or (reasoning on) the model's thinking
@@ -1088,7 +1303,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		// sanitizeRuleText can't distinguish it from a normal response.
 		slog.Warn("improve call hit max_tokens", "model", model, "effort", effort)
 	}
-	suggestion := sanitizeRuleText(extractText(out.Output))
+	suggestion := sanitizeRuleText(answer)
 
 	// Build updated conversation for storage
 	var conv []ChatMessage
@@ -1129,6 +1344,15 @@ type ReplayFailure struct {
 	Sender  string `json:"sender"`
 	Subject string `json:"subject"`
 	Got     bool   `json:"got"`
+	// ExampleIndex is this failure's position in the []ReplayExample slice passed to
+	// ReplayAgainstExamples. json:"-" is deliberate and load-bearing, not just tidiness:
+	// the index is only meaningful within the process that ran this replay call — the
+	// caller (improve.go's improve loop) rebuilds its example corpus fresh on every round,
+	// so a persisted index would silently point at the wrong email after a reload or a
+	// later round. It exists purely so a same-process caller (buildReplayFeedbackTurn) can
+	// recover the full source example — body excerpt included — for the next round's
+	// feedback turn without ReplayFailure itself needing to carry a copy of it.
+	ExampleIndex int `json:"-"`
 }
 
 // ReplayResult summarizes a replay run. Total counts only examples that were successfully
@@ -1208,7 +1432,7 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 	}
 	wg.Wait()
 
-	for _, o := range outcomes {
+	for i, o := range outcomes {
 		if o.errored {
 			store.Log("ERROR", fmt.Sprintf("replay validation: classify failed for example (verdict=%s), excluded from score", o.ex.Verdict))
 			continue
@@ -1219,6 +1443,7 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 		} else {
 			result.Failures = append(result.Failures, ReplayFailure{
 				Verdict: o.ex.Verdict, Sender: o.ex.Sender, Subject: o.ex.Subject, Got: o.got,
+				ExampleIndex: i,
 			})
 		}
 	}

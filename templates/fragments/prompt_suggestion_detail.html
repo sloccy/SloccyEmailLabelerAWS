@@ -1,13 +1,4 @@
-<div class="card p-4" id="suggestion-detail-{{.ID}}"
-  {{if eq .Status "generating"}}
-  {{/* Self-refresh while a background improve round is in flight — the improve worker
-       (improve.go) can take well over the suggestions list's own 60s poll interval
-       (templates/index.html) once replay validation is in the picture, and this card may
-       be the only thing open when the result lands. */}}
-  hx-get="/fragments/prompt-suggestions/{{.ID}}"
-  hx-trigger="every 10s"
-  hx-swap="outerHTML"
-  {{end}}>
+<div class="card p-4" id="suggestion-detail-{{.ID}}">
   <div class="d-flex align-items-center justify-content-between mb-3 gap-2 flex-wrap">
     <div>
       <h6 class="mb-1 fw-bold">{{.PromptName}}</h6>
@@ -77,6 +68,23 @@
   </div>
   {{end}}
 
+  {{if gt (len .Rounds) 1}}
+  {{/* Only shown when the improve loop (improve.go) actually ran more than one round —
+       a single-round suggestion (replay off, or improve_max_rounds=1) has nothing to
+       compare and this would just repeat the Suggested Instructions pane below. */}}
+  <details class="mb-3">
+    <summary class="small text-muted" style="cursor:pointer">Attempts ({{len .Rounds}}) &mdash; round {{.BestRound}} applied &#9656;</summary>
+    <ul class="small mt-2 ps-3 mb-0">
+      {{range .Rounds}}
+      <li class="mb-1{{if eq .N $.BestRound}} fw-semibold{{end}}">
+        Round {{.N}}{{if eq .N $.BestRound}} (applied){{end}}:
+        {{if gt .Total 0}}{{.Passed}}/{{.Total}} correct &mdash; {{end}}<span class="text-muted">{{.Candidate}}</span>
+      </li>
+      {{end}}
+    </ul>
+  </details>
+  {{end}}
+
   <div class="row g-3 mb-4">
     <div class="col-md-6">
       <div class="form-label small fw-semibold text-muted text-uppercase">Current Instructions</div>
@@ -85,9 +93,21 @@
     <div class="col-md-6">
       <div class="form-label small fw-semibold text-success text-uppercase">Suggested Instructions</div>
       {{if eq .Status "generating"}}
-      <div class="p-2 border rounded bg-body-secondary d-flex align-items-center gap-2 text-muted small" style="min-height:5rem">
-        <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
-        Waiting for AI&hellip;
+      {{/* Live trace pane — replaces the old static "Waiting for AI..." spinner. Populated
+           by static/app.js polling GET /fragments/prompt-suggestions/{{.ID}}/trace with a
+           seq cursor (see handlePromptSuggestionTrace, server.go); the polling loop starts
+           itself on htmx:afterSwap (see #suggestion-detail-container's listener) rather
+           than needing a <script> tag embedded in this fragment. */}}
+      <div class="trace-live" data-suggestion-id="{{.ID}}" data-after-seq="0">
+        <div class="p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">
+          <span class="trace-answer text-muted fst-italic">Waiting for the model to start&hellip;</span><span class="spinner-border spinner-border-sm ms-1" role="status" aria-hidden="true"></span>
+        </div>
+        <details class="mt-2">
+          <summary class="small text-muted" style="cursor:pointer">Thinking&hellip;</summary>
+          <pre class="trace-thinking small text-muted mt-1 mb-0" style="white-space:pre-wrap;word-break:break-word;max-height:12rem;overflow-y:auto"></pre>
+        </details>
+        <ul class="trace-steps small text-muted mt-2 mb-0 ps-3"></ul>
+        <div class="trace-stalled small text-danger mt-2 d-none">No progress for a few minutes &mdash; the worker may have died. Try regenerating.</div>
       </div>
       {{else if eq .Status "failed"}}
       <div class="p-2 border border-danger rounded bg-body-secondary font-monospace small text-danger" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.UserComment}}</div>

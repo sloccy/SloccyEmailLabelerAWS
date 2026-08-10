@@ -444,3 +444,18 @@ func (s *FakeStore) ClaimPromptSuggestion(_ context.Context, id int64) (bool, er
 	s.suggestionClaims[id] = true
 	return true, nil
 }
+
+// MarkPromptSuggestionGenerating mirrors Store.MarkPromptSuggestionGenerating: flips the
+// suggestion back to generating and clears the claim, so a regenerate's worker invocation
+// can win ClaimPromptSuggestion again — see that method's doc comment for why clearing the
+// claim isn't optional.
+func (s *FakeStore) MarkPromptSuggestionGenerating(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.suggestionClaims, id)
+	if sg, ok := s.suggestions[id]; ok {
+		sg.Status = SuggestionStatusGenerating
+		sg.UpdatedAt = Now()
+	}
+	return nil
+}

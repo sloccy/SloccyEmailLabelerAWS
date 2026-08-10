@@ -42,6 +42,13 @@ function setActivePage(page, el) {
   if (el) el.classList.add('active');
   if (location.hash !== '#' + page) history.replaceState(null, '', '#' + page);
   closeSidebar();
+  // The suggestions list's own poll only fires while this page is already active (see
+  // #suggestions-poll's hx-trigger filter in prompt_suggestions_list.html), so navigating
+  // here from elsewhere would otherwise wait up to its own interval for the first update —
+  // navigation itself is a good enough reason to refresh immediately.
+  if (page === 'prompt-suggestions') {
+    window.dispatchEvent(new CustomEvent('refreshSuggestions'));
+  }
 }
 
 function _navToHash() {
@@ -498,6 +505,100 @@ window.addEventListener('refreshSuggestions', function() {
   if (listContainer && document.getElementById('page-prompt-suggestions').classList.contains('active')) {
     htmx.ajax('GET', '/fragments/prompt-suggestions', { target: '#suggestions-list-container', swap: 'innerHTML' });
   }
+});
+
+// ---- Suggestion live trace ----
+//
+// A generating suggestion's detail card (prompt_suggestion_detail.html) renders a
+// .trace-live pane instead of a static spinner. This polls its progress log
+// (GET .../trace?after=N) every 1.5s, appends deltas into that pane, and — the piece that
+// actually fixes "Generating… forever until refresh" — swaps in the finished card and
+// notifies the list/badge the instant the trace reports done, instead of waiting on any
+// fixed interval to notice on its own.
+const _suggestionTracers = {};
+
+function _startSuggestionTrace(el) {
+  const id = el.dataset.suggestionId;
+  if (!id || _suggestionTracers[id]) return; // already tracking this one
+
+  const answerEl = el.querySelector('.trace-answer');
+  const thinkingEl = el.querySelector('.trace-thinking');
+  const stepsEl = el.querySelector('.trace-steps');
+  const stalledEl = el.querySelector('.trace-stalled');
+  let after = 0;
+  let answerStarted = false;
+
+  const stepLabels = {
+    round_start: 'Starting…', candidate: 'Draft ready, validating…',
+    replay_start: 'Checking against past examples…', replay_done: 'Validation',
+    note: 'Note', error: 'Error',
+  };
+
+  function appendStep(kind, text) {
+    if (!stepsEl || !(kind in stepLabels)) return;
+    const li = document.createElement('li');
+    li.textContent = text ? stepLabels[kind] + ': ' + text : stepLabels[kind];
+    stepsEl.appendChild(li);
+  }
+
+  function poll() {
+    // The element (or the whole card) may have been removed from the DOM since the last
+    // tick — "Back to list" clears #suggestion-detail-container's innerHTML directly, with
+    // no htmx swap event to hook a cleanup callback onto, so this check is the only thing
+    // that stops the interval in that case.
+    if (!document.body.contains(el)) {
+      clearInterval(_suggestionTracers[id]);
+      delete _suggestionTracers[id];
+      return;
+    }
+    fetch('/fragments/prompt-suggestions/' + id + '/trace?after=' + after)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => {
+        after = data.lastSeq;
+        (data.events || []).forEach(ev => {
+          if (ev.kind === 'answer') {
+            if (!answerStarted) { answerEl.textContent = ''; answerEl.classList.remove('text-muted', 'fst-italic'); answerStarted = true; }
+            answerEl.textContent += ev.text;
+          } else if (ev.kind === 'thinking' && thinkingEl) {
+            thinkingEl.textContent += ev.text;
+          } else {
+            appendStep(ev.kind, ev.text);
+          }
+        });
+        if (stalledEl) stalledEl.classList.toggle('d-none', !data.stalled);
+
+        if (data.status !== 'generating') {
+          clearInterval(_suggestionTracers[id]);
+          delete _suggestionTracers[id];
+          // Swap in the finished card (pending/failed/dismissed) in place of this one, then
+          // let the list and badge know — this is the completion signal that never existed
+          // before: nothing used to fire when the worker finished, so the UI waited on
+          // whatever poll happened to be running next, if any were running at all.
+          const card = document.getElementById('suggestion-detail-' + id);
+          if (card && window.htmx) {
+            htmx.ajax('GET', '/fragments/prompt-suggestions/' + id, { target: '#' + card.id, swap: 'outerHTML' });
+          }
+          window.dispatchEvent(new CustomEvent('refreshSuggestions'));
+        }
+      })
+      .catch(() => {}); // a transient fetch failure just waits for the next tick
+  }
+
+  _suggestionTracers[id] = setInterval(poll, 1500);
+  poll();
+}
+
+// Listened for on #suggestion-detail-container (never itself replaced) rather than on the
+// .trace-live element directly, so this covers both ways a generating card can appear:
+// the initial GET (targets #suggestion-detail-container, swap innerHTML) and a regenerate
+// POST (targets #suggestion-detail-{id}, swap outerHTML, nested inside the same container).
+// Re-scans the whole container rather than reading the swap target off the event, matching
+// the htmx:afterSwap pattern already used for #hist-body/#prompts-list elsewhere in this
+// file — _startSuggestionTrace is idempotent (skips an id it's already tracking), so
+// re-scanning a small subtree on every swap is cheap and simple rather than depending on
+// an event-detail shape.
+document.getElementById('suggestion-detail-container')?.addEventListener('htmx:afterSwap', function() {
+  document.querySelectorAll('#suggestion-detail-container .trace-live[data-suggestion-id]').forEach(_startSuggestionTrace);
 });
 
 document.body.addEventListener('closeModal', function(e) {

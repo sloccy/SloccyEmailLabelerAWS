@@ -482,13 +482,15 @@ func processEmail(
 		// db.InsertPromptExamples' doc comment for why that dedup depends on every
 		// PromptExample write path sharing the same monotonically-ordered id source.
 		examples = append(examples, db.PromptExample{
-			PromptID:    p.ID,
-			AccountID:   account.ID,
-			MessageID:   msg.ID,
-			Verdict:     db.VerdictConfirmedPositive,
-			Sender:      msg.Sender,
-			Subject:     msg.Subject,
-			BodyExcerpt: excerpt,
+			PromptID:        p.ID,
+			AccountID:       account.ID,
+			MessageID:       msg.ID,
+			Verdict:         db.VerdictConfirmedPositive,
+			Sender:          msg.Sender,
+			Subject:         msg.Subject,
+			BodyExcerpt:     excerpt,
+			PromptVersionID: p.CurrentVersionID,
+			Source:          db.ExampleSourcePassive,
 		})
 	}
 

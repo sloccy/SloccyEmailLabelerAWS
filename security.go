@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strings"
 )
 
 // contentSecurityPolicy locks every fetch directive to the app's own origin — external
@@ -40,9 +41,13 @@ func newSecurityMiddleware(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 
 		// GET /api/prompts/generate-stream drives Bedrock spend, so it gets the same
-		// cross-site check as writes despite being a read.
+		// cross-site check as writes despite being a read. The suggestion-trace endpoint
+		// is cheap per call (a couple of DynamoDB reads), but a hostile page can hold a
+		// tab open and poll it in a loop for as long as the victim leaves it open, same
+		// abuse shape as generate-stream just at a smaller unit cost — same gate.
 		guarded := r.Method != http.MethodGet && r.Method != http.MethodHead ||
-			r.URL.Path == "/api/prompts/generate-stream"
+			r.URL.Path == "/api/prompts/generate-stream" ||
+			strings.HasSuffix(r.URL.Path, "/trace")
 		if guarded {
 			switch r.Header.Get("Sec-Fetch-Site") {
 			case "", "same-origin", "none": // non-browser, same-origin, or user-initiated (typed URL)

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/sloccy/ollamail-aws/db"
@@ -113,7 +116,11 @@ func TestBulkVerdictsAndPlan_ApplyAndRemoveSameRuleIgnored(t *testing.T) {
 
 func TestBuildPromptExamples(t *testing.T) {
 	verdicts := map[int64]string{5: db.VerdictFalseNegative, 7: db.VerdictConfirmedPositive}
-	got := buildPromptExamples(1, "msg1", "a@example.com", "Hello", "excerpt", "my note", verdicts)
+	promptByID := map[int64]db.Prompt{
+		5: {ID: 5, CurrentVersionID: 42},
+		7: {ID: 7}, // no version yet — should stamp 0, not panic on a missing entry's zero value
+	}
+	got := buildPromptExamples(1, "msg1", "a@example.com", "Hello", "excerpt", "my note", verdicts, promptByID)
 	if len(got) != 2 {
 		t.Fatalf("got %d examples, want 2: %+v", len(got), got)
 	}
@@ -131,11 +138,67 @@ func TestBuildPromptExamples(t *testing.T) {
 	if byPrompt[7].Verdict != db.VerdictConfirmedPositive {
 		t.Errorf("prompt 7 verdict = %q, want confirmed_positive", byPrompt[7].Verdict)
 	}
+	if byPrompt[5].PromptVersionID != 42 {
+		t.Errorf("prompt 5 PromptVersionID = %d, want 42 (stamped from promptByID.CurrentVersionID)", byPrompt[5].PromptVersionID)
+	}
+	if byPrompt[7].PromptVersionID != 0 {
+		t.Errorf("prompt 7 PromptVersionID = %d, want 0 (no version recorded yet)", byPrompt[7].PromptVersionID)
+	}
+}
+
+func TestBuildPromptExamples_MissingPromptFromMapStampsZero(t *testing.T) {
+	// Defensive: shouldn't happen (the caller builds promptByID from the same prompts the
+	// verdict map came from), but a promptID absent from the map must degrade to "no
+	// version," not panic on a missing map entry.
+	verdicts := map[int64]string{99: db.VerdictFalseNegative}
+	got := buildPromptExamples(1, "msg1", "a", "b", "c", "d", verdicts, map[int64]db.Prompt{})
+	if len(got) != 1 || got[0].PromptVersionID != 0 {
+		t.Errorf("got %+v, want one example with PromptVersionID=0", got)
+	}
 }
 
 func TestBuildPromptExamples_EmptyVerdictsProducesNil(t *testing.T) {
-	if got := buildPromptExamples(1, "msg1", "a", "b", "c", "d", nil); got != nil {
+	if got := buildPromptExamples(1, "msg1", "a", "b", "c", "d", nil, nil); got != nil {
 		t.Errorf("expected nil for empty verdicts, got %+v", got)
+	}
+}
+
+// fakeVersionObserver records every IncrementVersionObserved call for
+// TestIncrementVersionObservedFor to assert against.
+type fakeVersionObserver struct {
+	calls []struct {
+		promptID, versionID int64
+		verdict             string
+	}
+}
+
+func (f *fakeVersionObserver) IncrementVersionObserved(_ context.Context, promptID, versionID int64, verdict string) {
+	f.calls = append(f.calls, struct {
+		promptID, versionID int64
+		verdict             string
+	}{promptID, versionID, verdict})
+}
+
+func TestIncrementVersionObservedFor(t *testing.T) {
+	// Deliberately includes a confirmed_positive example — IncrementVersionObserved itself
+	// (db/store.go) is responsible for skipping it, not this loop, so this test doubles as
+	// a check that the loop really does call through for every example unconditionally.
+	examples := []db.PromptExample{
+		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictFalsePositive},
+		{PromptID: 2, PromptVersionID: 20, Verdict: db.VerdictFalseNegative},
+		{PromptID: 3, PromptVersionID: 30, Verdict: db.VerdictConfirmedPositive},
+	}
+	f := &fakeVersionObserver{}
+	incrementVersionObservedFor(t.Context(), f, examples)
+
+	if len(f.calls) != 3 {
+		t.Fatalf("expected 3 calls (one per example), got %d: %+v", len(f.calls), f.calls)
+	}
+	for i, ex := range examples {
+		c := f.calls[i]
+		if c.promptID != ex.PromptID || c.versionID != ex.PromptVersionID || c.verdict != ex.Verdict {
+			t.Errorf("call %d = %+v, want promptID=%d versionID=%d verdict=%s", i, c, ex.PromptID, ex.PromptVersionID, ex.Verdict)
+		}
 	}
 }
 
@@ -162,79 +225,181 @@ func TestBulkTriggerKind(t *testing.T) {
 	}
 }
 
-// TestDedupeBySenderSubject_SameVerdictSameSenderSubject is the core case the dedup exists
-// for: passive confirmation (processor.processEmail) writes a confirmed_positive on every
-// match, so a recurring sender+subject (a daily digest, a templated receipt) would otherwise
-// fill a verdict's example budget with near-identical rows. Only the newest (first, per
-// selectExamplesForPrompt's ordering guarantee) survives.
-func TestDedupeBySenderSubject_SameVerdictSameSenderSubject(t *testing.T) {
+// TestRoundRobinBySender_TightBudgetKeepsNewestPerBucket checks the scarce-budget case: with
+// only one distinct sender+subject bucket and room for just one pick, the newest survives —
+// this is the same "recurring sender doesn't dominate" guarantee the old flat dedup gave,
+// just expressed as "the newest wins the one slot" rather than "collapse to exactly one
+// forever" (see TestRoundRobinBySender_SpreadsAcrossBuckets for why round-robin, unlike the
+// old dedup, will take more than one from a bucket once every other bucket is exhausted and
+// budget remains).
+func TestRoundRobinBySender_TightBudgetKeepsNewestPerBucket(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 3, MessageID: "newest", Verdict: db.VerdictConfirmedPositive, Sender: "digest@example.com", Subject: "Weekly Digest"},
-		{ID: 2, MessageID: "middle", Verdict: db.VerdictConfirmedPositive, Sender: "digest@example.com", Subject: "Weekly Digest"},
-		{ID: 1, MessageID: "oldest", Verdict: db.VerdictConfirmedPositive, Sender: "digest@example.com", Subject: "Weekly Digest"},
+		{ID: 3, MessageID: "newest", Sender: "digest@example.com", Subject: "Weekly Digest"},
+		{ID: 2, MessageID: "middle", Sender: "digest@example.com", Subject: "Weekly Digest"},
+		{ID: 1, MessageID: "oldest", Sender: "digest@example.com", Subject: "Weekly Digest"},
 	}
-	got := dedupeBySenderSubject(examples, 10)
-	if len(got) != 1 {
-		t.Fatalf("got %d examples, want 1: %+v", len(got), got)
-	}
-	if got[0].MessageID != "newest" {
-		t.Errorf("survivor = %q, want the newest (%q)", got[0].MessageID, "newest")
+	got := roundRobinBySender(examples, 1)
+	if len(got) != 1 || got[0].MessageID != "newest" {
+		t.Fatalf("got %+v, want just the newest example", got)
 	}
 }
 
-// TestDedupeBySenderSubject_DifferentVerdictsIndependent checks the dedup is scoped per
-// verdict ("each category" in the request) — the same sender+subject pair legitimately
-// appearing in two different verdict groups (e.g. this sender's subject line used to be
-// wrongly caught, and is now correctly matched) must not have one group suppress the other.
-func TestDedupeBySenderSubject_DifferentVerdictsIndependent(t *testing.T) {
+// TestRoundRobinBySender_DrainsASingleBucketWhenNoOthersCompete checks the flip side: with
+// only one bucket present at all, round-robin has nothing to interleave against, so it
+// correctly drains that whole bucket up to budget rather than artificially withholding
+// examples that exist nowhere else in the corpus.
+func TestRoundRobinBySender_DrainsASingleBucketWhenNoOthersCompete(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 3, MessageID: "newest", Sender: "digest@example.com", Subject: "Weekly Digest"},
+		{ID: 2, MessageID: "middle", Sender: "digest@example.com", Subject: "Weekly Digest"},
+		{ID: 1, MessageID: "oldest", Sender: "digest@example.com", Subject: "Weekly Digest"},
+	}
+	got := roundRobinBySender(examples, 10)
+	if len(got) != 3 {
+		t.Fatalf("got %d examples, want all 3 (one bucket, nothing to spread across, budget unused otherwise): %+v", len(got), got)
+	}
+}
+
+// TestRoundRobinBySender_SpreadsAcrossBuckets is the actual fix this sampler exists for:
+// unlike a flat "first N distinct, newest-first" scan, round-robin takes one from every
+// bucket before taking a second from any one — so a sender with many recent emails (all the
+// same recurring sender+subject pattern) doesn't crowd out a sender with fewer, older ones.
+func TestRoundRobinBySender_SpreadsAcrossBuckets(t *testing.T) {
+	var examples []db.PromptExample
+	// Sender A: 5 recent emails, all the same recurring sender+subject pattern (a daily
+	// digest) — one bucket.
+	for i := int64(10); i < 15; i++ {
+		examples = append(examples, db.PromptExample{ID: i, MessageID: fmt.Sprintf("a%d", i), Sender: "a@example.com", Subject: "Daily digest"})
+	}
+	// Sender B: 1 older email — a second, distinct bucket.
+	examples = append(examples, db.PromptExample{ID: 1, MessageID: "b1", Sender: "b@example.com", Subject: "only one"})
+	// Newest-first, matching gatherRawExamples' contract.
+	sort.Slice(examples, func(i, j int) bool { return examples[i].ID > examples[j].ID })
+
+	got := roundRobinBySender(examples, 2)
+	if len(got) != 2 {
+		t.Fatalf("got %d examples, want 2", len(got))
+	}
+	senders := map[string]bool{}
+	for _, ex := range got {
+		senders[ex.Sender] = true
+	}
+	if !senders["a@example.com"] || !senders["b@example.com"] {
+		t.Errorf("expected one pick from each sender, got %+v (a flat recency scan would pick two from sender A's digest instead)", got)
+	}
+}
+
+// TestRoundRobinBySender_NormalizesCaseAndWhitespace checks the bucket key is trimmed and
+// case-folded, so a mail client rendering the same templated email's headers with different
+// casing/whitespace across sends still collapses into one bucket.
+func TestRoundRobinBySender_NormalizesCaseAndWhitespace(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 2, MessageID: "newest", Sender: "Digest@Example.com", Subject: "  Weekly Digest"},
+		{ID: 1, MessageID: "oldest", Sender: "digest@example.com ", Subject: "Weekly Digest  "},
+	}
+	got := roundRobinBySender(examples, 1)
+	if len(got) != 1 || got[0].MessageID != "newest" {
+		t.Fatalf("got %+v, want just the newest (both normalize to the same bucket)", got)
+	}
+}
+
+// TestRoundRobinBySender_RespectsBudget checks the budget cap: even with no bucket
+// collisions at all (every example a distinct sender), the sampler stops at budget.
+func TestRoundRobinBySender_RespectsBudget(t *testing.T) {
+	var examples []db.PromptExample
+	for i := int64(1); i <= 5; i++ {
+		examples = append(examples, db.PromptExample{
+			ID: i, MessageID: "distinct", Sender: fmt.Sprintf("sender%d@example.com", i), Subject: "distinct subject",
+		})
+	}
+	got := roundRobinBySender(examples, 3)
+	if len(got) != 3 {
+		t.Fatalf("got %d examples, want 3 (capped by budget)", len(got))
+	}
+}
+
+// ============================================================
+// sampleExamples (tiered: recurred > manual > passive, round-robin within tiers)
+// ============================================================
+
+// TestSampleExamples_RecurredPrioritizedOverManualAndPassive checks Tier 1: a recurred
+// example wins a slot even when non-recurred manual/passive examples are newer.
+func TestSampleExamples_RecurredPrioritizedOverManualAndPassive(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 3, MessageID: "m3", Verdict: db.VerdictFalsePositive, Sender: "c@example.com", Subject: "s3", Source: db.ExampleSourceManual},
+		{ID: 2, MessageID: "m2", Verdict: db.VerdictFalsePositive, Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
+		{ID: 1, MessageID: "m1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s1", Recurred: true},
+	}
+	got := sampleExamples(examples, 1)
+	if len(got) != 1 || got[0].MessageID != "m1" {
+		t.Errorf("got %+v, want the single recurred example even though it's the oldest", got)
+	}
+}
+
+// TestSampleExamples_ManualPrioritizedOverPassive checks Tier 2 vs Tier 3: with no
+// recurrence in play, a manually-reviewed example wins over a passively-confirmed one even
+// when the passive example is newer.
+func TestSampleExamples_ManualPrioritizedOverPassive(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedPositive, Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
+		{ID: 1, MessageID: "m1", Verdict: db.VerdictConfirmedPositive, Sender: "a@example.com", Subject: "s1", Source: db.ExampleSourceManual},
+	}
+	got := sampleExamples(examples, 1)
+	if len(got) != 1 || got[0].MessageID != "m1" {
+		t.Errorf("got %+v, want the manual example even though the passive one is newer", got)
+	}
+}
+
+// TestSampleExamples_RecurredBudgetLeavesRoomForOtherTiers checks that Tier 1 is capped
+// (recurredBudget) rather than allowed to consume the whole per-verdict budget — a rule
+// with many regressions should still show some non-regression signal.
+func TestSampleExamples_RecurredBudgetLeavesRoomForOtherTiers(t *testing.T) {
+	var examples []db.PromptExample
+	for i := int64(1); i <= 4; i++ {
+		examples = append(examples, db.PromptExample{
+			ID: i, MessageID: fmt.Sprintf("r%d", i), Verdict: db.VerdictFalsePositive,
+			Sender: fmt.Sprintf("r%d@example.com", i), Subject: "s", Recurred: true,
+		})
+	}
+	examples = append(examples, db.PromptExample{
+		ID: 5, MessageID: "m", Verdict: db.VerdictFalsePositive, Sender: "manual@example.com", Subject: "s", Source: db.ExampleSourceManual,
+	})
+
+	got := sampleExamples(examples, 4) // recurredBudget(4) == 2
+	var recurredCount, manualCount int
+	for _, ex := range got {
+		if ex.Recurred {
+			recurredCount++
+		}
+		if ex.Source == db.ExampleSourceManual {
+			manualCount++
+		}
+	}
+	if recurredCount != 2 {
+		t.Errorf("recurredCount = %d, want 2 (capped at half the budget)", recurredCount)
+	}
+	if manualCount != 1 {
+		t.Errorf("manualCount = %d, want 1 (the manual example should fill the leftover budget)", manualCount)
+	}
+}
+
+// TestSampleExamples_IndependentPerVerdict checks a cap applies separately to each verdict
+// — the same sender+subject legitimately appearing under two verdicts (e.g. wrongly caught
+// once, later correctly matched) must not have one verdict's budget affect the other's.
+func TestSampleExamples_IndependentPerVerdict(t *testing.T) {
 	examples := []db.PromptExample{
 		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedPositive, Sender: "a@example.com", Subject: "Your receipt"},
 		{ID: 1, MessageID: "m1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "Your receipt"},
 	}
-	got := dedupeBySenderSubject(examples, 10)
+	got := sampleExamples(examples, 10)
 	if len(got) != 2 {
 		t.Fatalf("got %d examples, want 2 (one per verdict): %+v", len(got), got)
 	}
 }
 
-// TestDedupeBySenderSubject_NormalizesCaseAndWhitespace checks the sender/subject
-// comparison key is trimmed and case-folded, so a mail client rendering the same templated
-// email's headers with different casing/whitespace across sends doesn't defeat the dedup.
-func TestDedupeBySenderSubject_NormalizesCaseAndWhitespace(t *testing.T) {
-	examples := []db.PromptExample{
-		{ID: 2, MessageID: "newest", Verdict: db.VerdictConfirmedPositive, Sender: "Digest@Example.com", Subject: "  Weekly Digest"},
-		{ID: 1, MessageID: "oldest", Verdict: db.VerdictConfirmedPositive, Sender: "digest@example.com ", Subject: "Weekly Digest  "},
-	}
-	got := dedupeBySenderSubject(examples, 10)
-	if len(got) != 1 {
-		t.Fatalf("got %d examples, want 1 (normalized to the same key): %+v", len(got), got)
-	}
-	if got[0].MessageID != "newest" {
-		t.Errorf("survivor = %q, want the newest (%q)", got[0].MessageID, "newest")
-	}
-}
-
-// TestDedupeBySenderSubject_CapsPerVerdict checks the per-verdict target cap: even with no
-// sender+subject collisions at all, a verdict stops accepting examples once it reaches
-// perVerdictTarget, so a very active rule can't blow past the intended budget fed to the
-// improver.
-func TestDedupeBySenderSubject_CapsPerVerdict(t *testing.T) {
-	var examples []db.PromptExample
-	for i := int64(1); i <= 5; i++ {
-		examples = append(examples, db.PromptExample{
-			ID:        i,
-			MessageID: "distinct",
-			Verdict:   db.VerdictConfirmedPositive,
-			Sender:    "sender@example.com",
-			Subject:   "distinct subject",
-		})
-		// Give each a genuinely distinct sender so there's no collision to dedupe away —
-		// only the cap should be limiting the count.
-		examples[len(examples)-1].Sender = examples[len(examples)-1].Sender + string(rune('a'+i))
-	}
-	got := dedupeBySenderSubject(examples, 3)
-	if len(got) != 3 {
-		t.Fatalf("got %d examples, want 3 (capped by perVerdictTarget)", len(got))
+func TestSampleExamples_ZeroCapReturnsNil(t *testing.T) {
+	if got := sampleExamples([]db.PromptExample{{Verdict: db.VerdictFalsePositive}}, 0); got != nil {
+		t.Errorf("sampleExamples with cap 0 = %+v, want nil", got)
 	}
 }
 

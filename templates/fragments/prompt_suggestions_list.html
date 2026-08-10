@@ -1,6 +1,19 @@
-{{if .}}
+{{/* Self-replacing polling driver, invisible on its own — swaps a fresh copy of this whole
+     fragment into #suggestions-list-container (the stable, never-replaced element that
+     lives in index.html) on every tick, so PollEvery below can change from poll to poll
+     without index.html itself ever needing to know the current suggestion state. Fixes the
+     root cause of "Generating… forever until refresh": the old fixed 60s interval lived
+     directly on index.html's container, which can't be data-dependent because that element
+     is never swapped. See handlePromptSuggestionsList (server.go) for how PollEvery is
+     picked (fast while anything here is still generating, slow otherwise). */}}
+<div id="suggestions-poll" class="d-none"
+  hx-get="/fragments/prompt-suggestions"
+  hx-trigger="every {{.PollEvery}} [document.getElementById('page-prompt-suggestions').classList.contains('active') && document.visibilityState === 'visible']"
+  hx-target="#suggestions-list-container"
+  hx-swap="innerHTML"></div>
+{{if .Items}}
 <div class="d-flex flex-column gap-3" id="suggestions-list">
-  {{range .}}
+  {{range .Items}}
   <div class="card p-3 suggestion-card" id="suggestion-row-{{.ID}}">
     <div class="d-flex align-items-start justify-content-between gap-2 flex-wrap">
       <div class="flex-grow-1" style="min-width:0">
@@ -24,14 +37,18 @@
           {{end}}
         </div>
         <div class="small text-muted text-truncate mb-2">{{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</div>
-        {{if or (eq .Status "pending") (eq .Status "failed")}}
+        {{/* Generating is now included here (it used to be pending|failed only) — a
+             suggestion that's still generating can be opened to watch its live trace
+             instead of being unreachable until it finishes. See
+             prompt_suggestion_detail.html's generating branch. */}}
+        {{if or (eq .Status "pending") (eq .Status "failed") (eq .Status "generating")}}
         <div class="d-flex gap-2 flex-wrap">
           <button class="btn btn-outline-secondary btn-sm"
             hx-get="/fragments/prompt-suggestions/{{.ID}}"
             hx-target="#suggestion-detail-container"
             hx-swap="innerHTML"
             hx-on::after-request="document.getElementById('suggestion-detail-container').scrollIntoView({behavior:'smooth'})">
-            Review &amp; Edit
+            {{if eq .Status "generating"}}Watch{{else}}Review &amp; Edit{{end}}
           </button>
         </div>
         {{end}}

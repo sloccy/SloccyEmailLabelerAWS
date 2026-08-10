@@ -50,6 +50,7 @@ const (
 	triggerRefreshSuggestionBadge = "refreshSuggestionBadge"
 	toastKeyMessage               = "message"
 	jsonKeyType                   = "type"
+	jsonKeyText                   = "text"
 	toastTypeSuccess              = "success"
 	encodingGzip                  = "gzip"
 	headerAcceptEncoding          = "Accept-Encoding"
@@ -230,6 +231,7 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("POST /fragments/history/bulk-recategorize", s.handleBulkRecategorize)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions", s.handlePromptSuggestionsList)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}", s.handlePromptSuggestionDetail)
+	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}/trace", s.handlePromptSuggestionTrace)
 	s.mux.HandleFunc("POST /fragments/prompt-suggestions/{id}/regenerate", s.handlePromptSuggestionRegenerate)
 	s.mux.HandleFunc("POST /fragments/prompt-suggestions/{id}/apply", s.handlePromptSuggestionApply)
 	s.mux.HandleFunc("POST /fragments/prompt-suggestions/{id}/dismiss", s.handlePromptSuggestionDismiss)
@@ -694,14 +696,26 @@ func modelAllowedForTier(m llm.ModelOption, tier string) bool {
 // the Standard selects (already sorted cheapest-first by ListAvailableModels); FlexModels is a
 // copy re-sorted by flex-tier cost (see llm.SortModelsByFlexCost) so the Flex selects sink their
 // own unpriced entries to the bottom instead of inheriting the standard-cost order.
-func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, improveReasoningEffort string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, improveMaxRounds, improveExampleCap, replayExampleCap int, improveReasoningEffort string, models []llm.ModelOption) map[string]any {
 	return map[string]any{
-		"ClassifyModel":          classifyModel,
-		"ImproveModel":           improveModel,
-		"ClassifyTier":           classifyTier,
-		"ImproveTier":            improveTier,
-		"ReasoningDirective":     reasoningDirective,
-		"ImproveReplay":          improveReplay,
+		"ClassifyModel":      classifyModel,
+		"ImproveModel":       improveModel,
+		"ClassifyTier":       classifyTier,
+		"ImproveTier":        improveTier,
+		"ReasoningDirective": reasoningDirective,
+		"ImproveReplay":      improveReplay,
+		"ImproveMaxRounds":   improveMaxRounds,
+		// ImproveMaxRoundsOptions is the <select>'s option list — 1..llm.ImproveMaxRoundsCap
+		// — computed here rather than hardcoded in the template so the two can't drift if
+		// the cap ever changes.
+		"ImproveMaxRoundsOptions": improveMaxRoundsOptions(),
+		// ImproveExampleCap/ReplayExampleCap are number inputs (not <select>s — the ranges
+		// are too wide, especially ReplayExampleCap's, to enumerate as options) bounded by
+		// their *Max template values so the template can't drift from llm's actual caps.
+		"ImproveExampleCap":      improveExampleCap,
+		"ImproveExampleCapMax":   llm.ImproveExampleCapMax,
+		"ReplayExampleCap":       replayExampleCap,
+		"ReplayExampleCapMax":    llm.ReplayExampleCapMax,
 		"ImproveReasoningEffort": improveReasoningEffort,
 		// ImproveReasoningLevels is what the effort <select> actually renders as options —
 		// not a fixed four values, but whatever llm.ReasoningEffortLevels reports the current
@@ -712,6 +726,16 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier
 		"Models":                 models,
 		"FlexModels":             llm.SortModelsByFlexCost(models),
 	}
+}
+
+// improveMaxRoundsOptions returns [1, llm.ImproveMaxRoundsCap] for the settings form's
+// round-budget <select>.
+func improveMaxRoundsOptions() []int {
+	opts := make([]int, llm.ImproveMaxRoundsCap)
+	for i := range opts {
+		opts[i] = i + 1
+	}
+	return opts
 }
 
 // loadSettings fetches every stored setting in one Query and returns it as a key->value
@@ -743,10 +767,13 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
 	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
 	improveReplay := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
+	improveMaxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
+	improveExampleCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
+	replayExampleCap := parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
 	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
 	models := s.cachedModels(ctx)
 	s.fragmentResponse(w, "settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveReasoningEffort, models), "")
+		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveMaxRounds, improveExampleCap, replayExampleCap, improveReasoningEffort, models), "")
 }
 
 // applyTierSetting reads formKey from r's form; if it's a recognized tier ("standard" or
@@ -824,6 +851,35 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReplay, Value: replayValue})
 
+	// Round budget for the improve<->replay loop (improve.go) — validated the same way
+	// applyModelSetting/applyTierSetting validate their own fields: a value outside
+	// [1, llm.ImproveMaxRoundsCap] (garbage, blank, out of range) is silently ignored
+	// rather than persisted, leaving the current setting in place.
+	improveMaxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
+	if v := r.FormValue("improve_max_rounds"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ImproveMaxRoundsCap {
+			improveMaxRounds = n
+			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveMaxRounds, Value: v})
+		}
+	}
+
+	// Example-selection caps (improve.go's sampleExamples) — same validate-or-ignore
+	// pattern as improve_max_rounds above, one per Setting.
+	improveExampleCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
+	if v := r.FormValue("improve_example_cap"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ImproveExampleCapMax {
+			improveExampleCap = n
+			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveExampleCap, Value: v})
+		}
+	}
+	replayExampleCap := parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
+	if v := r.FormValue("replay_example_cap"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ReplayExampleCapMax {
+			replayExampleCap = n
+			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingReplayExampleCap, Value: v})
+		}
+	}
+
 	// Reasoning effort for the improve call: accepted values depend on improveModel's family
 	// (llm.ReasoningEffortLevels) — not a fixed four, since most families support none of
 	// them and GLM only really supports one. Anything else (including a level valid for a
@@ -835,7 +891,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReasoningEffort, Value: v})
 	}
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveReasoningEffort, models)
+	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveMaxRounds, improveExampleCap, replayExampleCap, improveReasoningEffort, models)
 	s.fragmentResponse(w, "settings_form.html", data, "Settings saved")
 }
 
@@ -1519,14 +1575,21 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 	ch := s.llm.StreamGeneratePromptInstruction(r.Context(), description)
 	for chunk := range ch {
 		if chunk.Err != nil {
-			b, _ := json.Marshal(map[string]string{jsonKeyType: "error", "text": chunk.Err.Error()}) //nolint:errchkjson // map[string]string cannot fail
+			b, _ := json.Marshal(map[string]string{jsonKeyType: "error", jsonKeyText: chunk.Err.Error()}) //nolint:errchkjson // map[string]string cannot fail
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 			flusher.Flush()
 			break
 		}
-		b, _ := json.Marshal(map[string]string{jsonKeyType: "content", "text": chunk.Text}) //nolint:errchkjson // map[string]string cannot fail
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
+		if chunk.Reasoning != "" {
+			b, _ := json.Marshal(map[string]string{jsonKeyType: "reasoning", jsonKeyText: chunk.Reasoning}) //nolint:errchkjson // map[string]string cannot fail
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+		if chunk.Text != "" {
+			b, _ := json.Marshal(map[string]string{jsonKeyType: "content", jsonKeyText: chunk.Text}) //nolint:errchkjson // map[string]string cannot fail
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
 	}
 	_, _ = fmt.Fprintf(w, "data: {\"type\":\"done\"}\n\n")
 	flusher.Flush()
@@ -1562,6 +1625,13 @@ type suggestionView struct {
 	ReplayPassed   int64
 	ReplayBaseline int64
 	ReplayFailures []llm.ReplayFailure
+
+	// Rounds is the improve<->replay trajectory (improve.go's loop), parsed from
+	// PromptSuggestion.RoundsJSON — empty for a suggestion generated before the loop
+	// existed, or one with only a single round (the template only bothers showing this
+	// when there's more than one attempt to compare). BestRound is which entry won.
+	Rounds    []db.SuggestionRoundSummary
+	BestRound int64
 }
 
 // suggestionExampleGroup is one verdict's worth of a rule's example corpus, labeled for
@@ -1596,15 +1666,16 @@ func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView 
 }
 
 // suggestionDetailView builds the detail-page view for a suggestion: the base fields plus
-// its rule's example corpus (grouped by verdict, same corpus selectExamplesForPrompt fed
-// into the improve/replay calls) and the stored replay result, if any
+// its rule's example corpus (the same curated set selectExamplesForImprove fed into the
+// improve call — deliberately not the larger set ReplayAgainstExamples was scored against,
+// so this page shows exactly what the model saw) and the stored replay result, if any
 // (ReplayTotal == 0 means replay didn't run — improve_replay disabled, or an older
 // suggestion from before this field existed — and the template renders nothing for that
 // case rather than a misleading "0/0").
 func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestion, promptName string) suggestionView {
 	view := toSuggestionView(sg, promptName)
 
-	examples := selectExamplesForPrompt(ctx, s.store, sg.PromptID)
+	examples := selectExamplesForImprove(ctx, s.store, sg.PromptID)
 	labels := map[string]string{
 		db.VerdictFalseNegative:     "Missed it (should have matched)",
 		db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
@@ -1629,7 +1700,33 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 	if sg.ReplayFailures != "" {
 		_ = json.Unmarshal([]byte(sg.ReplayFailures), &view.ReplayFailures)
 	}
+	view.BestRound = sg.BestRound
+	if sg.RoundsJSON != "" {
+		_ = json.Unmarshal([]byte(sg.RoundsJSON), &view.Rounds)
+	}
 	return view
+}
+
+// suggestionsListView wraps the suggestion cards for prompt_suggestions_list.html with the
+// poll interval the fragment's own self-replacing driver (#suggestions-poll) should use —
+// see suggestionsPollInterval.
+type suggestionsListView struct {
+	Items     []suggestionView
+	PollEvery string
+}
+
+// suggestionsPollInterval picks the list's next poll cadence: fast while anything is still
+// generating, so a finished round (or a newly seeded one) is picked up quickly without
+// anyone needing to have a detail trace open; slow otherwise, since there's nothing to
+// watch for. Pure and unit-tested (server_test.go) independent of the *db.Store this
+// handler otherwise needs.
+func suggestionsPollInterval(views []suggestionView) string {
+	for _, v := range views {
+		if v.Status == db.SuggestionStatusGenerating {
+			return "5s"
+		}
+	}
+	return "60s"
 }
 
 func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Request) {
@@ -1647,7 +1744,91 @@ func (s *server) handlePromptSuggestionsList(w http.ResponseWriter, r *http.Requ
 	for i, sg := range suggestions {
 		views[i] = toSuggestionView(sg, promptNames[sg.PromptID])
 	}
-	s.fragmentResponse(w, "prompt_suggestions_list.html", views, "")
+	s.fragmentResponse(w, "prompt_suggestions_list.html", suggestionsListView{
+		Items:     views,
+		PollEvery: suggestionsPollInterval(views),
+	}, "")
+}
+
+// suggestionTraceResponse is the trace endpoint's JSON body. The browser's polling loop
+// (static/app.js) appends Events to the live pane, advances its cursor to LastSeq, and
+// stops polling once Status is no longer "generating" — see handlePromptSuggestionTrace.
+type suggestionTraceResponse struct {
+	Status  string                    `json:"status"`
+	LastSeq int64                     `json:"lastSeq"`
+	Stalled bool                      `json:"stalled"`
+	Events  []db.SuggestionTraceEvent `json:"events"`
+}
+
+// handlePromptSuggestionTrace serves a suggestion's live progress log with a seq cursor
+// (?after=N) — this, not SSE or a WebSocket, is what makes "Generating…" observable: the
+// improve worker (a separate Lambda, see improve.go's package doc comment) has no channel
+// back to WebFunction, but both write to and read from the same DynamoDB table, so polling
+// this endpoint is the only connection between them that doesn't require re-architecting
+// where the long-running work happens. Returns JSON, not an HTML fragment — the frontend
+// appends deltas into existing DOM nodes rather than re-rendering the whole pane on every
+// poll (see prompt_suggestion_detail.html's generating branch).
+func (s *server) handlePromptSuggestionTrace(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	after := parseTraceAfter(r.URL.Query().Get("after"))
+
+	sg, err := s.store.GetPromptSuggestion(ctx, id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	events, err := s.store.ListSuggestionTrace(ctx, id, after)
+	if err != nil {
+		http.Error(w, "trace query failed", http.StatusInternalServerError)
+		return
+	}
+	lastSeq := traceLastSeq(after, events)
+	// Best-effort: a staleness-check error just means this particular poll doesn't report
+	// stalled — the next poll tries again, and the hard 20-minute backstop
+	// (generatingStaleAfter, db/store.go) still applies regardless.
+	stalled, _ := s.store.IsSuggestionTraceStale(ctx, sg)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(suggestionTraceResponse{ //nolint:errchkjson // struct fields are all plain types, cannot fail
+		Status:  sg.Status,
+		LastSeq: lastSeq,
+		Stalled: stalled,
+		Events:  events,
+	})
+}
+
+// parseTraceAfter parses the trace endpoint's ?after= cursor, defaulting to 0 (the
+// beginning) for anything missing or malformed — a bad cursor value should replay the
+// whole trace, not 400. Factored out so its edge cases (empty, negative, garbage) are
+// unit-testable without a *db.Store — see this file's history-pagination tests for the
+// same rationale (server.store is a concrete *db.Store, not db.StoreIface, so a full
+// handler test would need a much wider fake than this one value's parsing warrants).
+func parseTraceAfter(v string) int64 {
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// traceLastSeq computes the cursor the browser should poll with next: the highest Seq
+// across the returned events, or after unchanged if the page was empty (nothing new since
+// last poll — the cursor must not regress).
+func traceLastSeq(after int64, events []db.SuggestionTraceEvent) int64 {
+	lastSeq := after
+	for _, e := range events {
+		if e.Seq > lastSeq {
+			lastSeq = e.Seq
+		}
+	}
+	return lastSeq
 }
 
 func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Request) {
@@ -1736,7 +1917,7 @@ func (s *server) handlePromptSuggestionApply(w http.ResponseWriter, r *http.Requ
 	if sg.ProblemExampleKeys != "" {
 		_ = json.Unmarshal([]byte(sg.ProblemExampleKeys), &problemKeys)
 	}
-	if err := s.store.ApplyPromptSuggestionAndUpdatePrompt(ctx, id, sg.PromptID, sg.SuggestedInstructions, problemKeys); err != nil {
+	if err := s.store.ApplyPromptSuggestionAndUpdatePrompt(ctx, sg, problemKeys); err != nil {
 		http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

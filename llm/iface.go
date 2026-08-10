@@ -17,7 +17,7 @@ type ClientIface interface {
 	ResolveClassifySettings(ctx context.Context) (model, tier, reasoningOverride string)
 	ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier, reasoningOverride string, debug bool) (ClassifyResult, error)
 	StreamGeneratePromptInstruction(ctx context.Context, description string) <-chan StreamChunk
-	ImprovePromptInstructions(ctx context.Context, req ImproveRequest) (string, []ChatMessage, error)
+	ImprovePromptInstructions(ctx context.Context, req ImproveRequest, sink ImproveSink) (string, []ChatMessage, error)
 	ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 }
 
@@ -68,7 +68,10 @@ func (c *FakeClient) StreamGeneratePromptInstruction(ctx context.Context, _ stri
 	return ch
 }
 
-func (c *FakeClient) ImprovePromptInstructions(_ context.Context, _ ImproveRequest) (string, []ChatMessage, error) {
+func (c *FakeClient) ImprovePromptInstructions(_ context.Context, _ ImproveRequest, sink ImproveSink) (string, []ChatMessage, error) {
+	if sink != nil {
+		sink(StreamChunk{Text: "fake improved"})
+	}
 	return "fake improved", nil, nil
 }
 

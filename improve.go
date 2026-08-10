@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,10 +121,23 @@ func (r *improveRunner) runOne(ctx context.Context, t improveTarget) {
 		return
 	}
 
+	// A regenerate can reach this point more than once for the same suggestion id (see
+	// MarkPromptSuggestionGenerating's doc comment), each time as a fresh worker
+	// invocation — so the trace's seq counter has to be seeded from what's already
+	// written, not restarted at 0, or a regenerate round would silently overwrite the
+	// first round's items (see newTraceWriter's doc comment). Best-effort: a failed
+	// lookup just starts a new trace segment at 0, which risks one SK collision with an
+	// existing item rather than losing the whole round over a transient read error.
+	startSeq, err := r.store.LatestSuggestionTraceSeq(ctx, t.SuggestionID)
+	if err != nil {
+		slog.Warn("improve worker: could not read prior trace seq, starting from 0", "suggestion_id", t.SuggestionID, "err", err)
+	}
+	tw := newTraceWriter(r.store, t.SuggestionID, startSeq)
+
 	p, err := r.store.GetPrompt(ctx, t.PromptID)
 	if err != nil {
 		slog.Error("improve worker: get prompt", "suggestion_id", t.SuggestionID, "prompt_id", t.PromptID, "err", err)
-		r.writeFailure(ctx, t.SuggestionID, err)
+		r.writeFailure(ctx, tw, t.SuggestionID, err)
 		return
 	}
 
@@ -138,15 +152,15 @@ func (r *improveRunner) runOne(ctx context.Context, t improveTarget) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			slog.Error("improve worker: panic", "suggestion_id", t.SuggestionID, "recover", rec)
-			r.writeFailure(ctx, t.SuggestionID, fmt.Errorf("panic: %v", rec))
+			r.writeFailure(ctx, tw, t.SuggestionID, fmt.Errorf("panic: %v", rec))
 			return
 		}
 		if !done {
-			r.writeFailure(ctx, t.SuggestionID, errors.New("worker deadline exceeded before a result was written"))
+			r.writeFailure(ctx, tw, t.SuggestionID, errors.New("worker deadline exceeded before a result was written"))
 		}
 	}()
 
-	r.improveAndFinalizeSuggestion(callCtx, t.SuggestionID, p, t.OriginalInstructions, t.PriorConversation, t.Note, t.UserComment)
+	r.improveAndFinalizeSuggestion(callCtx, tw, t.SuggestionID, p, t.OriginalInstructions, t.PriorConversation, t.Note, t.UserComment)
 	done = true
 }
 
@@ -156,9 +170,12 @@ func (r *improveRunner) runOne(ctx context.Context, t improveTarget) {
 // to write it itself. ctx may already be past its deadline (that's often why this is being
 // called), so the write uses a fresh bounded context detached from it rather than
 // inheriting an already-expired one.
-func (r *improveRunner) writeFailure(ctx context.Context, suggestionID int64, cause error) {
+func (r *improveRunner) writeFailure(ctx context.Context, tw *traceWriter, suggestionID int64, cause error) {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
+	// The trace's error event is emitted after the status write, same reasoning as
+	// improveAndFinalizeSuggestion's done event: the trace poll's terminal signal must mean
+	// "the suggestion's status is actually final," not merely "about to be."
 	if err := r.store.FinalizePromptSuggestion(writeCtx, db.FinalizePromptSuggestionParams{
 		ID:                    suggestionID,
 		SuggestedInstructions: "",
@@ -168,39 +185,50 @@ func (r *improveRunner) writeFailure(ctx context.Context, suggestionID int64, ca
 	}); err != nil {
 		slog.Error("improve worker: write failure status failed", "suggestion_id", suggestionID, "err", err)
 	}
+	tw.Event(writeCtx, db.TraceKindError, 0, cause.Error())
 }
 
-// selectExamplesForPrompt reads a rule's example corpus: the newest ~10 of each verdict
-// (false_negative/false_positive/confirmed_positive), deduped by message across verdict
-// groups. Feeds both ImprovePromptInstructions' three example slices and
-// ReplayAgainstExamples' scoring set from a single read, rather than querying the corpus
-// twice for the same data. A free function (not an improveRunner method) since server.go's
-// suggestionDetailView also calls it, purely for display, with no improve round involved.
-func selectExamplesForPrompt(ctx context.Context, store *db.Store, promptID int64) []db.PromptExample {
-	// Raw fetch is generous — 40 per verdict, not the eventual 10-per-verdict target —
-	// because dedupeBySenderSubject below can collapse many rows down to one when a
-	// recurring sender (a daily digest, a templated receipt) has been writing a
-	// confirmed_positive on every match via passive confirmation
-	// (processor.processEmail), not just on manual corrections. Widening this is cheap:
-	// ListExamplesByVerdict's cost is Limit-bounded regardless of corpus size.
-	const perVerdictRawLimit = 40
-	const perVerdictTarget = 10
+// rawLimitForVerdict bounds how many rows gatherRawExamples pulls per verdict before any
+// sampling happens. confirmed_positive gets a much wider window than the other two:
+// passive confirmation (processor.processEmail) writes one on every ordinary classify
+// match, not just on a manual correction, so it can grow far faster than
+// false_negative/false_positive — sampleExamples needs a wide enough raw pool to actually
+// find diverse manual/recurring rows before a wall of recent passive confirms would
+// otherwise fill the window on its own. Both limits are cheap regardless of corpus size:
+// ListExamplesByVerdict's cost is bounded by the Limit passed in, not by how large the
+// partition has grown.
+func rawLimitForVerdict(verdict string) int32 {
+	if verdict == db.VerdictConfirmedPositive {
+		return 200
+	}
+	return 60
+}
 
+// gatherRawExamples reads a rule's whole raw example window (see rawLimitForVerdict),
+// marks recurrences, drops resolved rows, and collapses the same message appearing under
+// more than one verdict down to its newest occurrence. This is the shared foundation
+// everything downstream samples from at whatever cap fits its purpose: selectExamplesForImprove
+// calls it directly for the small, token-bounded improve-prompt set, and
+// improveAndFinalizeSuggestion calls it once per round and samples the result a second time
+// at replayExampleCap for the larger validation set — one raw fetch, two different-sized
+// samples, rather than fetching the corpus twice for the same round.
+func gatherRawExamples(ctx context.Context, store *db.Store, promptID int64) []db.PromptExample {
 	var all []db.PromptExample
 	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
-		examples, err := store.ListExamplesByVerdict(ctx, promptID, v, perVerdictRawLimit)
+		examples, err := store.ListExamplesByVerdict(ctx, promptID, v, rawLimitForVerdict(v))
 		if err != nil {
-			slog.Error("select examples for prompt", "prompt_id", promptID, "verdict", v, "err", err)
+			slog.Error("gather raw examples", "prompt_id", promptID, "verdict", v, "err", err)
 			continue
 		}
 		all = append(all, examples...)
 	}
+	all = markRecurrences(all)
 	all = filterResolved(all)
 
-	// The same message can appear in more than one verdict's top-N if it was corrected more
-	// than once over time (e.g. false_positive once, confirmed_positive later after the rule
-	// was fixed). Keeping every occurrence would hand the improver a live contradiction —
-	// "this email is both a false positive and a confirmed positive" — so only the newest
+	// The same message can appear in more than one verdict's raw window if it was corrected
+	// more than once over time (e.g. false_positive once, confirmed_positive later after the
+	// rule was fixed). Keeping every occurrence would hand the improver a live contradiction
+	// — "this email is both a false positive and a confirmed positive" — so only the newest
 	// occurrence survives, by db.PromptExample.ID (monotonically increasing, and shared
 	// across every write path that can produce a PromptExample — see
 	// db.InsertPromptExamples' doc comment). Iterating `all` in its original per-verdict-
@@ -222,55 +250,236 @@ func selectExamplesForPrompt(ctx context.Context, store *db.Store, promptID int6
 		seen[ex.MessageID] = true
 		survivors = append(survivors, ex)
 	}
-
-	return dedupeBySenderSubject(survivors, perVerdictTarget)
+	return survivors
 }
 
-// senderSubjectKey normalizes a sender+subject pair for dedupeBySenderSubject: trimmed and
-// case-folded, so trailing whitespace or casing differences (a mail client rendering
-// headers slightly differently across sends of the same templated email) don't defeat the
-// dedup. \x00 as a separator can't appear in either field, so it can't collide across a
-// sender/subject boundary.
+// parseExampleCap is the pure parsing/clamping core shared by improveExampleCap and
+// replayExampleCap, mirroring parseImproveMaxRounds' shape: unset, unparsable, or
+// non-positive falls back to def; anything above maxCap clamps down to it.
+func parseExampleCap(raw string, def, maxCap int) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return def
+	}
+	if n > maxCap {
+		return maxCap
+	}
+	return n
+}
+
+// improveExampleCap resolves llm.SettingImproveExampleCap — how many examples per verdict
+// selectExamplesForImprove curates for the improve prompt itself. A free function (not an
+// improveRunner method) so server.go's suggestionDetailView can call it with just a
+// *db.Store, matching selectExamplesForImprove's own signature.
+func improveExampleCap(ctx context.Context, store *db.Store) int {
+	v, err := store.GetSetting(ctx, llm.SettingImproveExampleCap)
+	if err != nil || v == "" {
+		return llm.ImproveExampleCapDefault
+	}
+	return parseExampleCap(v, llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
+}
+
+// replayExampleCap resolves llm.SettingReplayExampleCap — how many examples per verdict
+// ReplayAgainstExamples scores a candidate rule against (see improveAndFinalizeSuggestion).
+// Deliberately independent of and larger than improveExampleCap (see
+// SettingReplayExampleCap's doc comment, llm/bedrock.go).
+func replayExampleCap(ctx context.Context, store *db.Store) int {
+	v, err := store.GetSetting(ctx, llm.SettingReplayExampleCap)
+	if err != nil || v == "" {
+		return llm.ReplayExampleCapDefault
+	}
+	return parseExampleCap(v, llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
+}
+
+// selectExamplesForImprove curates the small, token-bounded example set the improve prompt
+// itself sees (llm.ImproveRequest's three example slices) — and, via
+// server.suggestionDetailView, what the user sees on the suggestion detail page, so the two
+// always show the same examples the model actually saw. See sampleExamples for the
+// selection policy.
+func selectExamplesForImprove(ctx context.Context, store *db.Store, promptID int64) []db.PromptExample {
+	return sampleExamples(gatherRawExamples(ctx, store, promptID), improveExampleCap(ctx, store))
+}
+
+// The larger, more representative sample ReplayAgainstExamples scores a candidate rule
+// against — deliberately independent of and bigger than selectExamplesForImprove's set,
+// since replay's cost is one classify call per example, not prompt tokens, so a wider
+// sample buys a materially less noisy pass/fail score for comparatively little — has no
+// standalone named entry point the way selectExamplesForImprove does: its only caller,
+// improveAndFinalizeSuggestion, already has the raw window in hand (see gatherRawExamples'
+// doc comment) and just samples it again at replayExampleCap, only when replay is actually
+// enabled (improveReplayEnabled).
+
+// senderSubjectKey normalizes a sender+subject pair for the round-robin sampler below:
+// trimmed and case-folded, so trailing whitespace or casing differences (a mail client
+// rendering headers slightly differently across sends of the same templated email) don't
+// defeat the grouping. \x00 as a separator can't appear in either field, so it can't
+// collide across a sender/subject boundary.
 func senderSubjectKey(sender, subject string) string {
 	return strings.ToLower(strings.TrimSpace(sender)) + "\x00" + strings.ToLower(strings.TrimSpace(subject))
 }
 
-// dedupeBySenderSubject walks examples — already newest-first within each verdict's
-// contiguous span, per selectExamplesForPrompt's ordering guarantee — and, independently
-// per verdict, keeps only the first (i.e. newest) occurrence of each sender+subject pair,
-// capping each verdict at perVerdictTarget. Without this, a recurring sender could fill an
-// entire verdict's example budget with near-identical rows: passive confirmation
-// (processor.processEmail) writes a confirmed_positive on every ordinary classify match,
-// so a daily newsletter from the same sender+subject would otherwise dominate the
-// "already correct" evidence fed to the improver instead of a diverse sample.
-func dedupeBySenderSubject(examples []db.PromptExample, perVerdictTarget int) []db.PromptExample {
-	seen := make(map[string]map[string]bool)
-	count := make(map[string]int)
-	out := make([]db.PromptExample, 0, len(examples))
+// sampleExamples curates up to perVerdictCap examples per verdict from a rule's raw, deduped
+// corpus (gatherRawExamples) — this replaces the old "keep the first N distinct
+// sender+subject pairs in recency order" dedup, which converges on whichever few senders
+// happen to be freshest rather than actually spreading across what the corpus contains.
+// Independently per verdict, three priority tiers fill the budget in order (see
+// sampleVerdict): examples that recurred after a prior fix, then manually-reviewed
+// examples, then passively-confirmed ones — each of the latter two round-robinned across
+// sender+subject buckets rather than taken newest-first. See db.PromptExample.Source and
+// .Recurred for what feeds the tiering.
+func sampleExamples(examples []db.PromptExample, perVerdictCap int) []db.PromptExample {
+	if perVerdictCap <= 0 {
+		return nil
+	}
+	byVerdict := make(map[string][]db.PromptExample, 3)
 	for _, ex := range examples {
-		if count[ex.Verdict] >= perVerdictTarget {
-			continue
-		}
-		key := senderSubjectKey(ex.Sender, ex.Subject)
-		if seen[ex.Verdict] == nil {
-			seen[ex.Verdict] = make(map[string]bool)
-		}
-		if seen[ex.Verdict][key] {
-			continue
-		}
-		seen[ex.Verdict][key] = true
-		count[ex.Verdict]++
-		out = append(out, ex)
+		byVerdict[ex.Verdict] = append(byVerdict[ex.Verdict], ex)
+	}
+	var out []db.PromptExample
+	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+		out = append(out, sampleVerdict(byVerdict[v], perVerdictCap)...)
 	}
 	return out
 }
 
+// recurredBudget bounds how much of a verdict's cap Tier 1 (recurred examples) may consume
+// on its own — half, rounded up — so a rule with many regressions still leaves room for
+// positive/negative signal beyond "everything is broken," rather than an improve prompt
+// that's all regressions and nothing else. Unused budget rolls over to the later tiers (see
+// sampleVerdict): this only ever shrinks how much recurred examples can take, never
+// guarantees them a fixed share when there are fewer of them than that.
+func recurredBudget(perVerdictCap int) int {
+	return (perVerdictCap + 1) / 2
+}
+
+// sampleVerdict applies the three-tier policy (see sampleExamples) to one verdict's
+// candidates, which must already be newest-first (gatherRawExamples' contract).
+func sampleVerdict(candidates []db.PromptExample, verdictCap int) []db.PromptExample {
+	var recurred, manual, passive []db.PromptExample
+	for _, ex := range candidates {
+		switch {
+		case ex.Recurred:
+			recurred = append(recurred, ex)
+		case ex.Source == db.ExampleSourceManual:
+			manual = append(manual, ex)
+		default:
+			// Passive, or "" for a row written before Source tracking existed — treated the
+			// same as passive: neither carries the "a human explicitly reviewed this" signal
+			// manual does.
+			passive = append(passive, ex)
+		}
+	}
+
+	out := make([]db.PromptExample, 0, verdictCap)
+	budget := recurredBudget(verdictCap)
+	for _, ex := range recurred {
+		if len(out) >= verdictCap || len(out) >= budget {
+			break
+		}
+		out = append(out, ex)
+	}
+	out = append(out, roundRobinBySender(manual, verdictCap-len(out))...)
+	out = append(out, roundRobinBySender(passive, verdictCap-len(out))...)
+	return out
+}
+
+// roundRobinBySender groups candidates (already newest-first) into senderSubjectKey
+// buckets, preserving each bucket's newest-first order internally, then takes one item per
+// bucket in rotating passes until budget is exhausted or every bucket runs dry — spreading
+// picks across every distinct sender/subject pattern present in candidates instead of
+// converging on whichever few are freshest.
+func roundRobinBySender(candidates []db.PromptExample, budget int) []db.PromptExample {
+	if budget <= 0 || len(candidates) == 0 {
+		return nil
+	}
+	buckets := make(map[string][]db.PromptExample)
+	var bucketOrder []string
+	for _, ex := range candidates {
+		key := senderSubjectKey(ex.Sender, ex.Subject)
+		if _, ok := buckets[key]; !ok {
+			bucketOrder = append(bucketOrder, key)
+		}
+		buckets[key] = append(buckets[key], ex)
+	}
+
+	out := make([]db.PromptExample, 0, budget)
+	for len(out) < budget {
+		tookAny := false
+		for _, key := range bucketOrder {
+			if len(out) >= budget {
+				break
+			}
+			if len(buckets[key]) == 0 {
+				continue
+			}
+			out = append(out, buckets[key][0])
+			buckets[key] = buckets[key][1:]
+			tookAny = true
+		}
+		if !tookAny {
+			break
+		}
+	}
+	return out
+}
+
+// markRecurrences flags each still-live (unresolved) example whose problem a prior
+// suggestion already claimed to fix — an older row for the same message and verdict (or,
+// failing that, the same sender+subject, since a re-sent templated email can arrive with a
+// new MessageID) has ResolvedBySuggestionID set. Must run before filterResolved, which
+// drops every resolved row: this is the one point in gatherRawExamples' pipeline where both
+// the resolved and unresolved rows for the same problem are still present
+// together, which is exactly what's needed to tell "this was already tried and failed"
+// apart from "this is a first-time problem." Without it, a regression looks to the
+// improver exactly like a brand-new problem — filterResolved just drops the old resolved
+// row and the fresh one shows up with no memory attached, so the improver has no way to
+// know a small edit already failed here once and a bigger change is warranted (see
+// ExampleRef.Recurred, llm/bedrock.go, for where this actually reaches the improve prompt).
+// Mutates examples in place (and returns the same slice) rather than copying — this runs
+// on every improve round and every suggestion-detail page view, so it stays a single pass
+// with no extra allocation for the case (the overwhelming majority) where nothing recurs.
+func markRecurrences(examples []db.PromptExample) []db.PromptExample {
+	type msgKey struct{ id, verdict string }
+	type senderKey struct{ key, verdict string }
+	resolvedByMessage := make(map[msgKey]int64, len(examples))
+	resolvedBySender := make(map[senderKey]int64, len(examples))
+	for _, ex := range examples {
+		if ex.ResolvedBySuggestionID == nil {
+			continue
+		}
+		mk := msgKey{ex.MessageID, ex.Verdict}
+		if _, ok := resolvedByMessage[mk]; !ok {
+			resolvedByMessage[mk] = ex.PromptVersionID
+		}
+		sk := senderKey{senderSubjectKey(ex.Sender, ex.Subject), ex.Verdict}
+		if _, ok := resolvedBySender[sk]; !ok {
+			resolvedBySender[sk] = ex.PromptVersionID
+		}
+	}
+	for i, ex := range examples {
+		if ex.ResolvedBySuggestionID != nil {
+			continue
+		}
+		if v, ok := resolvedByMessage[msgKey{ex.MessageID, ex.Verdict}]; ok {
+			examples[i].Recurred = true
+			examples[i].RecurredFromVersion = v
+			continue
+		}
+		if v, ok := resolvedBySender[senderKey{senderSubjectKey(ex.Sender, ex.Subject), ex.Verdict}]; ok {
+			examples[i].Recurred = true
+			examples[i].RecurredFromVersion = v
+		}
+	}
+	return examples
+}
+
 // filterResolved drops examples whose problem this rule has already been fixed for — see
-// db.PromptExample.ResolvedBySuggestionID's doc comment. Applied first, ahead of both dedup
-// passes above in selectExamplesForPrompt, so a resolved example can never win either dedup
-// and end up in the output: showing the improver a case it already fixed is meaningless
-// unless the rule regressed and missed it again, in which case a fresh (unresolved)
-// correction on that email will already be in the pool.
+// db.PromptExample.ResolvedBySuggestionID's doc comment. Applied after markRecurrences
+// (which needs the resolved rows still present to compare against) and ahead of
+// gatherRawExamples' own message-level dedup, so a resolved example can never win it and
+// end up in the output: showing the improver a case it already fixed is meaningless unless
+// the rule regressed and missed it again, in which case a fresh (unresolved) correction on
+// that email will already be in the pool, now marked Recurred.
 func filterResolved(examples []db.PromptExample) []db.PromptExample {
 	out := make([]db.PromptExample, 0, len(examples))
 	for _, ex := range examples {
@@ -309,7 +518,7 @@ func problemExampleKeys(examples []db.PromptExample) []db.ResolvedExampleKey {
 // slices llm.ImproveRequest expects, keyed by each example's stored Verdict.
 func improveRequestExamples(examples []db.PromptExample) (shouldMatch, shouldNotMatch, alreadyCorrect []llm.ExampleRef) {
 	for _, ex := range examples {
-		ref := llm.ExampleRef{Sender: ex.Sender, Subject: ex.Subject, Excerpt: ex.BodyExcerpt}
+		ref := llm.ExampleRef{Sender: ex.Sender, Subject: ex.Subject, Excerpt: ex.BodyExcerpt, Recurred: ex.Recurred}
 		switch ex.Verdict {
 		case db.VerdictFalseNegative:
 			shouldMatch = append(shouldMatch, ref)
@@ -348,80 +557,357 @@ func (r *improveRunner) improveReplayEnabled(ctx context.Context) bool {
 	return err != nil || v == "" || v == "1"
 }
 
-// improveAndFinalizeSuggestion runs one improve-plus-optional-replay round for a single
-// suggestion and writes the result. It rebuilds ShouldMatch/ShouldNotMatch/AlreadyCorrect
-// fresh from the prompt's *current* example corpus on every call — including on a
-// regenerate round, where the pre-corpus version of this code instead replayed a
-// conversation frozen around one snapshot email — then calls the improver (a first round
-// when priorConv is empty and note carries the correction comment, a refinement round when
-// priorConv is non-empty and userComment carries the user's feedback on the previous
-// suggestion), optionally replays the candidate against the same corpus on the classify
-// model (see llm.ReplayAgainstExamples — deliberately not the improve model just used
-// above it), and finalizes the suggestion row. Shared by every improveTarget runOne works,
-// batch or regenerate alike, so this logic can't drift between the two call sites — see
-// this file's package doc comment.
-func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, sid int64, p db.Prompt, originalInstructions string, priorConv []llm.ChatMessage, note, userComment string) {
-	examples := selectExamplesForPrompt(ctx, r.store, p.ID)
-	shouldMatch, shouldNotMatch, alreadyCorrect := improveRequestExamples(examples)
+// versionLister is the one method attemptsForPrompt needs from db.Store — declared locally
+// rather than widening db.StoreIface, matching this codebase's established pattern for a
+// narrow, consumer-declared interface (see llm.Settings/llm.StoreLogger, and traceStore in
+// improve_trace.go). *db.Store satisfies this implicitly.
+type versionLister interface {
+	ListPromptVersions(ctx context.Context, promptID int64, limit int32) ([]db.PromptVersion, error)
+}
 
-	suggested, conv, llmErr := r.llm.ImprovePromptInstructions(ctx, llm.ImproveRequest{
-		PromptName:           p.Name,
-		LabelName:            p.LabelName,
-		OriginalInstructions: originalInstructions,
-		ShouldMatch:          shouldMatch,
-		ShouldNotMatch:       shouldNotMatch,
-		AlreadyCorrect:       alreadyCorrect,
-		UserNote:             note,
-		PriorConversation:    priorConv,
-		UserComment:          userComment,
-	})
-	if llmErr != nil {
-		slog.Error("improve prompt", "suggestion_id", sid, "prompt_id", p.ID, "err", llmErr)
-		if err := r.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
-			ID:                    sid,
-			SuggestedInstructions: "",
-			ConversationJSON:      "[]",
-			Status:                db.SuggestionStatusFailed,
-			UserComment:           llmErr.Error(),
-		}); err != nil {
-			slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
+// attemptsFetchLimit is a little more than llm's PAST ATTEMPTS cap (3 lines,
+// llm.maxAttemptLines): it has to cover the current version — excluded below, since
+// OriginalInstructions already shows that text — plus enough slack that a version or two
+// with no replay evidence (which formatAttempts, llm/bedrock.go, skips) doesn't starve the
+// display down to fewer than 3 attempts when more exist.
+const attemptsFetchLimit = 6
+
+// attemptsForPrompt builds ImproveRequest.PastAttempts for p — its version history, newest
+// first, excluding the current version. This is the improve loop's cross-session memory:
+// without it, every improve round starts from a blank slate and can re-propose a phrasing
+// this exact rule already tried and already failed (see llm.AttemptRef's doc comment).
+// Best-effort: a lookup failure just means no attempt history this round, not a failed
+// round — the improver still has the example corpus to work from either way.
+func attemptsForPrompt(ctx context.Context, store versionLister, p db.Prompt) []llm.AttemptRef {
+	versions, err := store.ListPromptVersions(ctx, p.ID, attemptsFetchLimit)
+	if err != nil {
+		slog.Error("attempts for prompt", "prompt_id", p.ID, "err", err)
+		return nil
+	}
+	attempts := make([]llm.AttemptRef, 0, len(versions))
+	for _, v := range versions {
+		if v.ID == p.CurrentVersionID {
+			continue
 		}
-		return
+		attempts = append(attempts, llm.AttemptRef{
+			Instructions: v.Instructions,
+			Passed:       int(v.ReplayPassed),
+			Total:        int(v.ReplayTotal),
+		})
+	}
+	return attempts
+}
+
+// parseImproveMaxRounds is the pure parsing/clamping core of improveMaxRounds, factored
+// out so the boundary behavior (unset, unparsable, zero/negative, above the cap) is
+// unit-testable without a live store — GetSetting needs *db.Store, which (like every other
+// *db.Store-backed method in this codebase touching s.ddb directly) has no in-package fake
+// seam. Empty/unparsable/less-than-1 all fall back to llm.ImproveMaxRoundsDefault; anything
+// above llm.ImproveMaxRoundsCap clamps down to it.
+func parseImproveMaxRounds(raw string) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return llm.ImproveMaxRoundsDefault
+	}
+	if n > llm.ImproveMaxRoundsCap {
+		return llm.ImproveMaxRoundsCap
+	}
+	return n
+}
+
+// improveMaxRounds resolves llm.SettingImproveMaxRounds. Read directly via GetSetting
+// rather than through llm.Client: the loop is orchestrated by this package, not by the LLM
+// client (same reasoning SettingImproveReplay's doc comment gives).
+func (r *improveRunner) improveMaxRounds(ctx context.Context) int {
+	v, err := r.store.GetSetting(ctx, llm.SettingImproveMaxRounds)
+	if err != nil || v == "" {
+		return llm.ImproveMaxRoundsDefault
+	}
+	return parseImproveMaxRounds(v)
+}
+
+// selectBestRound returns the index into rounds of the best-scoring round: strictly
+// higher Passed wins; a tie keeps the earlier round, since it's closer to the user's
+// original scope and later rounds tend to drift wider chasing a handful of edge cases.
+// Returns -1 for an empty slice. Used both to pick the round improveAndFinalizeSuggestion
+// finalizes and, inline in its loop, to answer "did the round I just ran actually improve
+// on what came before?" (see improveLoopStop) — one comparison rule, not two.
+func selectBestRound(rounds []db.SuggestionRoundSummary) int {
+	best := -1
+	for i, rd := range rounds {
+		if best == -1 || rd.Passed > rounds[best].Passed {
+			best = i
+		}
+	}
+	return best
+}
+
+// improveLoopStop decides whether improveAndFinalizeSuggestion's loop should stop after
+// round n, given that round's outcome — factored out so the stop policy is unit-testable
+// independent of a live LLM/store. replayOn=false means the loop always stops after round
+// 1 regardless of every other input, since without a score there's nothing to iterate on.
+// improved reports whether round n (the one just run) is the best seen across every round
+// up to and including it — the caller computes this via selectBestRound; a tie with an
+// earlier round counts as "not improved." timeRemains is whether enough of the worker's
+// deadline is left for another attempt (hasTimeForAnotherRound). reason is a short,
+// human-readable string suitable for a trace note; empty when stopping needs no
+// explanation (budget exhausted) or when not stopping at all.
+func improveLoopStop(n, maxRounds int, replayOn bool, replay llm.ReplayResult, improved, timeRemains bool) (stop bool, reason string) {
+	if !replayOn {
+		return true, ""
+	}
+	if replay.Total > 0 && replay.Passed == replay.Total {
+		return true, "perfect score, stopping"
+	}
+	if n >= maxRounds {
+		return true, ""
+	}
+	if n > 1 && !improved {
+		return true, "no improvement over the best round so far, stopping"
+	}
+	if !timeRemains {
+		return true, "not enough time left for another round, stopping"
+	}
+	return false, ""
+}
+
+// roundFitsDeadline is the pure predicate hasTimeForAnotherRound wraps around
+// ctx.Deadline() — given how long the last round took and how much time remains, is there
+// enough room for another? The 1.5x headroom (not 1x) accounts for a later round tending
+// to run longer than the one before it: the conversation grows every round, and a replay
+// fan-out competing with a busier Bedrock adaptive retryer can take longer under load than
+// it did last time. improveWorkerMargin is added on top since that cushion still has to be
+// there afterward for runOne's own deferred failure write.
+func roundFitsDeadline(remaining, lastRound time.Duration) bool {
+	return remaining > lastRound*3/2+improveWorkerMargin
+}
+
+// hasTimeForAnotherRound resolves ctx's deadline and applies roundFitsDeadline. No
+// deadline at all (local dev, or the local-fallback goroutine off the server's long-lived
+// context — see dispatchImprove) means there's nothing to run out of, so it's always true
+// in that case rather than refusing every round after the first.
+func hasTimeForAnotherRound(ctx context.Context, lastRound time.Duration) bool {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return roundFitsDeadline(time.Until(dl), lastRound)
+}
+
+// buildReplayFeedbackTurn renders the next user turn when a round's replay score didn't
+// stop the loop on its own — the improver's only view of its own previous mistake, which
+// is exactly what was missing before this loop existed (see this file's package doc
+// comment). Correlates each llm.ReplayFailure back to its full source example (body
+// excerpt included) via ExampleIndex — see that field's doc comment for why the index,
+// not a copy of the example, is what ReplayFailure carries. Grouped by direction (wrongly
+// matched vs. wrongly missed) rather than by verdict: direction is what the model has to
+// act on, and Got alone already determines it without needing Verdict. Deliberately terse,
+// in line with this repo's recent token-compression commits (05b44f0, df611fe) — only the
+// failures are shown, not a restatement of the whole corpus, since PriorConversation
+// already carries that from the first turn.
+func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExample) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "VALIDATION: your last rewrite scored %d/%d on the real classifier.\n", replay.Passed, replay.Total)
+
+	var wronglyMatched, wronglyMissed []llm.ReplayFailure
+	for _, f := range replay.Failures {
+		if f.Got {
+			wronglyMatched = append(wronglyMatched, f)
+		} else {
+			wronglyMissed = append(wronglyMissed, f)
+		}
+	}
+	writeGroup := func(label string, fails []llm.ReplayFailure) {
+		if len(fails) == 0 {
+			return
+		}
+		fmt.Fprintf(&sb, "\n%s:\n", label)
+		for _, f := range fails {
+			if f.ExampleIndex < 0 || f.ExampleIndex >= len(examples) {
+				continue // defensive: examples is the exact slice replay was scored against, but never trust an index blindly
+			}
+			ex := examples[f.ExampleIndex]
+			fmt.Fprintf(&sb, "- %s | %s | %s\n", ex.Sender, ex.Subject, ex.BodyExcerpt)
+		}
+	}
+	writeGroup("STILL WRONGLY CAUGHT (must not match)", wronglyMatched)
+	writeGroup("STILL MISSED (must match)", wronglyMissed)
+
+	fmt.Fprintf(&sb, "\nRewrite again to fix these without breaking the %d it already gets right. Same constraints.", replay.Passed)
+	return sb.String()
+}
+
+// improveAndFinalizeSuggestion runs a bounded improve<->replay loop for a single
+// suggestion and writes the best-scoring round's result. Round 1 behaves exactly as the
+// single-shot version of this function always did: it rebuilds ShouldMatch/ShouldNotMatch/
+// AlreadyCorrect fresh from the prompt's *current* example corpus (including on a
+// regenerate round, where the pre-corpus version of this code instead replayed a
+// conversation frozen around one snapshot email), calls the improver (a first round when
+// priorConv is empty and note carries the correction comment, a refinement round when
+// priorConv is non-empty and userComment carries the user's feedback on the previous
+// suggestion), and optionally replays the candidate against the same corpus on the
+// classify model (see llm.ReplayAgainstExamples — deliberately not the improve model just
+// used above it).
+//
+// What's new: if replay is on and the round didn't score perfectly, the loop feeds the
+// replay failures back to the improver as the next user turn (buildReplayFeedbackTurn) and
+// tries again, up to improveMaxRounds. It stops early — perfect score, a round that
+// doesn't beat the best score seen so far, the round budget, or not enough of the worker's
+// remaining deadline left for another attempt (hasTimeForAnotherRound) — and finalizes
+// whichever round scored highest, not necessarily the last one: a later round is free to
+// try something that makes the score worse, and the loop keeps a strictly-better-or-bust
+// standard rather than trusting "more recent" as "better." A round-1 improve-call failure
+// is still fatal, exactly as before (there's no earlier round to fall back on); an improve-
+// call failure on round 2+ just stops the loop and finalizes the best round already found,
+// rather than losing a good candidate to a transient Bedrock error.
+//
+// Shared by every improveTarget runOne works, batch or regenerate alike, so this logic
+// can't drift between the two call sites — see this file's package doc comment.
+func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *traceWriter, sid int64, p db.Prompt, originalInstructions string, priorConv []llm.ChatMessage, note, userComment string) {
+	// One raw fetch, sampled twice at different caps — see gatherRawExamples' doc comment
+	// on why this avoids re-querying the corpus twice in one round. examples (small,
+	// token-bounded) drives the improve prompt itself and what gets marked resolved;
+	// replayExamples (larger, more representative) is only built when replay will actually
+	// use it — no reason to pay for that if replay is off.
+	raw := gatherRawExamples(ctx, r.store, p.ID)
+	examples := sampleExamples(raw, improveExampleCap(ctx, r.store))
+	shouldMatch, shouldNotMatch, alreadyCorrect := improveRequestExamples(examples)
+	replayOn := r.improveReplayEnabled(ctx)
+	maxRounds := r.improveMaxRounds(ctx)
+	if !replayOn {
+		// No score to iterate on — same behavior as the pre-loop code, exactly one round.
+		maxRounds = 1
+	}
+	var replayExamples []db.PromptExample
+	if replayOn {
+		replayExamples = sampleExamples(raw, replayExampleCap(ctx, r.store))
 	}
 
-	convJSON, _ := json.Marshal(conv) //nolint:errchkjson // []llm.ChatMessage cannot fail
+	req := llm.ImproveRequest{
+		PromptName: p.Name, LabelName: p.LabelName, OriginalInstructions: originalInstructions,
+		ShouldMatch: shouldMatch, ShouldNotMatch: shouldNotMatch, AlreadyCorrect: alreadyCorrect,
+		UserNote: note, PriorConversation: priorConv, UserComment: userComment,
+		PastAttempts: attemptsForPrompt(ctx, r.store, p),
+	}
+
+	// rounds, candidates, convs, and replays are parallel slices, one entry per completed
+	// round — kept separate from db.SuggestionRoundSummary (which only needs N/Candidate/
+	// Passed/Total for persistence) because the full conversation and replay failures for
+	// every round would be wasteful to carry in what gets JSON-marshaled onto the
+	// suggestion row; only the winning round's need to survive past this function.
+	var rounds []db.SuggestionRoundSummary
+	var candidates []string
+	var convs [][]llm.ChatMessage
+	var replays []llm.ReplayResult
+
+	for n := 1; n <= maxRounds; n++ {
+		round := int64(n)
+		tw.Event(ctx, db.TraceKindRoundStart, round, "")
+		roundStart := time.Now()
+
+		suggested, conv, llmErr := r.llm.ImprovePromptInstructions(ctx, req, tw.Sink(ctx, round))
+		if llmErr != nil {
+			slog.Error("improve prompt", "suggestion_id", sid, "prompt_id", p.ID, "round", n, "err", llmErr)
+			tw.Event(ctx, db.TraceKindError, round, llmErr.Error())
+			if len(rounds) == 0 {
+				// Round 1 failing is fatal — there's no earlier candidate to fall back on,
+				// same as the single-shot version of this function always did.
+				if err := r.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
+					ID:                    sid,
+					SuggestedInstructions: "",
+					ConversationJSON:      "[]",
+					Status:                db.SuggestionStatusFailed,
+					UserComment:           llmErr.Error(),
+				}); err != nil {
+					slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
+				}
+				return
+			}
+			tw.Event(ctx, db.TraceKindNote, round, "keeping the best round found so far after this error")
+			break
+		}
+		tw.Event(ctx, db.TraceKindCandidate, round, suggested)
+
+		var replay llm.ReplayResult
+		if replayOn {
+			tw.Event(ctx, db.TraceKindReplayStart, round, "")
+			// concurrency 0: unbounded fan-out. This used to pass cfg.ClassifyConcurrency
+			// (default 6) because the goroutine it ran in shared WebFunction's 128MB/30s
+			// budget with live HTTP requests; running inside ImproveFunction's own
+			// 1024MB/900s invocation, there's no such budget to protect, and
+			// ReplayAgainstExamples' own concurrency<=0 handling (llm/bedrock.go) skips
+			// the semaphore entirely — Bedrock's adaptive retryer (newBedrockRetryer)
+			// already provides the real backpressure. A bounded round budget (maxRounds)
+			// is what keeps this fan-out from multiplying unboundedly, not a concurrency
+			// limit here.
+			replay = r.llm.ReplayAgainstExamples(ctx, r.store, suggested, replayExamplesFor(replayExamples), 0)
+			tw.Event(ctx, db.TraceKindReplayDone, round, fmt.Sprintf("%d/%d", replay.Passed, replay.Total))
+		}
+		rounds = append(rounds, db.SuggestionRoundSummary{N: n, Candidate: suggested, Passed: int64(replay.Passed), Total: int64(replay.Total)})
+		candidates = append(candidates, suggested)
+		convs = append(convs, conv)
+		replays = append(replays, replay)
+
+		// "Improved" means round n is the best seen across every round up to and
+		// including it — reusing selectBestRound's own comparison rule (strict >, ties
+		// favor earlier) rather than duplicating it, so there's exactly one definition of
+		// "better" for both the stop decision and the final pick after the loop ends.
+		improved := selectBestRound(rounds) == len(rounds)-1
+		timeRemains := hasTimeForAnotherRound(ctx, time.Since(roundStart))
+		if stop, reason := improveLoopStop(n, maxRounds, replayOn, replay, improved, timeRemains); stop {
+			if reason != "" {
+				tw.Event(ctx, db.TraceKindNote, round, reason)
+			}
+			break
+		}
+
+		req.PriorConversation = conv
+		req.UserComment = buildReplayFeedbackTurn(replay, replayExamples)
+	}
+
+	bestIdx := selectBestRound(rounds)
+	bestN := rounds[bestIdx].N
+	bestSuggested := candidates[bestIdx]
+	bestConv := convs[bestIdx]
+	bestReplay := replays[bestIdx]
+
+	convJSON, _ := json.Marshal(bestConv) //nolint:errchkjson // []llm.ChatMessage cannot fail
 	// Recorded on every generate/regenerate round, so applying whichever round's
 	// suggestion the user actually accepts marks the examples that shaped *that* version —
-	// not stale keys from an earlier round if the corpus shifted in between (see
-	// improveAndFinalizeSuggestion's doc comment).
+	// not stale keys from an earlier round if the corpus shifted in between (see this
+	// function's doc comment).
 	problemKeysJSON, _ := json.Marshal(problemExampleKeys(examples)) //nolint:errchkjson // []db.ResolvedExampleKey cannot fail
+	roundsJSON, _ := json.Marshal(rounds)                            //nolint:errchkjson // []db.SuggestionRoundSummary cannot fail
 	finalize := db.FinalizePromptSuggestionParams{
 		ID:                    sid,
-		SuggestedInstructions: suggested,
+		SuggestedInstructions: bestSuggested,
 		ConversationJSON:      string(convJSON),
 		Status:                db.SuggestionStatusPending,
 		UserComment:           userComment,
 		ProblemExampleKeys:    string(problemKeysJSON),
+		RoundsJSON:            string(roundsJSON),
+		RoundsRun:             int64(len(rounds)),
+		BestRound:             int64(bestN),
 	}
-	if r.improveReplayEnabled(ctx) {
-		// concurrency 0: unbounded fan-out. This used to pass cfg.ClassifyConcurrency
-		// (default 6) because the goroutine it ran in shared WebFunction's 128MB/30s
-		// budget with live HTTP requests; running inside ImproveFunction's own 1024MB/900s
-		// invocation, there's no such budget to protect, and ReplayAgainstExamples' own
-		// concurrency<=0 handling (llm/bedrock.go) skips the semaphore entirely — Bedrock's
-		// adaptive retryer (newBedrockRetryer) already provides the real backpressure.
-		replay := r.llm.ReplayAgainstExamples(ctx, r.store, suggested, replayExamplesFor(examples), 0)
-		failuresJSON, _ := json.Marshal(replay.Failures) //nolint:errchkjson // []llm.ReplayFailure cannot fail
-		finalize.ReplayModel = replay.Model
-		finalize.ReplayTotal = int64(replay.Total)
-		finalize.ReplayPassed = int64(replay.Passed)
-		finalize.ReplayBaseline = replayBaseline(examples)
+	if replayOn {
+		failuresJSON, _ := json.Marshal(bestReplay.Failures) //nolint:errchkjson // []llm.ReplayFailure cannot fail
+		finalize.ReplayModel = bestReplay.Model
+		finalize.ReplayTotal = int64(bestReplay.Total)
+		finalize.ReplayPassed = int64(bestReplay.Passed)
+		finalize.ReplayBaseline = replayBaseline(replayExamples)
 		finalize.ReplayFailures = string(failuresJSON)
 	}
+	// The done event is emitted only after FinalizePromptSuggestion actually lands — the
+	// trace poll's completion signal (see the trace endpoint, server.go) tells the browser
+	// it's safe to re-fetch the suggestion card, and that's only true once the terminal
+	// status has been written, not merely decided.
 	if err := r.store.FinalizePromptSuggestion(ctx, finalize); err != nil {
 		slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
+		tw.Event(ctx, db.TraceKindError, int64(bestN), "saved the suggestion but failed to record its final status: "+err.Error())
+		return
 	}
-	slog.Info("improve suggestion ready", "suggestion_id", sid, "prompt_id", p.ID, "replay_total", finalize.ReplayTotal, "replay_passed", finalize.ReplayPassed)
+	tw.Event(ctx, db.TraceKindDone, int64(bestN), "")
+	slog.Info("improve suggestion ready", "suggestion_id", sid, "prompt_id", p.ID, "rounds_run", len(rounds), "best_round", bestN, "replay_total", finalize.ReplayTotal, "replay_passed", finalize.ReplayPassed)
 }
 
 // replayBaseline is the free baseline ReplayResult.Passed is compared against: how many of

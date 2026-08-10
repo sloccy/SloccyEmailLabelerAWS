@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -226,7 +227,7 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 
 	render := func(classifyTier, improveTier string) string {
 		var sb strings.Builder
-		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", true, llm.ReasoningEffortOff, models)
+		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", true, llm.ImproveMaxRoundsDefault, llm.ImproveExampleCapDefault, llm.ReplayExampleCapDefault, llm.ReasoningEffortOff, models)
 		if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
 			t.Fatalf("ExecuteTemplate: %v", err)
 		}
@@ -275,6 +276,49 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 	})
 }
 
+func TestSettingsFormRendersImproveMaxRoundsOptions(t *testing.T) {
+	tmpl, err := loadTemplates()
+	if err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+	models := []llm.ModelOption{{ID: "m", Label: "M"}}
+
+	var sb strings.Builder
+	data := settingsTemplateData("m", "m", llm.TierStandard, llm.TierStandard, "", true, 4, llm.ImproveExampleCapDefault, llm.ReplayExampleCapDefault, llm.ReasoningEffortOff, models)
+	if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
+		t.Fatalf("ExecuteTemplate: %v", err)
+	}
+	out := sb.String()
+
+	if !strings.Contains(out, `name="improve_max_rounds"`) {
+		t.Error("missing the improve_max_rounds select")
+	}
+	for n := 1; n <= llm.ImproveMaxRoundsCap; n++ {
+		want := fmt.Sprintf(`value="%d"`, n)
+		if !strings.Contains(out, want) {
+			t.Errorf("missing option %s", want)
+		}
+	}
+	if !strings.Contains(out, `value="4" selected`) {
+		t.Error("expected the current setting (4) to render as the selected option")
+	}
+	if strings.Contains(out, `value="3" selected`) {
+		t.Error("only the current setting should render as selected")
+	}
+}
+
+func TestImproveMaxRoundsOptions(t *testing.T) {
+	got := improveMaxRoundsOptions()
+	if len(got) != llm.ImproveMaxRoundsCap {
+		t.Fatalf("len = %d, want %d", len(got), llm.ImproveMaxRoundsCap)
+	}
+	for i, v := range got {
+		if v != i+1 {
+			t.Errorf("options[%d] = %d, want %d", i, v, i+1)
+		}
+	}
+}
+
 // ============================================================
 // History pagination (handleHistory helpers)
 // ============================================================
@@ -306,6 +350,72 @@ func TestHistoryPageLimit(t *testing.T) {
 			if limit != tc.wantLimit || ceilingHit != tc.wantCeilingHit {
 				t.Errorf("historyPageLimit(%d, %d, %d) = (%d, %v), want (%d, %v)",
 					tc.pageSize, tc.maxLimit, tc.loaded, limit, ceilingHit, tc.wantLimit, tc.wantCeilingHit)
+			}
+		})
+	}
+}
+
+// ============================================================
+// Suggestion trace endpoint helpers
+// ============================================================
+
+func TestParseTraceAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{"empty defaults to 0", "", 0},
+		{"valid positive", "42", 42},
+		{"zero", "0", 0},
+		{"negative rejected", "-5", 0},
+		{"garbage rejected", "not-a-number", 0},
+		{"float rejected", "1.5", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := parseTraceAfter(c.in); got != c.want {
+				t.Errorf("parseTraceAfter(%q) = %d, want %d", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestTraceLastSeq(t *testing.T) {
+	cases := []struct {
+		name   string
+		after  int64
+		events []db.SuggestionTraceEvent
+		want   int64
+	}{
+		{"no events keeps cursor unchanged", 5, nil, 5},
+		{"advances to the highest seq", 0, []db.SuggestionTraceEvent{{Seq: 1}, {Seq: 3}, {Seq: 2}}, 3},
+		{"events already below after are ignored", 10, []db.SuggestionTraceEvent{{Seq: 1}}, 10},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := traceLastSeq(c.after, c.events); got != c.want {
+				t.Errorf("traceLastSeq(%d, %v) = %d, want %d", c.after, c.events, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSuggestionsPollInterval(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []suggestionView
+		want string
+	}{
+		{"empty list: slow", nil, "60s"},
+		{"nothing generating: slow", []suggestionView{{Status: db.SuggestionStatusPending}, {Status: db.SuggestionStatusFailed}}, "60s"},
+		{"one generating among others: fast", []suggestionView{{Status: db.SuggestionStatusPending}, {Status: db.SuggestionStatusGenerating}}, "5s"},
+		{"all generating: fast", []suggestionView{{Status: db.SuggestionStatusGenerating}, {Status: db.SuggestionStatusGenerating}}, "5s"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := suggestionsPollInterval(c.in); got != c.want {
+				t.Errorf("suggestionsPollInterval(%v) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

@@ -414,7 +414,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 			}); err != nil {
 				slog.Error("bulk recategorize: insert correction", "account_id", accountID, "message_id", mid, "err", err)
 			}
-			examples := buildPromptExamples(accountID, mid, st.Sender, st.Subject, excerpts[mid], note, perMessageVerdicts[mid])
+			examples := buildPromptExamples(accountID, mid, st.Sender, st.Subject, excerpts[mid], note, perMessageVerdicts[mid], promptByID)
 			allExamples = append(allExamples, examples...)
 		}
 	}
@@ -423,6 +423,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		if err := s.store.InsertPromptExamples(ctx, allExamples); err != nil {
 			slog.Error("bulk recategorize: insert prompt examples", "err", err)
 		}
+		incrementVersionObservedFor(ctx, s.store, allExamples)
 	}
 
 	// One suggestion per flagged rule, not per email — the corpus (just written above)

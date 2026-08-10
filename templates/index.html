@@ -352,9 +352,15 @@
       <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
         <div><h2 class="fw-bold mb-1">Prompt Updates</h2><div class="small text-muted">AI-suggested improvements from manual corrections</div></div>
       </div>
+      {{/* The recurring poll interval lives inside the fragment itself now (see
+           prompt_suggestions_list.html's #suggestions-poll), not here — this container
+           is never swapped via outerHTML, so an attribute on it could never become
+           data-dependent. This element only ever needs to fire the very first load and
+           react to an explicit refresh signal (recategorize submit, or the trace poll's
+           completion signal — see static/app.js). */}}
       <div id="suggestions-list-container"
         hx-get="/fragments/prompt-suggestions"
-        hx-trigger="intersect once, every 60s [document.getElementById('page-prompt-suggestions').classList.contains('active') &amp;&amp; document.visibilityState === 'visible'], refreshSuggestions from:window"
+        hx-trigger="intersect once, refreshSuggestions from:window"
         hx-swap="innerHTML">
         <div class="d-flex flex-column gap-3">
           <div class="skeleton rounded-3" style="height:4rem"></div>
