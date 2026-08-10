@@ -2265,18 +2265,22 @@ func (s *Store) InsertEmailCorrection(ctx context.Context, arg InsertEmailCorrec
 // matched-emails/day of passive confirmation, storage grows by roughly
 // 200 × 800B × 365 ≈ 58MB/year — still trivial against the 25GB free-tier allowance — and
 // read cost is unaffected by corpus size either way, since ListExamplesByVerdict is always
-// Limit-bounded regardless of how much has accumulated. So there's still no TTL and no trim
-// job here. The DeleteExamplesForPrompt escape hatch (wired into DeletePrompt) covers the
-// one real reason to clear a prompt's history — its intent changed enough that old examples
-// mislead the improver — without needing a background sweep. See db/models.go's
-// PromptExample doc comment for the key schema (PK = EXAMPLE#<promptId>,
+// Limit-bounded regardless of how much has accumulated. So there's still no TTL here — but
+// there IS now a daily active trim: prunePromptExamples (prune.go), run once per scheduled
+// scan, deletes whatever a prompt's example-selection sampler (improve.go's sampleVerdict)
+// would never actually pick, via DeletePromptExamples below, keeping each verdict's corpus
+// bounded to roughly 2x the replay-validation cap instead of growing forever. The
+// DeleteExamplesForPrompt escape hatch (wired into DeletePrompt) is separate and unchanged —
+// it covers the one thing the daily prune doesn't: a rule's intent changing enough that its
+// whole history should be cleared at once, not just trimmed to what's still useful. See
+// db/models.go's PromptExample doc comment for the key schema (PK = EXAMPLE#<promptId>,
 // SK = <verdict>#<ts>#<padID(id)>).
 
 // InsertPromptExamples writes a batch of examples produced by one recategorization (single
 // or bulk). Deliberately append-only: a re-correction of the same (promptId, messageId)
 // pair writes a new row rather than overwriting the old one. Deduping to "the newest
 // verdict wins" happens at read time in ListExamplesByVerdict's caller
-// (recategorize.go's selectExamplesForPrompt), not here — a dedupe index would cost an
+// (improve.go's gatherRawExamples), not here — a dedupe index would cost an
 // extra read-then-write per example, unaffordable during a bulk write at 2 WCU.
 // promptExampleItem and itemToPromptExample are the marshal/unmarshal pair for
 // PromptExample, mirroring every other entity's xToItem/itemToX helpers (accountItem/
@@ -2380,6 +2384,26 @@ func (s *Store) CountExamplesByVerdict(ctx context.Context, promptID int64) (map
 // history would mislead the improver.
 func (s *Store) DeleteExamplesForPrompt(ctx context.Context, promptID int64) error {
 	return s.deleteAllByPK(ctx, pkExample(promptID))
+}
+
+// DeletePromptExamples deletes exactly the given examples — unlike DeleteExamplesForPrompt
+// (which wipes a whole prompt's corpus), this is for prunePromptExamples (prune.go), which
+// already has the full PromptExample values in hand (from ListExamplesByVerdict) and just
+// needs their keys rebuilt, not re-queried. Callers don't need to know the key format
+// (pkExample/exampleSK stay unexported) — just hand back whichever examples pruneKeepSet
+// (improve.go) decided not to keep.
+func (s *Store) DeletePromptExamples(ctx context.Context, examples []PromptExample) error {
+	if len(examples) == 0 {
+		return nil
+	}
+	keys := make([]map[string]types.AttributeValue, len(examples))
+	for i, ex := range examples {
+		keys[i] = map[string]types.AttributeValue{
+			"PK": sv(pkExample(ex.PromptID)),
+			"SK": sv(exampleSK(ex.Verdict, ex.CreatedAt, ex.ID)),
+		}
+	}
+	return s.batchDelete(ctx, keys)
 }
 
 // ============================================================

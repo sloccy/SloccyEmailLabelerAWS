@@ -14,8 +14,10 @@ import (
 
 // scanOnce runs one full email-labeling pass against already-built deps.
 // Shared by the scheduled ScanFunction and the web UI "Scan Now" button.
-// (Retention of logs/history/processed-markers is enforced entirely by item-level
-// DynamoDB TTLs — no scan-time trim pass is needed.)
+// Retention of logs/history/processed-markers is enforced entirely by item-level DynamoDB
+// TTLs — no trim pass needed for those. Prompt examples are the one exception: they have no
+// TTL by design (permanent history), so prunePromptExamples (prune.go) runs once per scan to
+// keep each rule's corpus bounded instead of growing forever — see its own doc comment.
 func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmailAuth *gmail.Auth, cfg *Config) {
 	accounts, err := store.ListAccounts(ctx)
 	if err != nil {
@@ -59,4 +61,8 @@ func scanOnce(ctx context.Context, store *db.Store, llmClient *llm.Client, gmail
 		}
 		slog.Info("scan complete", "email", account.Email, "elapsed", time.Since(start))
 	}
+
+	// DynamoDB-only, no Gmail client needed — runs once per scan, not per account, since
+	// PromptExample's partition key is per-prompt, not per-account (see prune.go).
+	prunePromptExamples(ctx, store, prompts)
 }
