@@ -423,6 +423,62 @@ func roundRobinBySender(candidates []db.PromptExample, budget int) []db.PromptEx
 	return out
 }
 
+// pruneBuffer is the hysteresis margin shouldPruneVerdict adds on top of a verdict's cap
+// before a prune pass does any real work — without it, a verdict sitting right at cap would
+// trigger a prune (of only a couple of items) on every single scheduled run once its size
+// stabilizes, paying for the read+rank+delete pass for near-zero benefit each time.
+const pruneBuffer = 10
+
+// shouldPruneVerdict reports whether a verdict's example count justifies the expensive
+// read+rank+delete pass pruneVerdict (prune.go) runs — the cheap precheck this guards,
+// db.Store.CountExamplesByVerdict, is 3 Select:COUNT queries regardless of corpus size, so
+// most scheduled runs stop here for most prompts once a corpus has stabilized near cap.
+func shouldPruneVerdict(count int64, verdictCap int) bool {
+	return count > int64(verdictCap)+pruneBuffer
+}
+
+// pruneKeepSet decides, from one verdict's bounded raw read (newest-first, per
+// ListExamplesByVerdict's contract — pruneVerdict in prune.go is the only caller, passing a
+// much wider raw window than selection ever reads), which examples survive a daily prune
+// pass. This is the reverse of selectExamplesForImprove/selectExamplesForReplay: whatever
+// falls outside the keep set this returns is exactly what sampleVerdict would never pick for
+// either purpose, so it's safe to delete permanently (see db.Store.DeletePromptExamples).
+//
+// Unlike selection's gatherRawExamples, a resolved example isn't dropped outright here — it
+// still has one job left, letting markRecurrences flag a live row as a regression — so it's
+// kept by recency alone, up to cap, independent of the live pool below. Tiering doesn't apply
+// to a resolved row: nobody ever sees it, only "how far back can a regression still be
+// detected" does, and that's answered by recency. Live (unresolved) examples are ranked
+// exactly like selection (sampleVerdict, the same recurred > manual > passive, round-robin
+// priority) and kept up to cap.
+func pruneKeepSet(raw []db.PromptExample, verdictCap int) map[int64]bool {
+	marked := markRecurrences(raw) // needs resolved and live rows together to find a regression
+
+	var live, resolved []db.PromptExample
+	for _, ex := range marked {
+		if ex.ResolvedBySuggestionID != nil {
+			resolved = append(resolved, ex)
+		} else {
+			live = append(live, ex)
+		}
+	}
+
+	keep := make(map[int64]bool, verdictCap*2)
+	for _, ex := range sampleVerdict(live, verdictCap) {
+		keep[ex.ID] = true
+	}
+	// resolved is already newest-first — ListExamplesByVerdict's query order, undisturbed by
+	// markRecurrences (which mutates in place, no reordering) — so no re-ranking is needed,
+	// just take the newest cap.
+	for i, ex := range resolved {
+		if i >= verdictCap {
+			break
+		}
+		keep[ex.ID] = true
+	}
+	return keep
+}
+
 // markRecurrences flags each still-live (unresolved) example whose problem a prior
 // suggestion already claimed to fix — an older row for the same message and verdict (or,
 // failing that, the same sender+subject, since a re-sent templated email can arrive with a

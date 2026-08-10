@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/sloccy/ollamail-aws/db"
@@ -187,5 +188,132 @@ func TestAttemptsForPrompt_FeedsIntoImproveRequest(t *testing.T) {
 	}
 	if attempts[0] != (llm.AttemptRef{Instructions: "Match newsletters.", Passed: 7, Total: 10}) {
 		t.Errorf("got %+v, want the exact llm.AttemptRef shape", attempts[0])
+	}
+}
+
+// ============================================================
+// shouldPruneVerdict
+// ============================================================
+
+func TestShouldPruneVerdict(t *testing.T) {
+	const verdictCap = 40
+	cases := []struct {
+		name  string
+		count int64
+		want  bool
+	}{
+		{"well below cap", 10, false},
+		{"exactly at cap", 40, false},
+		{"within the buffer above cap", 40 + pruneBuffer, false},
+		{"just past the buffer", 40 + pruneBuffer + 1, true},
+		{"well above cap", 500, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldPruneVerdict(c.count, verdictCap); got != c.want {
+				t.Errorf("shouldPruneVerdict(%d, %d) = %v, want %v", c.count, verdictCap, got, c.want)
+			}
+		})
+	}
+}
+
+// ============================================================
+// pruneKeepSet
+// ============================================================
+
+// TestPruneKeepSet_LiveRankedLikeSelection checks the core "reverse of selection" property:
+// a recurred live example wins a keep slot over more recent, non-recurred live examples —
+// exactly the priority sampleVerdict already applies for selection (see
+// TestSampleExamples_RecurredPrioritizedOverManualAndPassive, recategorize_test.go), not
+// re-tested in depth here.
+func TestPruneKeepSet_LiveRankedLikeSelection(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 3, MessageID: "m3", Sender: "c@example.com", Subject: "s3", Source: db.ExampleSourceManual},
+		{ID: 2, MessageID: "m2", Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
+		{ID: 1, MessageID: "m1", Sender: "a@example.com", Subject: "s1", Recurred: true},
+	}
+	keep := pruneKeepSet(examples, 1)
+	if len(keep) != 1 || !keep[1] {
+		t.Errorf("keep = %v, want only ID 1 (the recurred example, even though it's the oldest)", keep)
+	}
+}
+
+// TestPruneKeepSet_ResolvedKeptByRecencyIndependentOfLive checks that resolved examples get
+// their own recency-only cap, separate from the live pool's tiered ranking — pruning a
+// verdict with plenty of live examples must not starve the resolved pool, and vice versa.
+func TestPruneKeepSet_ResolvedKeptByRecencyIndependentOfLive(t *testing.T) {
+	resolvedBy := int64(1)
+	var examples []db.PromptExample
+	// 3 resolved rows, newest-first (ListExamplesByVerdict's contract) — cap of 2 should
+	// keep only the newest 2.
+	for i := int64(3); i >= 1; i-- {
+		examples = append(examples, db.PromptExample{
+			ID: i, MessageID: fmt.Sprintf("resolved%d", i), Sender: fmt.Sprintf("r%d@example.com", i), Subject: "s",
+			ResolvedBySuggestionID: &resolvedBy,
+		})
+	}
+	// 1 live example — well within its own cap of 2.
+	examples = append(examples, db.PromptExample{ID: 10, MessageID: "live1", Sender: "live@example.com", Subject: "s"})
+
+	keep := pruneKeepSet(examples, 2)
+	if keep[1] {
+		t.Errorf("keep = %v, want the oldest resolved example (ID 1) pruned (cap 2, 3 resolved rows)", keep)
+	}
+	if !keep[2] || !keep[3] {
+		t.Errorf("keep = %v, want the two newest resolved examples (IDs 2, 3) kept", keep)
+	}
+	if !keep[10] {
+		t.Errorf("keep = %v, want the live example kept — it must not compete with the resolved pool for budget", keep)
+	}
+}
+
+// TestPruneKeepSet_ResolvedWithinCapPreservesRecurrenceDetection checks the reason resolved
+// rows are kept at all: a resolved row within its own cap must still let markRecurrences flag
+// a live row with the same message+verdict as Recurred, so [RECURRED] detection keeps working
+// after a prune pass, not just before one.
+func TestPruneKeepSet_ResolvedWithinCapPreservesRecurrenceDetection(t *testing.T) {
+	resolvedBy := int64(9)
+	examples := []db.PromptExample{
+		{ID: 2, MessageID: "msg1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s", ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 5},
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s"},
+	}
+	pruneKeepSet(examples, 10) // mutates examples in place via markRecurrences, same as gatherRawExamples does
+	var live db.PromptExample
+	for _, ex := range examples {
+		if ex.ID == 1 {
+			live = ex
+		}
+	}
+	if !live.Recurred || live.RecurredFromVersion != 5 {
+		t.Errorf("live example = %+v, want Recurred=true RecurredFromVersion=5 after pruneKeepSet ran markRecurrences", live)
+	}
+}
+
+// TestPruneKeepSet_EveryKeptIDIsFromInput is a sanity check against a bookkeeping bug: the
+// keep set must never reference an ID that wasn't actually in the input, and must never
+// exceed 2x cap (cap for live + cap for resolved).
+func TestPruneKeepSet_EveryKeptIDIsFromInput(t *testing.T) {
+	resolvedBy := int64(1)
+	var examples []db.PromptExample
+	for i := int64(1); i <= 20; i++ {
+		ex := db.PromptExample{ID: i, MessageID: fmt.Sprintf("m%d", i), Sender: fmt.Sprintf("s%d@example.com", i), Subject: "s"}
+		if i%3 == 0 {
+			ex.ResolvedBySuggestionID = &resolvedBy
+		}
+		examples = append(examples, ex)
+	}
+	valid := make(map[int64]bool, len(examples))
+	for _, ex := range examples {
+		valid[ex.ID] = true
+	}
+
+	keep := pruneKeepSet(examples, 5)
+	if len(keep) > 10 {
+		t.Errorf("len(keep) = %d, want at most 10 (cap 5 for live + cap 5 for resolved)", len(keep))
+	}
+	for id := range keep {
+		if !valid[id] {
+			t.Errorf("keep set references ID %d, which was never in the input", id)
+		}
 	}
 }
