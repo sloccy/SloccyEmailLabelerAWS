@@ -115,11 +115,26 @@ var errNotFound = errors.New("not found")
 // families this project runs, so every response is parsed as text regardless).
 
 // fakeConverseAPI stubs converseAPI. It returns one canned (output, err) pair per call,
-// indexed by call order.
+// indexed by call order. Converse and ConverseStream calls are tracked and indexed
+// independently — ImprovePromptInstructions only ever drives ConverseStream, so the two
+// call lists never need to interleave for any test in this file.
 type fakeConverseAPI struct {
 	outputs []*bedrockruntime.ConverseOutput
 	errs    []error
 	calls   []*bedrockruntime.ConverseInput
+
+	// streamEvents[i] is the canned event sequence for the i-th ConverseStream call;
+	// streamErrs[i], if set, is returned instead (before any events, matching how a
+	// request-shape rejection like ValidationException actually arrives from Bedrock —
+	// see converseAPI's doc comment on why a fake can only ever produce a
+	// *bedrockruntime.ConverseStreamEventStream, never the SDK's own ConverseStreamOutput).
+	// streamMidErrs[i], if set, is what Err() reports after streamEvents[i] has been
+	// delivered — a failure discovered mid-stream (e.g. a dropped connection), distinct
+	// from streamErrs' pre-stream rejection.
+	streamEvents  [][]types.ConverseStreamOutput
+	streamErrs    []error
+	streamMidErrs []error
+	streamCalls   []*bedrockruntime.ConverseStreamInput
 }
 
 func (f *fakeConverseAPI) Converse(_ context.Context, params *bedrockruntime.ConverseInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
@@ -138,8 +153,72 @@ func (f *fakeConverseAPI) Converse(_ context.Context, params *bedrockruntime.Con
 	return &bedrockruntime.ConverseOutput{}, nil
 }
 
-func (f *fakeConverseAPI) ConverseStream(_ context.Context, _ *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error) {
-	return nil, errors.New("fakeConverseAPI: ConverseStream not implemented")
+func (f *fakeConverseAPI) ConverseStream(_ context.Context, params *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error) {
+	i := len(f.streamCalls)
+	f.streamCalls = append(f.streamCalls, params)
+	if i < len(f.streamErrs) && f.streamErrs[i] != nil {
+		return nil, f.streamErrs[i]
+	}
+	var events []types.ConverseStreamOutput
+	if i < len(f.streamEvents) {
+		events = f.streamEvents[i]
+	}
+	var midErr error
+	if i < len(f.streamMidErrs) {
+		midErr = f.streamMidErrs[i]
+	}
+	return bedrockruntime.NewConverseStreamEventStream(func(es *bedrockruntime.ConverseStreamEventStream) {
+		es.Reader = newFakeStreamReader(events, midErr)
+	}), nil
+}
+
+// fakeStreamReader implements bedrockruntime.ConverseStreamOutputReader by replaying a
+// canned, already-buffered sequence of events, then reporting err (nil for a clean stream)
+// from Err() once the channel has drained.
+type fakeStreamReader struct {
+	ch  chan types.ConverseStreamOutput
+	err error
+}
+
+func newFakeStreamReader(events []types.ConverseStreamOutput, err error) *fakeStreamReader {
+	ch := make(chan types.ConverseStreamOutput, len(events))
+	for _, e := range events {
+		ch <- e
+	}
+	close(ch)
+	return &fakeStreamReader{ch: ch, err: err}
+}
+
+func (r *fakeStreamReader) Events() <-chan types.ConverseStreamOutput { return r.ch }
+func (r *fakeStreamReader) Close() error                              { return nil }
+func (r *fakeStreamReader) Err() error                                { return r.err }
+
+// textDeltaEvent, reasoningDeltaEvent, and stopEvent build the ConverseStreamOutput union
+// members ImprovePromptInstructions/streamGenerate switch on, for streamEvents fixtures.
+func textDeltaEvent(s string) types.ConverseStreamOutput {
+	return &types.ConverseStreamOutputMemberContentBlockDelta{
+		Value: types.ContentBlockDeltaEvent{Delta: &types.ContentBlockDeltaMemberText{Value: s}},
+	}
+}
+
+func reasoningDeltaEvent(s string) types.ConverseStreamOutput {
+	return &types.ConverseStreamOutputMemberContentBlockDelta{
+		Value: types.ContentBlockDeltaEvent{Delta: &types.ContentBlockDeltaMemberReasoningContent{
+			Value: &types.ReasoningContentBlockDeltaMemberText{Value: s},
+		}},
+	}
+}
+
+func stopEvent(reason types.StopReason) types.ConverseStreamOutput {
+	return &types.ConverseStreamOutputMemberMessageStop{Value: types.MessageStopEvent{StopReason: reason}}
+}
+
+// textStreamOutput is textOutput's streaming equivalent: a single text delta followed by
+// a normal end_turn stop, the shape every ImprovePromptInstructions test that just wants
+// "some rewritten text came back" uses. Every call site wants the same placeholder text,
+// unlike textOutput's varied call sites — no parameter to keep unparam happy about it.
+func textStreamOutput() []types.ConverseStreamOutput {
+	return []types.ConverseStreamOutput{textDeltaEvent("rewritten instructions"), stopEvent(types.StopReasonEndTurn)}
 }
 
 func textOutput(text string) *bedrockruntime.ConverseOutput {
@@ -592,6 +671,118 @@ func TestBuildImproveUserTurn_RendersPopulatedSections(t *testing.T) {
 	}
 }
 
+// TestBuildImproveUserTurn_RecurredExamplePrefixedAndClauseAdded checks two things a
+// recurring example (ExampleRef.Recurred) must trigger: the "[RECURRED]" line prefix
+// (formatExampleRefs) and the extra closing-goals clause telling the model a small edit
+// won't fix it. A non-recurred example in the same request must not get either.
+func TestBuildImproveUserTurn_RecurredExamplePrefixedAndClauseAdded(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches newsletters.",
+		ShouldMatch: []ExampleRef{
+			{Sender: "a@example.com", Subject: "Weekly digest", Excerpt: "top stories", Recurred: true},
+			{Sender: "z@example.com", Subject: "First time", Excerpt: "new problem"},
+		},
+	})
+	if !strings.Contains(turn, "[RECURRED] a@example.com") {
+		t.Errorf("expected the recurred example prefixed, got: %q", turn)
+	}
+	if strings.Contains(turn, "[RECURRED] z@example.com") {
+		t.Errorf("non-recurred example must not be prefixed, got: %q", turn)
+	}
+	if !strings.Contains(turn, "survived an earlier rewrite") {
+		t.Errorf("expected the recurred closing clause, got: %q", turn)
+	}
+}
+
+func TestBuildImproveUserTurn_NoRecurrenceOmitsClause(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches newsletters.",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "s", Excerpt: "e"}},
+	})
+	if strings.Contains(turn, "survived an earlier rewrite") {
+		t.Errorf("no example recurred, clause should be omitted, got: %q", turn)
+	}
+}
+
+// TestBuildImproveUserTurn_PastAttemptsSection checks the cross-session-memory section:
+// rendered between CURRENT and the example groups, only for attempts with evidence
+// (Total > 0), and omitted entirely when there's nothing to show.
+func TestBuildImproveUserTurn_PastAttemptsSection(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches promotional newsletters.",
+		PastAttempts: []AttemptRef{
+			{Instructions: "Matches newsletters.", Passed: 7, Total: 10},
+			{Instructions: "No evidence yet.", Passed: 0, Total: 0},
+		},
+	})
+	if !strings.Contains(turn, "PAST ATTEMPTS") {
+		t.Errorf("expected a PAST ATTEMPTS section, got: %q", turn)
+	}
+	if !strings.Contains(turn, `"Matches newsletters." -> scored 7/10`) {
+		t.Errorf("expected the attempt with evidence rendered, got: %q", turn)
+	}
+	if strings.Contains(turn, "No evidence yet.") {
+		t.Errorf("an attempt with Total=0 must be omitted, got: %q", turn)
+	}
+	if idx1, idx2 := strings.Index(turn, "PAST ATTEMPTS"), strings.Index(turn, "CURRENT:"); idx1 < idx2 {
+		t.Errorf("PAST ATTEMPTS must come after CURRENT, got: %q", turn)
+	}
+}
+
+func TestBuildImproveUserTurn_NoPastAttemptsOmitsSection(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{PromptName: "N", LabelName: "L", OriginalInstructions: "x"})
+	if strings.Contains(turn, "PAST ATTEMPTS") {
+		t.Errorf("expected no PAST ATTEMPTS section for a rule with no history, got: %q", turn)
+	}
+}
+
+func TestFormatAttempts(t *testing.T) {
+	t.Run("caps at maxAttemptLines and skips zero-evidence entries", func(t *testing.T) {
+		attempts := []AttemptRef{
+			{Instructions: "v1", Passed: 1, Total: 5},
+			{Instructions: "v2", Passed: 0, Total: 0}, // skipped: no evidence
+			{Instructions: "v3", Passed: 2, Total: 5},
+			{Instructions: "v4", Passed: 3, Total: 5},
+			{Instructions: "v5", Passed: 4, Total: 5}, // beyond the cap once v2 is skipped
+		}
+		got := formatAttempts(attempts)
+		if strings.Contains(got, "v2") {
+			t.Errorf("zero-evidence attempt should be skipped: %s", got)
+		}
+		if strings.Contains(got, "v5") {
+			t.Errorf("expected only %d attempts with evidence, v5 is the %dth: %s", maxAttemptLines, maxAttemptLines+1, got)
+		}
+		for _, want := range []string{"v1", "v3", "v4"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("expected %s in output: %s", want, got)
+			}
+		}
+	})
+
+	t.Run("truncates long instructions", func(t *testing.T) {
+		long := strings.Repeat("x", 300)
+		got := formatAttempts([]AttemptRef{{Instructions: long, Passed: 1, Total: 1}})
+		if strings.Contains(got, long) {
+			t.Errorf("expected the 300-char instructions truncated to 200, got the full text")
+		}
+		if !strings.Contains(got, strings.Repeat("x", 200)) {
+			t.Errorf("expected a 200-char prefix, got: %s", got)
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		if got := formatAttempts(nil); got != "" {
+			t.Errorf("formatAttempts(nil) = %q, want empty", got)
+		}
+	})
+}
+
 func TestExtractJSONObject(t *testing.T) {
 	cases := []struct {
 		name string
@@ -661,21 +852,21 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+			fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{textStreamOutput()}}
 			cl := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0", settings: c.settings}
 			_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
 				PromptName:           "newsletter",
 				LabelName:            "News",
 				OriginalInstructions: "matches newsletters",
 				ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
-			})
+			}, nil)
 			if err != nil {
 				t.Fatalf("ImprovePromptInstructions error: %v", err)
 			}
-			if len(fake.calls) != 1 {
-				t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+			if len(fake.streamCalls) != 1 {
+				t.Fatalf("expected exactly one ConverseStream call, got %d", len(fake.streamCalls))
 			}
-			got := fake.calls[0].ServiceTier
+			got := fake.streamCalls[0].ServiceTier
 			if c.wantFlex {
 				if got == nil || got.Type != types.ServiceTierTypeFlex {
 					t.Errorf("ServiceTier = %+v, want flex", got)
@@ -697,7 +888,7 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 // reasoning on" by turning it off, the opposite of what was asked.
 func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t *testing.T) {
 	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
-	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+	fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{textStreamOutput()}}
 	cl := &Client{br: fake, defaultModel: "nvidia.nemotron-nano-9b-v2", settings: settings}
 
 	_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
@@ -705,20 +896,20 @@ func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t
 		LabelName:            "News",
 		OriginalInstructions: "matches newsletters",
 		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("ImprovePromptInstructions error: %v", err)
 	}
-	if len(fake.calls) != 1 {
-		t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+	if len(fake.streamCalls) != 1 {
+		t.Fatalf("expected exactly one ConverseStream call, got %d", len(fake.streamCalls))
 	}
-	for _, block := range fake.calls[0].System {
+	for _, block := range fake.streamCalls[0].System {
 		if txt, ok := block.(*types.SystemContentBlockMemberText); ok && strings.Contains(txt.Value, "detailed thinking off") {
 			t.Errorf("system prompt contains the Nemotron suppression switch %q — an unsupported effort request must not invert into suppression", txt.Value)
 		}
 	}
-	if fake.calls[0].AdditionalModelRequestFields != nil {
-		t.Errorf("AdditionalModelRequestFields = %v, want nil (effort unsupported for this model, nothing should be sent)", fake.calls[0].AdditionalModelRequestFields)
+	if fake.streamCalls[0].AdditionalModelRequestFields != nil {
+		t.Errorf("AdditionalModelRequestFields = %v, want nil (effort unsupported for this model, nothing should be sent)", fake.streamCalls[0].AdditionalModelRequestFields)
 	}
 }
 
@@ -731,8 +922,13 @@ func TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression(t
 func TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields(t *testing.T) {
 	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
 	fake := &fakeConverseAPI{
-		outputs: []*bedrockruntime.ConverseOutput{nil, textOutput("rewritten instructions")},
-		errs:    []error{&types.ValidationException{Message: aws.String("unknown field reasoning_config")}, nil},
+		// The first ConverseStream call errors before any events are ever produced —
+		// exactly how a request-shape rejection like ValidationException actually arrives
+		// (Bedrock rejects the request before streaming starts), which is what lets the
+		// emitted-gate on the retry stay untested here and covered separately by
+		// TestImprovePromptInstructions_NoRetryAfterPartialStream below.
+		streamErrs:   []error{&types.ValidationException{Message: aws.String("unknown field reasoning_config")}, nil},
+		streamEvents: [][]types.ConverseStreamOutput{nil, textStreamOutput()},
 	}
 	cl := &Client{br: fake, defaultModel: "zai.glm-5", settings: settings}
 
@@ -741,24 +937,59 @@ func TestImprovePromptInstructions_ValidationExceptionRetriesWithoutFields(t *te
 		LabelName:            "News",
 		OriginalInstructions: "matches newsletters",
 		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("ImprovePromptInstructions error: %v, want the retry to succeed", err)
 	}
 	if text == "" {
 		t.Errorf("got empty rewritten instructions, want the second call's output")
 	}
-	if len(fake.calls) != 2 {
-		t.Fatalf("expected 2 Converse calls (initial + retry), got %d", len(fake.calls))
+	if len(fake.streamCalls) != 2 {
+		t.Fatalf("expected 2 ConverseStream calls (initial + retry), got %d", len(fake.streamCalls))
 	}
-	if fake.calls[0].AdditionalModelRequestFields == nil {
+	if fake.streamCalls[0].AdditionalModelRequestFields == nil {
 		t.Errorf("first call should have sent reasoning fields")
 	}
-	if fake.calls[1].AdditionalModelRequestFields != nil {
-		t.Errorf("retry call AdditionalModelRequestFields = %v, want nil (dropped after ValidationException)", fake.calls[1].AdditionalModelRequestFields)
+	if fake.streamCalls[1].AdditionalModelRequestFields != nil {
+		t.Errorf("retry call AdditionalModelRequestFields = %v, want nil (dropped after ValidationException)", fake.streamCalls[1].AdditionalModelRequestFields)
 	}
-	if got := aws.ToInt32(fake.calls[1].InferenceConfig.MaxTokens); got != 2048 {
+	if got := aws.ToInt32(fake.streamCalls[1].InferenceConfig.MaxTokens); got != 2048 {
 		t.Errorf("retry call MaxTokens = %d, want 2048 (reasoning fields dropped, so back to the tight non-reasoning ceiling)", got)
+	}
+}
+
+// TestImprovePromptInstructions_NoRetryAfterPartialStream guards the streaming-specific
+// half of the ValidationException retry gate: once any delta has already reached the
+// sink, a retry must not fire even if the stream then errors — the caller may already be
+// rendering a partial answer, and silently starting over would look like corrupted output,
+// not a clean retry. This can't happen for a real ValidationException (Bedrock rejects a
+// bad request field before streaming starts, see the test above) but the gate exists for
+// whatever mid-stream failure shape does surface this way, so it's tested directly against
+// a mid-stream Err() rather than assumed.
+func TestImprovePromptInstructions_NoRetryAfterPartialStream(t *testing.T) {
+	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
+	streamBroke := errors.New("connection reset mid-stream")
+	fake := &fakeConverseAPI{
+		streamEvents:  [][]types.ConverseStreamOutput{{textDeltaEvent("partial")}},
+		streamMidErrs: []error{streamBroke},
+	}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", settings: settings}
+
+	var got []StreamChunk
+	_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+		PromptName:           "newsletter",
+		LabelName:            "News",
+		OriginalInstructions: "matches newsletters",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+	}, func(c StreamChunk) { got = append(got, c) })
+	if !errors.Is(err, streamBroke) {
+		t.Fatalf("err = %v, want the mid-stream error surfaced (no retry to swallow it)", err)
+	}
+	if len(fake.streamCalls) != 1 {
+		t.Errorf("expected exactly one ConverseStream call — no retry after a partial stream, got %d", len(fake.streamCalls))
+	}
+	if len(got) != 1 || got[0].Text != "partial" {
+		t.Errorf("sink chunks = %+v, want exactly one Text=\"partial\" chunk", got)
 	}
 }
 
@@ -782,24 +1013,77 @@ func TestImprovePromptInstructions_MaxTokensFollowsReasoningState(t *testing.T) 
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{textOutput("rewritten instructions")}}
+			fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{textStreamOutput()}}
 			cl := &Client{br: fake, defaultModel: c.model, settings: c.settings}
 			_, _, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
 				PromptName:           "newsletter",
 				LabelName:            "News",
 				OriginalInstructions: "matches newsletters",
 				ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
-			})
+			}, nil)
 			if err != nil {
 				t.Fatalf("ImprovePromptInstructions error: %v", err)
 			}
-			if len(fake.calls) != 1 {
-				t.Fatalf("expected exactly one Converse call, got %d", len(fake.calls))
+			if len(fake.streamCalls) != 1 {
+				t.Fatalf("expected exactly one ConverseStream call, got %d", len(fake.streamCalls))
 			}
-			if got := aws.ToInt32(fake.calls[0].InferenceConfig.MaxTokens); got != c.want {
+			if got := aws.ToInt32(fake.streamCalls[0].InferenceConfig.MaxTokens); got != c.want {
 				t.Errorf("MaxTokens = %d, want %d", got, c.want)
 			}
 		})
+	}
+}
+
+// TestImprovePromptInstructions_StreamsAnswerAndReasoningSeparately checks the sink
+// contract end to end: answer deltas arrive as StreamChunk.Text, reasoning deltas arrive
+// as StreamChunk.Reasoning (never mixed into Text, never fed back into the returned
+// conversation), and the final returned suggestion is the sanitized concatenation of the
+// answer deltas only.
+func TestImprovePromptInstructions_StreamsAnswerAndReasoningSeparately(t *testing.T) {
+	fake := &fakeConverseAPI{
+		streamEvents: [][]types.ConverseStreamOutput{{
+			reasoningDeltaEvent("Let me think about this rule. "),
+			textDeltaEvent("Match "),
+			reasoningDeltaEvent("Yes, that covers it."),
+			textDeltaEvent("newsletters from any sender."),
+			stopEvent(types.StopReasonEndTurn),
+		}},
+	}
+	cl := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+
+	var chunks []StreamChunk
+	suggestion, conv, err := cl.ImprovePromptInstructions(context.Background(), ImproveRequest{
+		PromptName:           "newsletter",
+		LabelName:            "News",
+		OriginalInstructions: "matches newsletters",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+	}, func(c StreamChunk) { chunks = append(chunks, c) })
+	if err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v", err)
+	}
+
+	var textBuf, reasoningBuf strings.Builder
+	for _, c := range chunks {
+		textBuf.WriteString(c.Text)
+		reasoningBuf.WriteString(c.Reasoning)
+		if c.Text != "" && c.Reasoning != "" {
+			t.Errorf("chunk mixed Text and Reasoning in one delta: %+v", c)
+		}
+	}
+	gotText, gotReasoning := textBuf.String(), reasoningBuf.String()
+	if gotText != "Match newsletters from any sender." {
+		t.Errorf("accumulated Text = %q, want %q", gotText, "Match newsletters from any sender.")
+	}
+	if gotReasoning != "Let me think about this rule. Yes, that covers it." {
+		t.Errorf("accumulated Reasoning = %q, want the two reasoning deltas concatenated, got %q", gotReasoning, gotReasoning)
+	}
+	if suggestion != "Match newsletters from any sender." {
+		t.Errorf("suggestion = %q, want the answer text only (no reasoning)", suggestion)
+	}
+	for _, m := range conv {
+		if strings.Contains(m.Content, "think about this rule") {
+			t.Errorf("returned conversation leaked reasoning text: %+v", conv)
+		}
 	}
 }
 
@@ -926,7 +1210,7 @@ func (f *trackingConverseAPI) Converse(_ context.Context, _ *bedrockruntime.Conv
 	return textOutput(`{"1": true}`), nil
 }
 
-func (f *trackingConverseAPI) ConverseStream(_ context.Context, _ *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error) {
+func (f *trackingConverseAPI) ConverseStream(_ context.Context, _ *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error) {
 	return nil, errors.New("trackingConverseAPI: ConverseStream not implemented")
 }
 

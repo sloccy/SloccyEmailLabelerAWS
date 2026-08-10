@@ -139,6 +139,44 @@ func TestClaimPromptSuggestion_SecondClaimBlocked(t *testing.T) {
 	}
 }
 
+// TestMarkPromptSuggestionGenerating_ClearsClaimForRegenerate guards against a real bug:
+// MarkPromptSuggestionGenerating used to only SET status/updatedAt, never touching
+// claimedAt. Since ClaimPromptSuggestion's attribute_not_exists(claimedAt) condition only
+// ever succeeds once per id, every regenerate after the first would have its worker
+// invocation's claim silently lose, runOne would log "already claimed, skipping" and
+// return before its own deferred failure write is even registered, and the suggestion
+// would sit on "generating" until the 20-minute staleness flip — whose remedy text ("try
+// regenerating") would do nothing again. MarkPromptSuggestionGenerating must clear the
+// claim so a fresh round can win it.
+func TestMarkPromptSuggestionGenerating_ClearsClaimForRegenerate(t *testing.T) {
+	s := NewFake()
+	sid, err := s.InsertPromptSuggestion(t.Context(), InsertPromptSuggestionParams{
+		PromptID: 1, TriggerKind: TriggerKindFalseNegative, Status: SuggestionStatusGenerating,
+	})
+	if err != nil {
+		t.Fatalf("InsertPromptSuggestion: %v", err)
+	}
+
+	first, err := s.ClaimPromptSuggestion(t.Context(), sid)
+	if err != nil || !first {
+		t.Fatalf("first ClaimPromptSuggestion: claimed=%v err=%v", first, err)
+	}
+
+	// Simulate handlePromptSuggestionRegenerate: mark generating again before dispatching
+	// a fresh round.
+	if err := s.MarkPromptSuggestionGenerating(t.Context(), sid); err != nil {
+		t.Fatalf("MarkPromptSuggestionGenerating: %v", err)
+	}
+
+	second, err := s.ClaimPromptSuggestion(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("second ClaimPromptSuggestion: %v", err)
+	}
+	if !second {
+		t.Fatalf("expected the regenerate round to win a fresh claim, got blocked — MarkPromptSuggestionGenerating must clear claimedAt")
+	}
+}
+
 // TestClaimPromptSuggestion_DifferentSuggestionsIndependent checks that claiming one
 // suggestion doesn't block a claim on a different one — the condition is scoped to a
 // single item, not some shared state.

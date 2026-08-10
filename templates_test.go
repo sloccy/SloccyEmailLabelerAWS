@@ -2,9 +2,13 @@ package main
 
 import (
 	"html/template"
+	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sloccy/ollamail-aws/db"
+	"github.com/sloccy/ollamail-aws/llm"
 )
 
 func TestDict(t *testing.T) {
@@ -137,6 +141,120 @@ func TestFmtretention(t *testing.T) {
 			got := fmtretention(tc.days)
 			if got != tc.want {
 				t.Errorf("fmtretention(%d) = %q, want %q", tc.days, got, tc.want)
+			}
+		})
+	}
+}
+
+// ============================================================
+// Prompt suggestion fragments — render smoke tests
+// ============================================================
+//
+// html/template fails at *execution* time, not parse time, when a data shape doesn't
+// match what a template expects ({{.Foo}} on a struct with no Foo field, {{range .Items}}
+// against a bare slice, etc.) — exactly the kind of regression the suggestions-list
+// restructuring (suggestionsListView wrapping []suggestionView) and the detail view's new
+// live-trace branch could introduce silently. These render every status branch of both
+// fragments against loadTemplates()' real parsed set, so a shape mismatch fails a test
+// instead of a 500 in production.
+
+func mustLoadTemplates(t *testing.T) *template.Template {
+	t.Helper()
+	tmpl, err := loadTemplates()
+	if err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+	return tmpl
+}
+
+func TestPromptSuggestionsListTemplate_Renders(t *testing.T) {
+	tmpl := mustLoadTemplates(t)
+
+	cases := []struct {
+		name string
+		view suggestionsListView
+	}{
+		{"empty", suggestionsListView{PollEvery: "60s"}},
+		{"generating", suggestionsListView{PollEvery: "5s", Items: []suggestionView{
+			{ID: 1, PromptName: "Newsletters", TriggerKind: "false_negative", Status: "generating", EmailSubject: "Weekly digest", EmailSender: "a@example.com"},
+		}}},
+		{"pending", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
+			{ID: 2, PromptName: "Receipts", TriggerKind: "false_positive", Status: "pending", EmailSubject: "Order #1", EmailSender: "b@example.com"},
+		}}},
+		{"failed", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
+			{ID: 3, PromptName: "Spam", TriggerKind: "false_negative", Status: "failed", EmailSubject: "", EmailSender: "c@example.com"},
+		}}},
+		{"dismissed falls through to the else branch", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
+			{ID: 4, PromptName: "Spam", TriggerKind: "false_negative", Status: "dismissed"},
+		}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := tmpl.ExecuteTemplate(io.Discard, "prompt_suggestions_list.html", c.view); err != nil {
+				t.Errorf("execute: %v", err)
+			}
+		})
+	}
+}
+
+func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
+	tmpl := mustLoadTemplates(t)
+
+	base := suggestionView{
+		ID: 1, PromptName: "Newsletters", TriggerKind: "false_negative",
+		OriginalInstructions: "matches newsletters", EmailSubject: "Weekly digest", EmailSender: "a@example.com",
+	}
+
+	cases := []struct {
+		name string
+		view suggestionView
+	}{
+		{"generating: renders the live trace pane", func() suggestionView { v := base; v.Status = "generating"; return v }()},
+		{"pending: renders the regenerate form", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			return v
+		}()},
+		{"pending with replay results", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ReplayTotal, v.ReplayPassed, v.ReplayBaseline = 10, 8, 6
+			v.ReplayFailures = []llm.ReplayFailure{{Verdict: "false_positive", Sender: "x@example.com", Subject: "s", Got: true}}
+			return v
+		}()},
+		{"pending with example groups", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ExampleGroups = []suggestionExampleGroup{{Verdict: "false_negative", Label: "Missed it", Examples: []db.PromptExample{{Sender: "a@example.com", Subject: "s"}}}}
+			return v
+		}()},
+		{"pending with a multi-round trajectory", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ReplayTotal, v.ReplayPassed = 10, 9
+			v.BestRound = 2
+			v.Rounds = []db.SuggestionRoundSummary{
+				{N: 1, Candidate: "Match newsletters.", Passed: 7, Total: 10},
+				{N: 2, Candidate: "Match promotional newsletters.", Passed: 9, Total: 10},
+			}
+			return v
+		}()},
+		{"failed: renders the error text and retry form", func() suggestionView {
+			v := base
+			v.Status = "failed"
+			v.UserComment = "LLM error: timeout"
+			return v
+		}()},
+		{"dismissed: renders the terminal-status branch", func() suggestionView { v := base; v.Status = "dismissed"; return v }()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := tmpl.ExecuteTemplate(io.Discard, "prompt_suggestion_detail.html", c.view); err != nil {
+				t.Errorf("execute: %v", err)
 			}
 		})
 	}

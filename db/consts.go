@@ -23,6 +23,39 @@ const (
 	VerdictConfirmedPositive = "confirmed_positive"
 )
 
+// SuggestionTraceEvent kinds (see db/models.go's doc comment on SuggestionTraceEvent).
+// round_start/candidate/replay_start/replay_done/note/error/done are structural — they mark
+// a state change in the improve round and are flushed immediately by the trace writer.
+// answer/thinking are streamed deltas, coalesced before being written.
+const (
+	TraceKindRoundStart  = "round_start"
+	TraceKindAnswer      = "answer"
+	TraceKindThinking    = "thinking"
+	TraceKindCandidate   = "candidate"
+	TraceKindReplayStart = "replay_start"
+	TraceKindReplayDone  = "replay_done"
+	TraceKindNote        = "note"
+	TraceKindError       = "error"
+	TraceKindDone        = "done"
+)
+
+// PromptVersion.Source values (see db/models.go's doc comment on PromptVersion).
+const (
+	PromptVersionSourceInitial    = "initial"
+	PromptVersionSourceSuggestion = "suggestion"
+	PromptVersionSourceManual     = "manual"
+)
+
+// PromptExample.Source values (see db/models.go's doc comment on PromptExample). Distinct
+// from the PromptVersionSource* constants above — they describe different things (which
+// rule text was live vs. how this example's verdict was recorded) and happen to share the
+// word "manual" for an unrelated reason (a human did it), not because they're the same
+// concept.
+const (
+	ExampleSourceManual  = "manual"
+	ExampleSourcePassive = "passive"
+)
+
 // DynamoDB attribute names and expression placeholders reused across queries.
 const (
 	attrTTL       = "ttl"

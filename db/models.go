@@ -105,6 +105,56 @@ type Prompt struct {
 	SortOrder      int64  `dynamodbav:"sortOrder"`
 	StopProcessing int64  `dynamodbav:"stopProcessing"`
 	AccountID      *int64 `dynamodbav:"accountId"`
+
+	// CurrentVersionID is the PromptVersion.ID of this rule's live instructions text — 0
+	// for a prompt that predates the version ledger and hasn't been edited since. Kept
+	// denormalized here, rather than requiring a lookup into the PVER# partition, so
+	// stamping a PromptExample with "which rule text produced this verdict" (see
+	// PromptExample.PromptVersionID) costs zero extra reads on the hot classify path
+	// (processor.processEmail already loads this Prompt row for every match).
+	CurrentVersionID int64 `dynamodbav:"currentVersionId,omitempty"`
+}
+
+// PromptVersion is one historical text of a rule, plus what that text actually got wrong
+// while it was live — the improve loop's long-term memory (see improve.go's package doc
+// comment). Without this, every improve round starts from a blank slate and can re-propose
+// a phrasing that was already tried on this exact rule and already failed. Stored under
+// PK = PVER#<promptId>, SK = padID(id), no TTL — permanent, like PromptExample, since a
+// rule's edit history is exactly the kind of evidence that should never silently expire.
+// ID comes from the same atomic nextID counter every other low-write-volume entity in this
+// package uses (see InsertPromptVersion) — prompt edits happen a handful of times a week at
+// most, nowhere near the write volume localIDs exists to spare (PromptExample, history,
+// llm_debug).
+type PromptVersion struct {
+	ID           int64  `dynamodbav:"id"`
+	PromptID     int64  `dynamodbav:"promptId"`
+	CreatedAt    string `dynamodbav:"createdAt"`
+	Instructions string `dynamodbav:"instructions"`
+	// Source is one of the PromptVersionSource* constants (db/consts.go): "initial" (rule
+	// created), "suggestion" (an AI suggestion was applied), or "manual" (the user edited
+	// the rule text directly). Manual edits matter here as much as suggestions do — without
+	// them, a user's own fix would be invisible to a later improve round, which could then
+	// happily re-propose whatever the user just moved away from.
+	Source string `dynamodbav:"source"`
+	// SuggestionID is set only when Source is "suggestion" — the PromptSuggestion this
+	// version came from, for cross-referencing.
+	SuggestionID *int64 `dynamodbav:"suggestionId"`
+
+	// Replay evidence captured at the moment this version went live — copied from the
+	// winning PromptSuggestion round when Source is "suggestion"; zero-value (and
+	// meaningless — see ReplayTotal == 0 convention used elsewhere in this package) for
+	// "manual" and "initial", which have no replay score to carry.
+	ReplayModel  string `dynamodbav:"replayModel,omitempty"`
+	ReplayTotal  int64  `dynamodbav:"replayTotal,omitempty"`
+	ReplayPassed int64  `dynamodbav:"replayPassed,omitempty"`
+
+	// ObservedFP/ObservedFN accrue *after* this version went live, via
+	// IncrementVersionObserved — each false_positive/false_negative correction recorded
+	// while this was the current version adds one. This is what lets a later improve round
+	// see not just "how this version scored in the lab" (ReplayPassed/ReplayTotal) but "how
+	// it actually did in production."
+	ObservedFP int64 `dynamodbav:"observedFp,omitempty"`
+	ObservedFN int64 `dynamodbav:"observedFn,omitempty"`
 }
 
 // ExampleExcerptRunes bounds a PromptExample's stored body excerpt (via
@@ -152,6 +202,35 @@ type PromptExample struct {
 	// codebase's established nullable-pointer convention (see the package doc comment
 	// above and CategorizationHistory.PromptID/PromptSuggestion.CorrectionID).
 	ResolvedBySuggestionID *int64 `dynamodbav:"resolvedBySuggestionId"`
+
+	// PromptVersionID is the Prompt.CurrentVersionID that was live when this example was
+	// recorded — i.e. which rule text actually produced this verdict. omitempty (unlike
+	// ResolvedBySuggestionID above) rather than an explicit NULL: this field was added
+	// after ResolvedBySuggestionID's NULL convention was already established, and every
+	// existing example row predates it, so writing NULL retroactively would be
+	// indistinguishable from "explicitly no version" versus "not tracked yet" — omitting it
+	// keeps both cases reading as the same zero value.
+	PromptVersionID int64 `dynamodbav:"promptVersionId,omitempty"`
+
+	// Source is one of the ExampleSource* constants (db/consts.go): "manual" (a human
+	// reviewed this email during a recategorization and the verdict reflects their
+	// judgment) or "passive" (processor.processEmail auto-recorded a confirmed_positive on
+	// an ordinary match nobody has corrected — see this struct's package doc comment).
+	// omitempty, same reasoning as PromptVersionID: every row written before this field
+	// existed reads back as "", not a guessed value. sampleExamples (improve.go) prioritizes
+	// "manual" over "passive" when curating which examples the improver actually sees — a
+	// human's explicit confirmation is stronger signal than "nobody has complained yet,"
+	// especially for confirmed_positive, which passive confirmation writes on every match.
+	Source string `dynamodbav:"source,omitempty"`
+
+	// Recurred and RecurredFromVersion are computed at read time by markRecurrences
+	// (improve.go), never persisted (dynamodbav:"-"): true when an older, already-resolved
+	// example exists for the same message and verdict — i.e. a previous suggestion claimed
+	// to have fixed exactly this and the rule regressed. This is the signal that lets the
+	// improver see "already tried and failed" instead of treating a recurrence as a
+	// brand-new problem (see selectExamplesForPrompt's doc comment in improve.go).
+	Recurred            bool  `dynamodbav:"-"`
+	RecurredFromVersion int64 `dynamodbav:"-"`
 }
 
 // ResolvedExampleKey is enough to reconstruct one PromptExample's DynamoDB key
@@ -202,9 +281,60 @@ type PromptSuggestion struct {
 	// suggestion is applied (ApplyPromptSuggestionAndUpdatePrompt calls MarkExamplesResolved
 	// with the parsed keys) — never on dismiss, since nothing about the rule changed then.
 	ProblemExampleKeys string `dynamodbav:"problemExampleKeys,omitempty"`
+
+	// RoundsJSON is a JSON-encoded []SuggestionRoundSummary — one entry per improve->replay
+	// round the improve loop ran (improve.go), in order, so the detail view can show the
+	// trajectory and why the applied candidate (whichever round scored best, not
+	// necessarily the last) won. Kept deliberately lean — no per-round failure list, just
+	// the candidate text and its score — since it's carried on every FinalizePromptSuggestion
+	// write alongside EmailBodySnapshot, and RoundsRun/BestRound duplicate len(Rounds) and
+	// the winning index as plain attributes so the list/badge views don't need to parse
+	// this JSON just to show a count. Empty ("") for a suggestion generated before this
+	// field existed, or one that failed before completing a round.
+	RoundsJSON string `dynamodbav:"roundsJson,omitempty"`
+	RoundsRun  int64  `dynamodbav:"roundsRun,omitempty"`
+	BestRound  int64  `dynamodbav:"bestRound,omitempty"`
+}
+
+// SuggestionRoundSummary is one entry in PromptSuggestion.RoundsJSON: what one
+// improve->replay round produced and how it scored. Candidate is the full sanitized rule
+// text (not truncated) — a suggestion already stores one full rule text
+// (SuggestedInstructions) at the top level, so a handful more of the same size across a
+// bounded round count (ImproveMaxRoundsCap, llm/bedrock.go) isn't a meaningfully different
+// order of magnitude for one DynamoDB item.
+type SuggestionRoundSummary struct {
+	N         int    `json:"n"`
+	Candidate string `json:"candidate"`
+	Passed    int64  `json:"passed"`
+	Total     int64  `json:"total"`
 }
 
 type Setting struct {
 	Key   string
 	Value string
+}
+
+// SuggestionTraceEvent is one entry in a suggestion's live progress log — what the
+// improve worker is doing right now, for the "generating…" UI to poll and render instead
+// of showing a spinner with no information behind it. Append-only, written only by the
+// worker holding the suggestion's claim (see Store.ClaimPromptSuggestion), so Seq is
+// assigned from an in-process counter rather than the atomic nextIDs counter — there is
+// never a second writer to race with. Stored under PK = SUGG_TRACE#<suggestionId>,
+// SK = padID(seq), with a short TTL (traceTTLDays) — this is a debugging/watch artifact
+// whose value decays fast, not a permanent record like PromptExample or PromptSuggestion
+// itself.
+// json tags (alongside the dynamodbav tags every other model in this file uses) exist
+// because this struct, uniquely among them, is also served directly as JSON by the trace
+// endpoint (server.go) for the browser's polling loop to consume — the dynamodbav tag
+// only governs the DynamoDB wire format via attributevalue.MarshalMap/UnmarshalMap, so
+// json tags are additive, not a duplicate source of truth for the same encoding.
+type SuggestionTraceEvent struct {
+	Seq       int64  `dynamodbav:"seq" json:"seq"`
+	CreatedAt string `dynamodbav:"createdAt" json:"createdAt"`
+	// Kind is one of the db.TraceKind* constants.
+	Kind string `dynamodbav:"kind" json:"kind"`
+	// Round is the 1-based improve→replay round this event belongs to, 0 for an event
+	// that isn't scoped to a round (e.g. a top-level error before any round started).
+	Round int64  `dynamodbav:"round,omitempty" json:"round,omitempty"`
+	Text  string `dynamodbav:"text,omitempty" json:"text,omitempty"`
 }

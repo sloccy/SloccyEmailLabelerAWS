@@ -59,22 +59,49 @@ func singleRecategorizeVerdicts(currentIDs, requestedIDs map[int64]bool, addedID
 // buildPromptExamples turns a promptID->verdict map into example rows ready for
 // InsertPromptExamples. Every row from one recategorization shares the same email metadata
 // (account/message/sender/subject/excerpt/note) — they all describe the same underlying
-// correction, just from a different rule's point of view.
-func buildPromptExamples(accountID int64, messageID, sender, subject, excerpt, note string, verdicts map[int64]string) []db.PromptExample {
+// correction, just from a different rule's point of view. promptByID stamps each example
+// with the rule's CurrentVersionID — which text actually produced this verdict — so a
+// later improve round can attribute a recurring problem to the version that caused it (see
+// db.PromptExample.PromptVersionID/Recurred). A promptID missing from promptByID (shouldn't
+// happen — the caller builds it from the same prompts the verdict map was computed against)
+// just stamps 0, same as a pre-ledger example.
+// incrementVersionObservedFor updates each example's PromptVersion with what it actually
+// turned out to be — a false_positive/false_negative correction is one more piece of
+// production evidence against whatever rule text was live when the mismatched email came
+// in (see db.PromptVersion.ObservedFP/ObservedFN). confirmed_positive examples are skipped
+// by IncrementVersionObserved itself, not filtered here, so this can just iterate every
+// example unconditionally. Best-effort and fire-and-forget by design (matches
+// IncrementVersionObserved's own doc comment) — bookkeeping for a future improve round must
+// never be able to slow down or fail a correction the user is actively waiting on.
+func incrementVersionObservedFor(ctx context.Context, store versionObserver, examples []db.PromptExample) {
+	for _, ex := range examples {
+		store.IncrementVersionObserved(ctx, ex.PromptID, ex.PromptVersionID, ex.Verdict)
+	}
+}
+
+// versionObserver is the one method incrementVersionObservedFor needs — declared locally
+// so a test can supply a trivial fake without pulling in the rest of db.Store's surface.
+type versionObserver interface {
+	IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string)
+}
+
+func buildPromptExamples(accountID int64, messageID, sender, subject, excerpt, note string, verdicts map[int64]string, promptByID map[int64]db.Prompt) []db.PromptExample {
 	if len(verdicts) == 0 {
 		return nil
 	}
 	examples := make([]db.PromptExample, 0, len(verdicts))
 	for promptID, verdict := range verdicts {
 		examples = append(examples, db.PromptExample{
-			PromptID:    promptID,
-			AccountID:   accountID,
-			MessageID:   messageID,
-			Verdict:     verdict,
-			Sender:      sender,
-			Subject:     subject,
-			BodyExcerpt: excerpt,
-			Note:        note,
+			PromptID:        promptID,
+			AccountID:       accountID,
+			MessageID:       messageID,
+			Verdict:         verdict,
+			Sender:          sender,
+			Subject:         subject,
+			BodyExcerpt:     excerpt,
+			Note:            note,
+			PromptVersionID: promptByID[promptID].CurrentVersionID,
+			Source:          db.ExampleSourceManual,
 		})
 	}
 	return examples
@@ -224,10 +251,11 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 			subject = row.Subject
 		}
 		examples := buildPromptExamples(row.AccountID, row.MessageID, sender, subject,
-			gmail.CollapseExcerpt(msg.Body, db.ExampleExcerptRunes), note, verdicts)
+			gmail.CollapseExcerpt(msg.Body, db.ExampleExcerptRunes), note, verdicts, promptByID)
 		if err := s.store.InsertPromptExamples(ctx, examples); err != nil {
 			slog.Error("recategorize: insert prompt examples", "err", err)
 		}
+		incrementVersionObservedFor(ctx, s.store, examples)
 	}
 
 	// Rewrite history so it mirrors the post-correction labeling state

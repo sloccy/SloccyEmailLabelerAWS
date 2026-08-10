@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -557,5 +558,275 @@ func TestSuggestionRoundTrip_ProblemExampleKeys(t *testing.T) {
 	got := unmarshalItem[PromptSuggestion](item)
 	if got != want {
 		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestSuggestionRoundTrip_RoundsJSON checks PromptSuggestion.RoundsJSON/RoundsRun/BestRound
+// — the improve loop's (improve.go) trajectory fields — round-trip through
+// MarshalMap/UnmarshalMap. RoundsJSON itself is an opaque string as far as DynamoDB is
+// concerned (same treatment as ProblemExampleKeys/ReplayFailures above); the JSON shape
+// []SuggestionRoundSummary encodes/decodes is exercised separately below.
+func TestSuggestionRoundTrip_RoundsJSON(t *testing.T) {
+	want := PromptSuggestion{
+		ID: 9, PromptID: 5, Status: "pending",
+		RoundsJSON: `[{"n":1,"candidate":"Match newsletters.","passed":7,"total":10},{"n":2,"candidate":"Match promotional newsletters.","passed":9,"total":10}]`,
+		RoundsRun:  2,
+		BestRound:  2,
+	}
+	item := mustMarshalMap(want)
+	got := unmarshalItem[PromptSuggestion](item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestSuggestionRoundTrip_RoundsFieldsOmittedWhenZero mirrors
+// TestSuggestionRoundTrip_ReplayFieldsOmittedWhenZero: a suggestion that never ran the
+// improve loop's trajectory tracking (single-round, or generated before these fields
+// existed) must omit the attributes entirely rather than write explicit zero values.
+func TestSuggestionRoundTrip_RoundsFieldsOmittedWhenZero(t *testing.T) {
+	item := mustMarshalMap(PromptSuggestion{ID: 1, PromptID: 5, Status: "pending"})
+	for _, attr := range []string{"roundsJson", "roundsRun", "bestRound"} {
+		if _, ok := item[attr]; ok {
+			t.Errorf("%s attribute present with zero value, want omitted", attr)
+		}
+	}
+}
+
+func TestSuggestionRoundSummaryJSON_RoundTrips(t *testing.T) {
+	want := []SuggestionRoundSummary{
+		{N: 1, Candidate: "Match newsletters.", Passed: 7, Total: 10},
+		{N: 2, Candidate: "Match promotional newsletters.", Passed: 9, Total: 10},
+	}
+	b, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got []SuggestionRoundSummary
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("round %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// ============================================================
+// SuggestionTraceEvent
+// ============================================================
+
+// TestSuggestionTraceEventRoundTrip checks the wire format suggestionTraceItem/
+// ListSuggestionTrace depend on: PK scoped to the suggestion, SK a zero-padded seq (so
+// string sort order matches numeric seq order for the SK > :after cursor query), and every
+// field surviving the round trip.
+func TestSuggestionTraceEventRoundTrip(t *testing.T) {
+	want := SuggestionTraceEvent{
+		Seq: 3, CreatedAt: "2026-07-01 12:00:00", Kind: TraceKindAnswer, Round: 1, Text: "Match newsletters",
+	}
+	item := suggestionTraceItem(42, want)
+
+	if got, ok := item["PK"].(*types.AttributeValueMemberS); !ok || got.Value != "SUGG_TRACE#42" {
+		t.Errorf("PK = %v, want SUGG_TRACE#42", item["PK"])
+	}
+	wantSK := "00000000000000000003"
+	if got, ok := item["SK"].(*types.AttributeValueMemberS); !ok || got.Value != wantSK {
+		t.Errorf("SK = %v, want %q", item["SK"], wantSK)
+	}
+	if _, ok := item["ttl"]; !ok {
+		t.Error("ttl attribute missing; trace items must expire (traceTTLDays)")
+	}
+
+	got := unmarshalItem[SuggestionTraceEvent](item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestSuggestionTraceEventRoundTrip_SKOrdersBySeq guards the property the cursor query
+// (ListSuggestionTrace's "SK > :after") depends on: zero-padded seq strings must sort in
+// the same order as the underlying int64 seq, including across the 9->10 digit-count
+// boundary where naive string comparison would get it backwards.
+func TestSuggestionTraceEventRoundTrip_SKOrdersBySeq(t *testing.T) {
+	seqs := []int64{1, 2, 9, 10, 11, 100}
+	var prevSK string
+	for i, seq := range seqs {
+		item := suggestionTraceItem(1, SuggestionTraceEvent{Seq: seq, Kind: TraceKindNote})
+		skAttr, ok := item["SK"].(*types.AttributeValueMemberS)
+		if !ok {
+			t.Fatalf("seq %d: SK attribute type = %T, want *types.AttributeValueMemberS", seq, item["SK"])
+		}
+		sk := skAttr.Value
+		if i > 0 && sk <= prevSK {
+			t.Errorf("seq %d: SK %q did not sort after previous SK %q", seq, sk, prevSK)
+		}
+		prevSK = sk
+	}
+}
+
+// TestSuggestionTraceEventRoundTrip_OmitsEmptyRoundAndText checks that a structural event
+// with no round (e.g. a top-level error before any round started) and no text omits both
+// attributes rather than writing zero values — matching this package's established
+// omitempty convention for fields that are meaningful only sometimes.
+func TestSuggestionTraceEventRoundTrip_OmitsEmptyRoundAndText(t *testing.T) {
+	item := suggestionTraceItem(1, SuggestionTraceEvent{Seq: 1, Kind: TraceKindError})
+	if _, ok := item["round"]; ok {
+		t.Errorf("round attribute present with zero value, want omitted")
+	}
+	if _, ok := item["text"]; ok {
+		t.Errorf("text attribute present with zero value, want omitted")
+	}
+}
+
+// ============================================================
+// Prompt.CurrentVersionID / PromptExample.PromptVersionID
+// ============================================================
+
+// TestPromptRoundTrip_CurrentVersionID checks the field InsertPromptVersion writes and
+// every classify-path read of a Prompt depends on for zero-extra-read example stamping
+// (see PromptExample.PromptVersionID's doc comment) survives the round trip.
+func TestPromptRoundTrip_CurrentVersionID(t *testing.T) {
+	p := Prompt{ID: 1, Name: "Newsletters", Instructions: "x", Active: 1, CreatedAt: "2026-07-01 00:00:00", CurrentVersionID: 7}
+	item := promptToItem(p)
+	got := itemToPrompt(item)
+	if got != p {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, p)
+	}
+}
+
+// TestPromptRoundTrip_CurrentVersionIDOmittedWhenZero checks a prompt that predates the
+// version ledger (or has never been edited since) omits the attribute entirely, matching
+// this codebase's omitempty convention for "not tracked" rather than "explicitly zero."
+func TestPromptRoundTrip_CurrentVersionIDOmittedWhenZero(t *testing.T) {
+	item := promptToItem(Prompt{ID: 1, Name: "N", Instructions: "x", Active: 1, CreatedAt: "2026-07-01 00:00:00"})
+	if _, ok := item["currentVersionId"]; ok {
+		t.Errorf("currentVersionId attribute present with zero value, want omitted")
+	}
+}
+
+// TestPromptExampleRoundTrip_PromptVersionID checks the field buildPromptExamples
+// (recategorize.go) and processor.processEmail's passive confirmation both stamp survives
+// the round trip, and that Recurred/RecurredFromVersion — computed at read time by
+// markRecurrences, never persisted (dynamodbav:"-") — are excluded from the wire format
+// entirely rather than round-tripping as false/0 by coincidence.
+func TestPromptExampleRoundTrip_PromptVersionID(t *testing.T) {
+	want := PromptExample{
+		ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalseNegative,
+		Sender: "a@example.com", Subject: "s", PromptVersionID: 12,
+	}
+	item := promptExampleItem(want)
+	if _, ok := item["recurred"]; ok {
+		t.Error("recurred must never be written to DynamoDB (dynamodbav:\"-\")")
+	}
+	got := itemToPromptExample(item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+func TestPromptExampleRoundTrip_PromptVersionIDOmittedWhenZero(t *testing.T) {
+	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive})
+	if _, ok := item["promptVersionId"]; ok {
+		t.Errorf("promptVersionId attribute present with zero value, want omitted")
+	}
+}
+
+// TestPromptExampleRoundTrip_Source checks the field buildPromptExamples
+// (recategorize.go, "manual") and processor.processEmail's passive confirmation
+// ("passive") stamp survives the round trip — sampleExamples (improve.go) prioritizes
+// "manual" over "passive"/empty when curating which examples the improver sees.
+func TestPromptExampleRoundTrip_Source(t *testing.T) {
+	want := PromptExample{
+		ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedPositive,
+		Sender: "a@example.com", Subject: "s", Source: ExampleSourceManual,
+	}
+	item := promptExampleItem(want)
+	got := itemToPromptExample(item)
+	if got != want {
+		t.Errorf("round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// TestPromptExampleRoundTrip_SourceOmittedWhenEmpty checks a row written before Source
+// tracking existed reads back as "", not an error or a guessed value — every existing
+// example in the live table predates this field.
+func TestPromptExampleRoundTrip_SourceOmittedWhenEmpty(t *testing.T) {
+	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive})
+	if _, ok := item["source"]; ok {
+		t.Errorf("source attribute present with zero value, want omitted")
+	}
+	got := itemToPromptExample(item)
+	if got.Source != "" {
+		t.Errorf("Source = %q, want empty for a pre-existing row", got.Source)
+	}
+}
+
+// ============================================================
+// PromptVersion
+// ============================================================
+
+func TestPromptVersionRoundTrip(t *testing.T) {
+	sid := int64(99)
+	want := PromptVersion{
+		ID: 3, PromptID: 5, CreatedAt: "2026-07-01 12:00:00",
+		Instructions: "Match promotional newsletters.",
+		Source:       PromptVersionSourceSuggestion,
+		SuggestionID: &sid,
+		ReplayModel:  "us.amazon.nova-micro-v1:0",
+		ReplayTotal:  10,
+		ReplayPassed: 9,
+		ObservedFP:   2,
+		ObservedFN:   1,
+	}
+	item := keyedItem(want, pkPromptVersion(want.PromptID), padID(want.ID), 0)
+
+	if got, ok := item["PK"].(*types.AttributeValueMemberS); !ok || got.Value != "PVER#5" {
+		t.Errorf("PK = %v, want PVER#5", item["PK"])
+	}
+	if _, ok := item[attrTTL]; ok {
+		t.Error("PromptVersion must have no TTL (permanent, like PromptExample)")
+	}
+
+	got := unmarshalItem[PromptVersion](item)
+	if got.SuggestionID == nil || *got.SuggestionID != sid {
+		t.Fatalf("SuggestionID = %v, want %d", got.SuggestionID, sid)
+	}
+	got.SuggestionID, want.SuggestionID = nil, nil
+	if got != want {
+		t.Errorf("round trip mismatch (excluding SuggestionID, checked above): got %+v, want %+v", got, want)
+	}
+}
+
+// TestPromptVersionRoundTrip_ManualHasNoSuggestionID checks a manual-edit version (no
+// PromptSuggestion behind it) marshals SuggestionID as an explicit NULL, matching this
+// codebase's established nullable-pointer convention (see db/models.go's package doc
+// comment) rather than omitting it.
+func TestPromptVersionRoundTrip_ManualHasNoSuggestionID(t *testing.T) {
+	item := keyedItem(PromptVersion{ID: 1, PromptID: 5, Source: PromptVersionSourceManual}, pkPromptVersion(5), padID(1), 0)
+	if _, ok := item["suggestionId"]; !ok {
+		t.Error("suggestionId attribute missing; want explicit NULL")
+	}
+	if _, isNull := item["suggestionId"].(*types.AttributeValueMemberNULL); !isNull {
+		t.Errorf("suggestionId = %T, want NULL", item["suggestionId"])
+	}
+	got := unmarshalItem[PromptVersion](item)
+	if got.SuggestionID != nil {
+		t.Errorf("SuggestionID = %v, want nil", got.SuggestionID)
+	}
+}
+
+// TestPromptVersionRoundTrip_ReplayAndObservedOmittedWhenZero checks an "initial" or
+// "manual" version (no replay evidence, and no production corrections observed yet) omits
+// all five numeric fields rather than writing explicit zeros.
+func TestPromptVersionRoundTrip_ReplayAndObservedOmittedWhenZero(t *testing.T) {
+	item := keyedItem(PromptVersion{ID: 1, PromptID: 5, Source: PromptVersionSourceInitial}, pkPromptVersion(5), padID(1), 0)
+	for _, attr := range []string{"replayModel", "replayTotal", "replayPassed", "observedFp", "observedFn"} {
+		if _, ok := item[attr]; ok {
+			t.Errorf("%s attribute present with zero value, want omitted", attr)
+		}
 	}
 }

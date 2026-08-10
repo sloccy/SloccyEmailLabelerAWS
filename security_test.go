@@ -28,6 +28,8 @@ func TestSecurityMiddleware(t *testing.T) {
 		{"cross-site delete rejected", http.MethodDelete, "/api/accounts/1", "cross-site", http.StatusForbidden},
 		{"cross-site generate-stream GET rejected", http.MethodGet, "/api/prompts/generate-stream", "cross-site", http.StatusForbidden},
 		{"same-origin generate-stream GET passes", http.MethodGet, "/api/prompts/generate-stream", "same-origin", http.StatusOK},
+		{"cross-site suggestion trace GET rejected", http.MethodGet, "/fragments/prompt-suggestions/1/trace", "cross-site", http.StatusForbidden},
+		{"same-origin suggestion trace GET passes", http.MethodGet, "/fragments/prompt-suggestions/1/trace", "same-origin", http.StatusOK},
 	}
 
 	for _, tc := range cases {

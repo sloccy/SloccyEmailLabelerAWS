@@ -44,7 +44,30 @@
           <input class="form-check-input" type="checkbox" role="switch" name="improve_replay" id="improve-replay-toggle"{{if .ImproveReplay}} checked{{end}}>
           <label class="form-check-label fw-medium" for="improve-replay-toggle">Validate suggestions against example history</label>
         </div>
-        <div class="small text-muted mt-1">Before showing an AI-suggested rule rewrite, replay it against the rule's stored example corpus using the <strong>classification</strong> model (never the improver) and show a pass rate — e.g. "27/30 correct". Adds a classify call per stored example (up to ~30), fanned out concurrently, each time a suggestion is generated or regenerated; costs a fraction of a cent per suggestion on Nova Micro, more on a pricier classification model.</div>
+        <div class="small text-muted mt-1">Before showing an AI-suggested rule rewrite, replay it against the rule's stored example corpus using the <strong>classification</strong> model (never the improver) and show a pass rate — e.g. "27/30 correct". Adds one classify call per example in the validation sample below (fanned out concurrently), each time a suggestion is generated or regenerated; costs a fraction of a cent per suggestion on Nova Micro, more on a pricier classification model.</div>
+      </div>
+      <div class="py-3 px-4 border-bottom setting-row">
+        <div class="fw-medium">Improve rounds</div>
+        <div class="small text-muted mt-1">How many improve&rarr;validate rounds one suggestion may run: after the first draft, if validation found mistakes, the improver sees exactly what it got wrong and tries again — up to this many rounds, stopping early on a perfect score or a round that doesn't beat the best one so far. Each extra round costs one more improve call plus a full validation pass. Has no effect while validation above is off — with nothing to score, only one round ever runs.</div>
+        <select class="form-select form-select-sm mt-2" name="improve_max_rounds" style="max-width:120px;">
+          {{range .ImproveMaxRoundsOptions}}
+          <option value="{{.}}"{{if eq . $.ImproveMaxRounds}} selected{{end}}>{{.}}</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="py-3 px-4 border-bottom setting-row">
+        <div class="fw-medium">Example sample sizes</div>
+        <div class="small text-muted mt-1">How many examples per verdict (missed it / wrongly caught / already correct) are curated from a rule's full history. Selection prioritizes examples that recurred after an earlier fix, then ones a human manually reviewed, then everything else — spread across senders rather than just the newest few. The improve set is what the AI rewrite prompt itself sees (small, since it costs prompt tokens); the validation set is what it's scored against afterward (larger is fine — it only costs classify calls, not tokens, and gives a much less noisy pass rate).</div>
+        <div class="d-flex gap-3 mt-2 flex-wrap">
+          <label class="small">Improve set
+            <input type="number" class="form-control form-control-sm" name="improve_example_cap"
+              min="1" max="{{.ImproveExampleCapMax}}" value="{{.ImproveExampleCap}}" style="max-width:90px;">
+          </label>
+          <label class="small">Validation set
+            <input type="number" class="form-control form-control-sm" name="replay_example_cap"
+              min="1" max="{{.ReplayExampleCapMax}}" value="{{.ReplayExampleCap}}" style="max-width:90px;">
+          </label>
+        </div>
       </div>
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Prompt improver reasoning effort</div>

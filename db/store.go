@@ -1023,20 +1023,34 @@ func (s *Store) CreatePrompt(ctx context.Context, arg CreatePromptParams) (int64
 	if err != nil {
 		return 0, err
 	}
+	// Mint the initial version before the row's own PutItem below, so that write can carry
+	// the resulting CurrentVersionID directly instead of leaving a window where the prompt
+	// exists with no current version — see InsertPromptVersion's doc comment on why minting
+	// against a prompt row that doesn't exist yet here is safe (a sparse write immediately
+	// superseded by the full PutItem). Best-effort: a failure here is logged, not returned —
+	// it must not block creating the rule itself, and CurrentVersionID simply stays 0, same
+	// as any prompt that predates the version ledger.
+	versionID, verr := s.InsertPromptVersion(ctx, InsertPromptVersionParams{
+		PromptID: id, Instructions: arg.Instructions, Source: PromptVersionSourceInitial,
+	})
+	if verr != nil {
+		slog.Error("create prompt: insert initial version", "prompt_id", id, "err", verr)
+	}
 	p := Prompt{
-		ID:             id,
-		Name:           arg.Name,
-		Instructions:   arg.Instructions,
-		LabelName:      arg.LabelName,
-		Active:         1,
-		CreatedAt:      Now(),
-		ActionArchive:  arg.ActionArchive,
-		ActionSpam:     arg.ActionSpam,
-		ActionTrash:    arg.ActionTrash,
-		ActionMarkRead: arg.ActionMarkRead,
-		SortOrder:      arg.SortOrder,
-		StopProcessing: arg.StopProcessing,
-		AccountID:      nullInt64Ptr(arg.AccountID),
+		ID:               id,
+		Name:             arg.Name,
+		Instructions:     arg.Instructions,
+		LabelName:        arg.LabelName,
+		Active:           1,
+		CreatedAt:        Now(),
+		ActionArchive:    arg.ActionArchive,
+		ActionSpam:       arg.ActionSpam,
+		ActionTrash:      arg.ActionTrash,
+		ActionMarkRead:   arg.ActionMarkRead,
+		SortOrder:        arg.SortOrder,
+		StopProcessing:   arg.StopProcessing,
+		AccountID:        nullInt64Ptr(arg.AccountID),
+		CurrentVersionID: versionID,
 	}
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
@@ -1050,6 +1064,7 @@ func (s *Store) UpdatePrompt(ctx context.Context, arg UpdatePromptParams) error 
 	if err != nil {
 		return err
 	}
+	instructionsChanged := p.Instructions != arg.Instructions
 	p.Name = arg.Name
 	p.Instructions = arg.Instructions
 	p.LabelName = arg.LabelName
@@ -1059,17 +1074,27 @@ func (s *Store) UpdatePrompt(ctx context.Context, arg UpdatePromptParams) error 
 	p.ActionMarkRead = arg.ActionMarkRead
 	p.StopProcessing = arg.StopProcessing
 	p.AccountID = nullInt64Ptr(arg.AccountID)
+	if instructionsChanged {
+		// Only mint a version when the rule text itself changed — not on every edit
+		// (renaming the rule, changing its actions, moving accounts). Mint before the
+		// PutItem below, same reasoning as CreatePrompt, so this write carries the fresh
+		// CurrentVersionID directly rather than a separate trailing write. Best-effort:
+		// a failure here must not block a user-requested edit; CurrentVersionID just stays
+		// wherever it was, matching CreatePrompt's failure handling above.
+		versionID, verr := s.InsertPromptVersion(ctx, InsertPromptVersionParams{
+			PromptID: arg.ID, Instructions: arg.Instructions, Source: PromptVersionSourceManual,
+		})
+		if verr != nil {
+			slog.Error("update prompt: insert version", "prompt_id", arg.ID, "err", verr)
+		} else {
+			p.CurrentVersionID = versionID
+		}
+	}
 	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.table),
 		Item:      promptToItem(p),
 	})
 	return err
-}
-
-func (s *Store) UpdatePromptInstructions(ctx context.Context, arg UpdatePromptInstructionsParams) error {
-	return s.updateItem(ctx, "PROMPT", padID(arg.ID), "SET instructions = :i", nil, map[string]types.AttributeValue{
-		":i": sv(arg.Instructions),
-	})
 }
 
 // DeletePrompt removes the prompt itself and its example corpus (DeleteExamplesForPrompt) —
@@ -1110,6 +1135,124 @@ func (s *Store) DeletePromptsByAccount(ctx context.Context, accountID sql.NullIn
 		}
 	}
 	return s.batchDelete(ctx, keys)
+}
+
+// ============================================================
+// Prompt versions (improve loop's long-term memory)
+// ============================================================
+//
+// See PromptVersion's doc comment (db/models.go) for the schema and why manual edits are
+// versioned exactly like applied suggestions. Every write path that changes a Prompt's
+// Instructions — CreatePrompt (source "initial"), ApplyPromptSuggestionAndUpdatePrompt
+// (source "suggestion"), and UpdatePrompt (source "manual", only when Instructions
+// actually changed) — mints a version through InsertPromptVersion, which is also what
+// actually writes the new text onto the prompt row; there is no separate
+// "just update instructions" path anymore.
+
+func pkPromptVersion(promptID int64) string { return fmt.Sprintf("PVER#%d", promptID) }
+
+// InsertPromptVersionParams captures what a version records at creation — see
+// PromptVersion's doc comment for what each field means.
+type InsertPromptVersionParams struct {
+	PromptID     int64
+	Instructions string
+	Source       string
+	SuggestionID *int64
+	ReplayModel  string
+	ReplayTotal  int64
+	ReplayPassed int64
+}
+
+// InsertPromptVersion mints a new PromptVersion row and writes its text onto the prompt
+// row as the new live instructions, pointing CurrentVersionID at the version that produced
+// them — this is the only place either write happens, and the only place a prompt's
+// Instructions ever changes. Not transactional (same non-transactional, best-effort-
+// ordered pattern every other multi-step write in this package uses, e.g.
+// ApplyPromptSuggestionAndUpdatePrompt): a failure between the two calls leaves an
+// orphaned version row, which is harmless, rather than risking the reverse (a prompt
+// pointing at a version that was never written). Safe to call on a prompt row that doesn't
+// exist yet (CreatePrompt calls this before its own PutItem) — the resulting sparse
+// UpdateItem write is immediately superseded by that PutItem.
+func (s *Store) InsertPromptVersion(ctx context.Context, arg InsertPromptVersionParams) (int64, error) {
+	id, err := s.nextID(ctx, "prompt_versions")
+	if err != nil {
+		return 0, err
+	}
+	item := keyedItem(PromptVersion{
+		ID:           id,
+		PromptID:     arg.PromptID,
+		CreatedAt:    Now(),
+		Instructions: arg.Instructions,
+		Source:       arg.Source,
+		SuggestionID: arg.SuggestionID,
+		ReplayModel:  arg.ReplayModel,
+		ReplayTotal:  arg.ReplayTotal,
+		ReplayPassed: arg.ReplayPassed,
+	}, pkPromptVersion(arg.PromptID), padID(id), 0)
+	if _, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(s.table), Item: item}); err != nil {
+		return 0, err
+	}
+	if err := s.updateItem(ctx, "PROMPT", padID(arg.PromptID), "SET currentVersionId = :v, instructions = :i", nil,
+		map[string]types.AttributeValue{":v": nv(id), ":i": sv(arg.Instructions)}); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ListPromptVersions returns a prompt's version history, newest first, capped at limit —
+// the improve loop's source for "earlier attempts" context (see improve.go's
+// attemptsForPrompt). Uses ddb.Query directly rather than queryAll, same reasoning as
+// ListExamplesByVerdict: a bounded read stays cheap regardless of how long a rule's edit
+// history grows.
+func (s *Store) ListPromptVersions(ctx context.Context, promptID int64, limit int32) ([]PromptVersion, error) {
+	out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkPromptVersion(promptID)),
+		},
+		ScanIndexForward: aws.Bool(false),
+		Limit:            aws.Int32(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]PromptVersion, len(out.Items))
+	for i, it := range out.Items {
+		result[i] = unmarshalItem[PromptVersion](it)
+	}
+	return result, nil
+}
+
+// IncrementVersionObserved adds one to a version's ObservedFP or ObservedFN count — called
+// when a recategorization records a false_positive/false_negative example, using the
+// version that was live at the time (db.PromptExample.PromptVersionID). This is what lets
+// a later improve round see not just how a version scored in the replay "lab" but how it
+// actually did once real mail started arriving against it. versionID == 0 (an example
+// written before the ledger existed, or against a prompt that predates it) is a silent
+// no-op, not an error — there's nothing to attribute it to. verdict must be
+// VerdictFalsePositive or VerdictFalseNegative; anything else (VerdictConfirmedPositive) is
+// also a no-op, since a confirmation isn't a problem to track here. Best-effort, same
+// reasoning MarkExamplesResolved's own doc comment gives: this is bookkeeping for a future
+// improve round, not the primary effect of recording a correction, so it must never be
+// able to block one.
+func (s *Store) IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string) {
+	if versionID == 0 {
+		return
+	}
+	var attr string
+	switch verdict {
+	case VerdictFalsePositive:
+		attr = "observedFp"
+	case VerdictFalseNegative:
+		attr = "observedFn"
+	default:
+		return
+	}
+	if err := s.updateItem(ctx, pkPromptVersion(promptID), padID(versionID),
+		"ADD "+attr+" :one", nil, map[string]types.AttributeValue{":one": nv(1)}); err != nil {
+		slog.Error("increment version observed", "prompt_id", promptID, "version_id", versionID, "verdict", verdict, "err", err)
+	}
 }
 
 func (s *Store) TogglePrompt(ctx context.Context, id int64) (int64, error) {
@@ -2374,7 +2517,7 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 	return s.updateItem(ctx, "SUGGESTION", padID(arg.ID),
 		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua, "+
 			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayFailures = :rf, "+
-			"problemExampleKeys = :pk",
+			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br",
 		map[string]string{"#s": attrStatus},
 		map[string]types.AttributeValue{
 			":si":         sv(arg.SuggestedInstructions),
@@ -2388,6 +2531,9 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			":rb":         nv(arg.ReplayBaseline),
 			":rf":         sv(arg.ReplayFailures),
 			":pk":         sv(arg.ProblemExampleKeys),
+			":rj":         sv(arg.RoundsJSON),
+			":rr":         nv(arg.RoundsRun),
+			":br":         nv(arg.BestRound),
 		})
 }
 
@@ -2422,8 +2568,21 @@ func (s *Store) ApplyPromptSuggestion(ctx context.Context, id int64) error {
 // regenerate kicks off a fresh (now asynchronous) improve+replay round in the background,
 // so the detail page immediately shows the same spinner state it uses for a brand-new
 // suggestion instead of the stale previous instructions while Bedrock runs.
+//
+// Must REMOVE claimedAt, not just SET status — this cannot share setSuggestionStatus's
+// plain SET expression. ClaimPromptSuggestion's attribute_not_exists(claimedAt) condition
+// only ever succeeds once per id; without clearing it here, every regenerate after the
+// first would have its worker invocation's claim fail, runOne would log "already claimed,
+// skipping" and return before its deferred failure write is even registered, and the
+// suggestion would sit on "generating" until generatingStaleAfter's 20-minute read-side
+// flip — whose own remedy text ("try regenerating") would silently do nothing again.
 func (s *Store) MarkPromptSuggestionGenerating(ctx context.Context, id int64) error {
-	return s.setSuggestionStatus(ctx, id, SuggestionStatusGenerating)
+	return s.updateItem(ctx, "SUGGESTION", padID(id), "SET #s = :st, updatedAt = :ua REMOVE "+attrClaimedAt,
+		map[string]string{"#s": attrStatus},
+		map[string]types.AttributeValue{
+			exprStatus:    sv(SuggestionStatusGenerating),
+			exprUpdatedAt: sv(Now()),
+		})
 }
 
 func (s *Store) DismissPromptSuggestion(ctx context.Context, id int64) error {
@@ -2494,17 +2653,174 @@ func (s *Store) MarkExamplesResolved(ctx context.Context, keys []ResolvedExample
 // failure partway through leaves the prompt/suggestion state ahead of the resolved-marking,
 // which is the same order of priority MarkExamplesResolved's own best-effort behavior
 // already assumes.
-func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, suggestionID int64, promptID int64, newInstructions string, problemExampleKeys []ResolvedExampleKey) error {
-	if err := s.UpdatePromptInstructions(ctx, UpdatePromptInstructionsParams{
-		Instructions: newInstructions, ID: promptID,
+// ApplyPromptSuggestionAndUpdatePrompt applies sg to its prompt: mints a new PromptVersion
+// carrying sg's replay evidence (source "suggestion" — see PromptVersion's doc comment),
+// applies the suggestion, and marks the examples it was built from as resolved. Not
+// transactional, same as every other multi-step write in this package — a failure partway
+// through leaves state ahead of the resolved-marking, which is the same order of priority
+// MarkExamplesResolved's own best-effort behavior already assumes.
+func (s *Store) ApplyPromptSuggestionAndUpdatePrompt(ctx context.Context, sg PromptSuggestion, problemExampleKeys []ResolvedExampleKey) error {
+	sid := sg.ID
+	if _, err := s.InsertPromptVersion(ctx, InsertPromptVersionParams{
+		PromptID:     sg.PromptID,
+		Instructions: sg.SuggestedInstructions,
+		Source:       PromptVersionSourceSuggestion,
+		SuggestionID: &sid,
+		ReplayModel:  sg.ReplayModel,
+		ReplayTotal:  sg.ReplayTotal,
+		ReplayPassed: sg.ReplayPassed,
 	}); err != nil {
 		return err
 	}
-	if err := s.ApplyPromptSuggestion(ctx, suggestionID); err != nil {
+	if err := s.ApplyPromptSuggestion(ctx, sg.ID); err != nil {
 		return err
 	}
-	s.MarkExamplesResolved(ctx, problemExampleKeys, suggestionID)
+	s.MarkExamplesResolved(ctx, problemExampleKeys, sg.ID)
 	return nil
+}
+
+// ============================================================
+// Suggestion trace (live progress log)
+// ============================================================
+//
+// traceTTLDays is deliberately much shorter than suggestionTTLDays (90): the trace is a
+// watch/troubleshoot artifact whose value decays fast once a round finishes, not a
+// permanent record. Keeping it short bounds storage automatically as suggestions
+// accumulate, with no separate sweep — DynamoDB's TTL sweep does the work.
+const traceTTLDays = 7
+
+func pkSuggestionTrace(suggestionID int64) string { return fmt.Sprintf("SUGG_TRACE#%d", suggestionID) }
+
+func suggestionTraceItem(suggestionID int64, e SuggestionTraceEvent) map[string]types.AttributeValue {
+	return keyedItem(e, pkSuggestionTrace(suggestionID), padID(e.Seq), ttlDays(traceTTLDays))
+}
+
+// AppendSuggestionTrace writes a batch of trace events for one suggestion in a single
+// BatchWriteItem call. Best-effort by design at the caller (improve.go's trace writer): a
+// failure here must never fail the improve round it's merely narrating.
+func (s *Store) AppendSuggestionTrace(ctx context.Context, suggestionID int64, events []SuggestionTraceEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	items := make([]map[string]types.AttributeValue, len(events))
+	for i, e := range events {
+		items[i] = suggestionTraceItem(suggestionID, e)
+	}
+	return s.batchPut(ctx, items)
+}
+
+// ListSuggestionTrace returns a suggestion's trace events with Seq > afterSeq, oldest
+// first — the shape a polling cursor wants (append what's new, in order). Uses ddb.Query
+// directly rather than queryAll: a suggestion's trace is capped in practice by how long one
+// improve round runs, so following pagination here would only matter for a pathological
+// case, not the common one, and a direct bounded Query keeps this cheap regardless.
+func (s *Store) ListSuggestionTrace(ctx context.Context, suggestionID, afterSeq int64) ([]SuggestionTraceEvent, error) {
+	out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk AND SK > :after"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK:   sv(pkSuggestionTrace(suggestionID)),
+			":after": sv(padID(afterSeq)),
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SuggestionTraceEvent, len(out.Items))
+	for i, it := range out.Items {
+		result[i] = unmarshalItem[SuggestionTraceEvent](it)
+	}
+	return result, nil
+}
+
+// traceStaleAfter bounds how long a generating suggestion may go without a trace event
+// before IsSuggestionTraceStale reports it stale. Much tighter than generatingStaleAfter's
+// 20 minutes: a live trace updates roughly every traceFlushInterval while a round is
+// actually progressing (see improve_trace.go), so a gap this long is a far earlier and
+// sharper "the worker likely died" signal than generatingStaleAfter's read-side flip,
+// which is keyed off updatedAt — an attribute the worker only touches on its terminal
+// write, not on progress.
+const traceStaleAfter = 3 * time.Minute
+
+// latestSuggestionTraceEvent returns the newest trace event for a suggestion regardless of
+// any polling cursor. Used only for staleness detection (IsSuggestionTraceStale) — the
+// polling endpoint itself uses ListSuggestionTrace's cursor-scoped query instead.
+func (s *Store) latestSuggestionTraceEvent(ctx context.Context, suggestionID int64) (SuggestionTraceEvent, bool, error) {
+	out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pkSuggestionTrace(suggestionID)),
+		},
+		ScanIndexForward: aws.Bool(false),
+		Limit:            aws.Int32(1),
+	})
+	if err != nil {
+		return SuggestionTraceEvent{}, false, err
+	}
+	if len(out.Items) == 0 {
+		return SuggestionTraceEvent{}, false, nil
+	}
+	return unmarshalItem[SuggestionTraceEvent](out.Items[0]), true, nil
+}
+
+// LatestSuggestionTraceSeq returns the highest Seq already written for a suggestion's
+// trace, or 0 if it has none yet. The improve worker (improve_trace.go's newTraceWriter,
+// called from improve.go's runOne) seeds its in-process seq counter from this on every
+// invocation — a regenerate re-invokes the worker from scratch, and without this a fresh
+// traceWriter would restart at Seq 1 and silently overwrite the first round's Seq 1..N
+// items (same PK+SK) instead of continuing the sequence, corrupting the trace and making
+// the polling endpoint's cursor (already past those seqs from the first round) never see
+// the regenerate round's events at all.
+func (s *Store) LatestSuggestionTraceSeq(ctx context.Context, suggestionID int64) (int64, error) {
+	latest, found, err := s.latestSuggestionTraceEvent(ctx, suggestionID)
+	if err != nil || !found {
+		return 0, err
+	}
+	return latest.Seq, nil
+}
+
+// IsSuggestionTraceStale reports whether a generating suggestion has gone quiet long
+// enough that its worker likely died — the trace endpoint's (server.go) signal for
+// rendering "no progress for a while — the worker may have died; try regenerating" instead
+// of a spinner with no information behind it. Always false for any status other than
+// generating: a finished suggestion's trace going quiet is normal, not a problem. Falls
+// back to the suggestion's own UpdatedAt when no trace event exists yet at all (the worker
+// was invoked but hasn't reached its first Event call) rather than reporting stale
+// prematurely. This is read-side only, exactly like withGeneratingStaleness — the harder
+// backstop of actually flipping the stored status still belongs to generatingStaleAfter.
+func (s *Store) IsSuggestionTraceStale(ctx context.Context, sg PromptSuggestion) (bool, error) {
+	if sg.Status != SuggestionStatusGenerating {
+		return false, nil
+	}
+	lastActivity := sg.UpdatedAt
+	latest, found, err := s.latestSuggestionTraceEvent(ctx, sg.ID)
+	if err != nil {
+		return false, err
+	}
+	if found {
+		lastActivity = latest.CreatedAt
+	}
+	return isTraceStale(lastActivity, time.Now()), nil
+}
+
+// isTraceStale is the pure predicate IsSuggestionTraceStale wraps around a DynamoDB
+// lookup: given the last known activity timestamp (a trace event's CreatedAt, or the
+// suggestion's own UpdatedAt when no trace event exists yet) and the current time, has
+// traceStaleAfter elapsed with no progress? Factored out so the threshold logic is
+// unit-testable without a live DynamoDB client — Store.ddb is a concrete
+// *dynamodb.Client, not an interface, so IsSuggestionTraceStale itself can't be exercised
+// directly in this package's tests (see db/attributevalue_test.go's doc comment on the
+// same constraint for every other *Store method that touches s.ddb). An unparseable
+// timestamp reads as "not stale" rather than an error — the same fail-open choice
+// withGeneratingStaleness makes for the same field.
+func isTraceStale(lastActivity string, now time.Time) bool {
+	t, err := time.Parse(tsLayout, lastActivity)
+	if err != nil {
+		return false
+	}
+	return now.Sub(t) > traceStaleAfter
 }
 
 // ============================================================
@@ -2644,11 +2960,6 @@ type UpdatePromptParams struct {
 	ID             int64
 }
 
-type UpdatePromptInstructionsParams struct {
-	Instructions string
-	ID           int64
-}
-
 type UpdateAccountCredentialsParams struct {
 	CredentialsJSON string
 	ID              int64
@@ -2713,6 +3024,12 @@ type FinalizePromptSuggestionParams struct {
 	// doc comment in db/models.go. Empty ("") on a failed improve call, since nothing was
 	// built from anything in that case.
 	ProblemExampleKeys string
+
+	// Round trajectory — see PromptSuggestion.RoundsJSON's doc comment in db/models.go.
+	// All zero-value on a failed improve call, same as the replay fields above.
+	RoundsJSON string
+	RoundsRun  int64
+	BestRound  int64
 }
 
 type UpdatePromptSuggestionParams struct {
