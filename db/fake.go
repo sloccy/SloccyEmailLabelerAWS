@@ -11,6 +11,8 @@ import (
 
 // FakeStore is an in-memory StoreIface implementation for tests.
 // It is safe for concurrent use.
+var _ StoreIface = (*FakeStore)(nil)
+
 type FakeStore struct {
 	mu sync.Mutex
 
@@ -66,21 +68,6 @@ func (s *FakeStore) GetSetting(_ context.Context, key string) (string, error) {
 		return "", fmt.Errorf("setting %q not found", key)
 	}
 	return v, nil
-}
-
-func (s *FakeStore) ListAccounts(_ context.Context) ([]Account, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	result := make([]Account, 0, len(s.accounts))
-	for _, acc := range s.accounts {
-		result = append(result, *acc)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
-	return result, nil
-}
-
-func (s *FakeStore) ListActivePrompts(_ context.Context) ([]Prompt, error) {
-	return nil, nil
 }
 
 func (s *FakeStore) UpsertAccount(_ context.Context, arg UpsertAccountParams) (int64, error) {
@@ -206,10 +193,10 @@ func (s *FakeStore) ReleaseClaim(_ context.Context, accountID int64, messageID s
 	return nil
 }
 
-func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error {
+func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, r ProcessingResults) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, h := range history {
+	for _, h := range r.History {
 		entry := &CategorizationHistory{
 			ID:           s.nextID("history"),
 			Timestamp:    Now(),
@@ -228,16 +215,16 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 		s.history = append(s.history, entry)
 	}
 	ts := Now()
-	for _, e := range examples {
+	for _, e := range r.Examples {
 		e.ID = s.nextID("examples")
 		e.CreatedAt = ts
 		s.examples = append(s.examples, &e)
 	}
-	if messageID != "" {
-		if s.processed[accountID] == nil {
-			s.processed[accountID] = make(map[string]time.Time)
+	if r.Confirm {
+		if s.processed[r.AccountID] == nil {
+			s.processed[r.AccountID] = make(map[string]time.Time)
 		}
-		s.processed[accountID][messageID] = time.Time{} // confirmed
+		s.processed[r.AccountID][r.MessageID] = time.Time{} // confirmed
 	}
 	return nil
 }

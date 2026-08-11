@@ -30,8 +30,8 @@ import (
 )
 
 // traceStore is the slice of db.Store the trace writer needs. Declared locally rather than
-// added to db.StoreIface — that interface is the processor/scan/retention contract (see its
-// own doc comment), and none of those consumers care about a suggestion's live trace.
+// added to db.StoreIface — that interface is the processor/retention contract (see its own
+// doc comment), and neither of those consumers care about a suggestion's live trace.
 // *db.Store satisfies this implicitly.
 type traceStore interface {
 	AppendSuggestionTrace(ctx context.Context, suggestionID int64, events []db.SuggestionTraceEvent) error

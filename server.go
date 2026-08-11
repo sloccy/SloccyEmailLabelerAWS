@@ -702,19 +702,55 @@ func modelAllowedForTier(m llm.ModelOption, tier string) bool {
 	return true
 }
 
+// settingsView is every setting settings_form.html renders, resolved from storage (see
+// resolveSettings). A struct instead of settingsTemplateData's old 11 positional params —
+// which a wrong-order argument at either call site (handleGetSettings, handleUpdateSettings)
+// would have compiled silently.
+type settingsView struct {
+	ClassifyModel          string
+	ImproveModel           string
+	ClassifyTier           string
+	ImproveTier            string
+	ReasoningDirective     string
+	ImproveReplay          bool
+	ImproveMaxRounds       int
+	ImproveExampleCap      int
+	ReplayExampleCap       int
+	ImproveReasoningEffort string
+}
+
+// resolveSettings reads every setting settings_form.html needs out of settings (see
+// loadSettings), applying the same defaults/parsing/clamping handleGetSettings and
+// handleUpdateSettings both need — the latter as the "current value" baseline it patches
+// with whatever the submitted form actually changes (see handleUpdateSettings).
+func resolveSettings(settings map[string]string, defaultModel string) settingsView {
+	return settingsView{
+		ClassifyModel:          settingOr(settings, llm.SettingClassifyModel, defaultModel),
+		ImproveModel:           settingOr(settings, llm.SettingImproveModel, defaultModel),
+		ClassifyTier:           settingOr(settings, llm.SettingClassifyTier, llm.TierStandard),
+		ImproveTier:            settingOr(settings, llm.SettingImproveTier, llm.TierStandard),
+		ReasoningDirective:     settingOr(settings, llm.SettingClassifyReasoningDirective, ""),
+		ImproveReplay:          settingOr(settings, llm.SettingImproveReplay, "1") == "1",
+		ImproveMaxRounds:       parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds]),
+		ImproveExampleCap:      parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax),
+		ReplayExampleCap:       parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax),
+		ImproveReasoningEffort: settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff),
+	}
+}
+
 // settingsTemplateData builds the settings_form.html template data. models is used as-is for
 // the Standard selects (already sorted cheapest-first by ListAvailableModels); FlexModels is a
 // copy re-sorted by flex-tier cost (see llm.SortModelsByFlexCost) so the Flex selects sink their
 // own unpriced entries to the bottom instead of inheriting the standard-cost order.
-func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective string, improveReplay bool, improveMaxRounds, improveExampleCap, replayExampleCap int, improveReasoningEffort string, models []llm.ModelOption) map[string]any {
+func settingsTemplateData(v settingsView, models []llm.ModelOption) map[string]any {
 	return map[string]any{
-		"ClassifyModel":      classifyModel,
-		"ImproveModel":       improveModel,
-		"ClassifyTier":       classifyTier,
-		"ImproveTier":        improveTier,
-		"ReasoningDirective": reasoningDirective,
-		"ImproveReplay":      improveReplay,
-		"ImproveMaxRounds":   improveMaxRounds,
+		"ClassifyModel":      v.ClassifyModel,
+		"ImproveModel":       v.ImproveModel,
+		"ClassifyTier":       v.ClassifyTier,
+		"ImproveTier":        v.ImproveTier,
+		"ReasoningDirective": v.ReasoningDirective,
+		"ImproveReplay":      v.ImproveReplay,
+		"ImproveMaxRounds":   v.ImproveMaxRounds,
 		// ImproveMaxRoundsOptions is the <select>'s option list — 1..llm.ImproveMaxRoundsCap
 		// — computed here rather than hardcoded in the template so the two can't drift if
 		// the cap ever changes.
@@ -722,17 +758,17 @@ func settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier
 		// ImproveExampleCap/ReplayExampleCap are number inputs (not <select>s — the ranges
 		// are too wide, especially ReplayExampleCap's, to enumerate as options) bounded by
 		// their *Max template values so the template can't drift from llm's actual caps.
-		"ImproveExampleCap":      improveExampleCap,
+		"ImproveExampleCap":      v.ImproveExampleCap,
 		"ImproveExampleCapMax":   llm.ImproveExampleCapMax,
-		"ReplayExampleCap":       replayExampleCap,
+		"ReplayExampleCap":       v.ReplayExampleCap,
 		"ReplayExampleCapMax":    llm.ReplayExampleCapMax,
-		"ImproveReasoningEffort": improveReasoningEffort,
+		"ImproveReasoningEffort": v.ImproveReasoningEffort,
 		// ImproveReasoningLevels is what the effort <select> actually renders as options —
 		// not a fixed four values, but whatever llm.ReasoningEffortLevels reports the current
 		// ImproveModel's family actually distinguishes (see reasoningEffortRegistry). Empty
 		// means the model doesn't expose a controllable reasoning effort at all, and the
 		// template disables the control rather than offering choices that would no-op.
-		"ImproveReasoningLevels": llm.ReasoningEffortLevels(improveModel),
+		"ImproveReasoningLevels": llm.ReasoningEffortLevels(v.ImproveModel),
 		"Models":                 models,
 		"FlexModels":             llm.SortModelsByFlexCost(models),
 	}
@@ -773,19 +809,9 @@ func settingOr(settings map[string]string, key, def string) string {
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	settings := loadSettings(ctx, s.store)
-	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
-	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
-	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
-	improveTier := settingOr(settings, llm.SettingImproveTier, llm.TierStandard)
-	reasoningDirective := settingOr(settings, llm.SettingClassifyReasoningDirective, "")
-	improveReplay := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
-	improveMaxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
-	improveExampleCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
-	replayExampleCap := parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
-	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
+	v := resolveSettings(settings, s.cfg.BedrockModel)
 	models := s.cachedModels(ctx)
-	s.fragmentResponse(w, "settings_form.html",
-		settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveMaxRounds, improveExampleCap, replayExampleCap, improveReasoningEffort, models), "")
+	s.fragmentResponse(w, "settings_form.html", settingsTemplateData(v, models), "")
 }
 
 // applyTierSetting reads formKey from r's form; if it's a recognized tier ("standard" or
@@ -816,10 +842,29 @@ func (s *server) applyModelSetting(ctx context.Context, r *http.Request, formKey
 	return v
 }
 
+// applyIntSetting reads formKey from r's form; if it parses as an int in [min, max] it's
+// persisted under settingKey and returned, otherwise cur (the current setting) is returned
+// unchanged — same validate-or-ignore shape as applyTierSetting/applyModelSetting, for
+// handleUpdateSettings' three numeric fields (improve_max_rounds, improve_example_cap,
+// replay_example_cap), which used to hand-roll this three times.
+func (s *server) applyIntSetting(ctx context.Context, r *http.Request, formKey, settingKey string, minVal, maxVal, cur int) int {
+	v := r.FormValue(formKey)
+	if v == "" {
+		return cur
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < minVal || n > maxVal {
+		return cur
+	}
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: settingKey, Value: v})
+	return n
+}
+
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
 	settings := loadSettings(ctx, s.store)
+	cur := resolveSettings(settings, s.cfg.BedrockModel)
 
 	// Model selections — validate against available models to ignore garbage input
 	models := s.cachedModels(ctx)
@@ -832,80 +877,55 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
+	v := cur
+
 	// Classification tier — "standard" or "flex". Must be resolved before validating the
 	// classify_model choice: the two tiers have different eligible-model policies (see
 	// modelAllowedForTier) enforced below.
-	classifyTier := s.applyTierSetting(ctx, r, "classify_tier", llm.SettingClassifyTier,
-		settingOr(settings, llm.SettingClassifyTier, llm.TierStandard))
-	classifyModel := s.applyModelSetting(ctx, r, "classify_model", llm.SettingClassifyModel,
-		settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel), classifyTier, findModel)
+	v.ClassifyTier = s.applyTierSetting(ctx, r, "classify_tier", llm.SettingClassifyTier, cur.ClassifyTier)
+	v.ClassifyModel = s.applyModelSetting(ctx, r, "classify_model", llm.SettingClassifyModel, cur.ClassifyModel, v.ClassifyTier, findModel)
 
 	// Prompt-improver tier + model — same standard/flex policy as classification above.
-	improveTier := s.applyTierSetting(ctx, r, "improve_tier", llm.SettingImproveTier,
-		settingOr(settings, llm.SettingImproveTier, llm.TierStandard))
-	improveModel := s.applyModelSetting(ctx, r, "improve_model", llm.SettingImproveModel,
-		settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel), improveTier, findModel)
+	v.ImproveTier = s.applyTierSetting(ctx, r, "improve_tier", llm.SettingImproveTier, cur.ImproveTier)
+	v.ImproveModel = s.applyModelSetting(ctx, r, "improve_model", llm.SettingImproveModel, cur.ImproveModel, v.ImproveTier, findModel)
 
 	// Reasoning-suppression override: free text, no validation beyond trimming — it's an
 	// escape hatch for a model family reasoningRegistry (llm/reasoning.go) doesn't know
 	// about yet, so any soft-switch string the model expects is valid. Empty clears the
 	// override and falls back to the registry (see resolveSetting).
-	reasoningDirective := strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
-	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
+	v.ReasoningDirective = strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
+	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: v.ReasoningDirective})
 
 	// Checkbox semantics: the browser only sends improve_replay when checked, so its
 	// presence (any value) means enabled — persisted as "1"/"0" to match
 	// improveAndFinalizeSuggestion's (improve.go) unset-means-enabled default for this
 	// setting.
-	improveReplay := r.FormValue("improve_replay") != ""
+	v.ImproveReplay = r.FormValue("improve_replay") != ""
 	replayValue := "0"
-	if improveReplay {
+	if v.ImproveReplay {
 		replayValue = "1"
 	}
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReplay, Value: replayValue})
 
-	// Round budget for the improve<->replay loop (improve.go) — validated the same way
-	// applyModelSetting/applyTierSetting validate their own fields: a value outside
-	// [1, llm.ImproveMaxRoundsCap] (garbage, blank, out of range) is silently ignored
-	// rather than persisted, leaving the current setting in place.
-	improveMaxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
-	if v := r.FormValue("improve_max_rounds"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ImproveMaxRoundsCap {
-			improveMaxRounds = n
-			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveMaxRounds, Value: v})
-		}
-	}
-
-	// Example-selection caps (improve.go's sampleExamples) — same validate-or-ignore
-	// pattern as improve_max_rounds above, one per Setting.
-	improveExampleCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
-	if v := r.FormValue("improve_example_cap"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ImproveExampleCapMax {
-			improveExampleCap = n
-			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveExampleCap, Value: v})
-		}
-	}
-	replayExampleCap := parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
-	if v := r.FormValue("replay_example_cap"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= llm.ReplayExampleCapMax {
-			replayExampleCap = n
-			_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingReplayExampleCap, Value: v})
-		}
-	}
+	// Round budget for the improve<->replay loop, and the example-selection caps
+	// (improve.go's sampleExamples) — each validated the same way applyModelSetting/
+	// applyTierSetting validate their own fields: a value outside range (garbage, blank,
+	// out of bounds) is silently ignored, leaving the current setting in place.
+	v.ImproveMaxRounds = s.applyIntSetting(ctx, r, "improve_max_rounds", llm.SettingImproveMaxRounds, 1, llm.ImproveMaxRoundsCap, cur.ImproveMaxRounds)
+	v.ImproveExampleCap = s.applyIntSetting(ctx, r, "improve_example_cap", llm.SettingImproveExampleCap, 1, llm.ImproveExampleCapMax, cur.ImproveExampleCap)
+	v.ReplayExampleCap = s.applyIntSetting(ctx, r, "replay_example_cap", llm.SettingReplayExampleCap, 1, llm.ReplayExampleCapMax, cur.ReplayExampleCap)
 
 	// Reasoning effort for the improve call: accepted values depend on improveModel's family
 	// (llm.ReasoningEffortLevels) — not a fixed four, since most families support none of
 	// them and GLM only really supports one. Anything else (including a level valid for a
 	// different model than the one now selected) is ignored the same way applyModelSetting
 	// ignores an unrecognized model id.
-	improveReasoningEffort := settingOr(settings, llm.SettingImproveReasoningEffort, llm.ReasoningEffortOff)
-	if v := r.FormValue("improve_reasoning_effort"); v == llm.ReasoningEffortOff || slices.Contains(llm.ReasoningEffortLevels(improveModel), v) {
-		improveReasoningEffort = v
-		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReasoningEffort, Value: v})
+	if val := r.FormValue("improve_reasoning_effort"); val == llm.ReasoningEffortOff || slices.Contains(llm.ReasoningEffortLevels(v.ImproveModel), val) {
+		v.ImproveReasoningEffort = val
+		_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingImproveReasoningEffort, Value: val})
 	}
 
-	data := settingsTemplateData(classifyModel, improveModel, classifyTier, improveTier, reasoningDirective, improveReplay, improveMaxRounds, improveExampleCap, replayExampleCap, improveReasoningEffort, models)
-	s.fragmentResponse(w, "settings_form.html", data, "Settings saved")
+	s.fragmentResponse(w, "settings_form.html", settingsTemplateData(v, models), "Settings saved")
 }
 
 // ============================================================
