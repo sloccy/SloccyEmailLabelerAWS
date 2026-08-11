@@ -1,7 +1,11 @@
 <!-- hx-target/hx-swap/hx-include are set once here and inherited by every control below
      (htmx walks up to the nearest ancestor that sets each attribute) — only hx-get and
-     hx-trigger differ per control, so only those are repeated. -->
-<div hx-target="#hist-body" hx-swap="innerHTML" hx-include="#hist-filter-form">
+     hx-trigger differ per control, so only those are repeated. display:contents keeps this
+     div out of the box model entirely, so the four controls below stay direct flex items of
+     #hist-filter-form (d-flex flex-wrap, templates/index.html) and lay out side by side,
+     exactly as if this wrapper weren't here — without it they'd stack vertically as block
+     children of a non-flex wrapper. -->
+<div style="display:contents" hx-target="#hist-body" hx-swap="innerHTML" hx-include="#hist-filter-form">
   <div class="mb-0">
     <label class="form-label">Account</label>
     <select name="account_id" class="form-select form-select-sm"
