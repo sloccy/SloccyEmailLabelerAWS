@@ -23,6 +23,12 @@ const (
 	VerdictConfirmedPositive = "confirmed_positive"
 )
 
+// VerdictOrder is the fixed display/processing order for the three verdicts above — the
+// order examples get sampled per-verdict, pruned per-verdict, and shown to the user, so a
+// change here changes all of those consistently at once instead of drifting between
+// separately-written copies of this same slice.
+var VerdictOrder = []string{VerdictFalseNegative, VerdictFalsePositive, VerdictConfirmedPositive}
+
 // SuggestionTraceEvent kinds (see db/models.go's doc comment on SuggestionTraceEvent).
 // round_start/candidate/replay_start/replay_done/note/error/done are structural — they mark
 // a state change in the improve round and are flushed immediately by the trace writer.

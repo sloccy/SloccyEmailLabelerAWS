@@ -53,7 +53,7 @@ const pruneCapMultiplier = 2
 func prunePromptExamples(ctx context.Context, store *db.Store, prompts []db.Prompt) {
 	promptCap := pruneCapMultiplier * replayExampleCap(ctx, store)
 	for _, p := range prompts {
-		for _, verdict := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+		for _, verdict := range db.VerdictOrder {
 			pruneVerdict(ctx, store, p.ID, verdict, promptCap)
 		}
 	}

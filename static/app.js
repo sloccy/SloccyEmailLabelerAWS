@@ -348,6 +348,21 @@ document.addEventListener('click', function(e) {
   flexSel.disabled = !showFlex;
 });
 
+// ---- Retention panel: global rule enable/disable ----
+// Disables (and clears) the value/unit inputs when the global retention switch is off — a
+// named function like every other interaction in this app, rather than an inline onchange.
+function retentionGlobalToggle(checkbox) {
+  const value = document.getElementById('rg-value');
+  const unit = document.getElementById('rg-unit');
+  if (!value || !unit) return;
+  value.disabled = !checkbox.checked;
+  unit.disabled = !checkbox.checked;
+  if (!checkbox.checked) {
+    value.value = '';
+    unit.value = 'days';
+  }
+}
+
 // ---- Model pricing table: Normal/Flex toggle ----
 // Same delegated-handler pattern as the tier toggles above (the settings form is
 // HTMX-swapped, so a direct binding wouldn't survive a re-render).
@@ -368,19 +383,25 @@ document.body.addEventListener('showToast', function(e) {
 });
 
 // ---- Recategorize modal: "changed" detection + "Improve" checkbox toggle ----
+// _toggleImproveWrap shows/hides a row's "Improve prompt with AI" checkbox wrapper and
+// unchecks it when hidden — shared by recategorizeToggle (single-email modal) and
+// bulkActionToggle (bulk modal) below, which differ only in which row class and improve-wrap
+// selector they use.
+function _toggleImproveWrap(row, selector, show) {
+  const improveWrap = row.querySelector(selector);
+  if (!improveWrap) return;
+  improveWrap.classList.toggle('d-none', !show);
+  if (!show) {
+    const improveCheck = improveWrap.querySelector('input[type="checkbox"]');
+    if (improveCheck) improveCheck.checked = false;
+  }
+}
+
 function recategorizeToggle(checkbox) {
   const row = checkbox.closest('.recategorize-row');
   if (!row) return;
-  const initialChecked = checkbox.defaultChecked;
-  const changed = checkbox.checked !== initialChecked;
-  const improveWrap = row.querySelector('.improve-check-wrap');
-  if (improveWrap) {
-    improveWrap.classList.toggle('d-none', !changed);
-    if (!changed) {
-      const improveCheck = improveWrap.querySelector('input[type="checkbox"]');
-      if (improveCheck) improveCheck.checked = false;
-    }
-  }
+  const changed = checkbox.checked !== checkbox.defaultChecked;
+  _toggleImproveWrap(row, '.improve-check-wrap', changed);
 }
 
 // ---- Bulk recategorize: history table multi-select ----
@@ -454,14 +475,7 @@ function bulkActionToggle(checkbox) {
   if (checkbox.checked && other) other.checked = false;
 
   const anyChecked = row.querySelector('input[name="apply_prompt_ids"]:checked, input[name="remove_prompt_ids"]:checked');
-  const improveWrap = row.querySelector('.bulk-improve-wrap');
-  if (improveWrap) {
-    improveWrap.classList.toggle('d-none', !anyChecked);
-    if (!anyChecked) {
-      const improveCheck = improveWrap.querySelector('input[type="checkbox"]');
-      if (improveCheck) improveCheck.checked = false;
-    }
-  }
+  _toggleImproveWrap(row, '.bulk-improve-wrap', anyChecked);
 }
 
 function bulkRecategorizeOpen() {

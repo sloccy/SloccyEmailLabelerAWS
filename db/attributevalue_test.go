@@ -504,8 +504,8 @@ func TestPromptExampleRoundTrip_LocalIDsProduceDistinctOrderedSKs(t *testing.T) 
 
 // TestPromptExampleRoundTrip_ResolvedBySuggestion checks a resolved example (see
 // PromptExample.ResolvedBySuggestionID) survives the marshal/unmarshal round trip — the
-// property MarkExamplesResolved's UpdateItem and selectExamplesForPrompt's filterResolved
-// both depend on.
+// property MarkExamplesResolved's UpdateItem and gatherRawExamples' filterResolved (both in
+// improve.go) both depend on.
 func TestPromptExampleRoundTrip_ResolvedBySuggestion(t *testing.T) {
 	sid := int64(7)
 	want := PromptExample{

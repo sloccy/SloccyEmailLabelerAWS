@@ -843,7 +843,7 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	// Checkbox semantics: the browser only sends improve_replay when checked, so its
 	// presence (any value) means enabled — persisted as "1"/"0" to match improveReplayEnabled's
-	// (recategorize.go) unset-means-enabled default.
+	// (improve.go) unset-means-enabled default.
 	improveReplay := r.FormValue("improve_replay") != ""
 	replayValue := "0"
 	if improveReplay {
@@ -1681,7 +1681,7 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 		db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
 		db.VerdictConfirmedPositive: "Already correct (must keep matching)",
 	}
-	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+	for _, v := range db.VerdictOrder {
 		var grouped []db.PromptExample
 		for _, ex := range examples {
 			if ex.Verdict == v {

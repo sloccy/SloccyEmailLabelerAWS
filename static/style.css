@@ -156,8 +156,7 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .badge.font-monospace { font-size: 11px; padding: 2px 6px; }
 
 /* OAuth */
-.url-box { display: none; }
-.url-box.visible { display: block; }
+.url-box { display: block; }
 
 /* Empty states */
 .empty { text-align: center; color: var(--om-text-60); padding: 2.5rem 0; }
@@ -210,8 +209,6 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 .timeline li { display: grid; grid-template-columns: 20px 1fr; gap: 0 0.75rem; align-items: start; }
 .timeline-middle { display: flex; justify-content: center; padding-top: 0.3rem; }
 .timeline-end { padding: 0.125rem 0 0.5rem; min-width: 0; font-size: 0.75rem; }
-.timeline-log-entry { transition: background 0.12s; border-radius: 4px; }
-.timeline-log-entry:hover { background: var(--hover-subtle-bg); }
 .tag-dot { width: 8px; height: 8px; padding: 0; min-width: 0; border-radius: 50%; display: inline-block; }
 
 /* Skeleton */
@@ -230,6 +227,13 @@ h1,h2,h3,h4,h5,h6 { letter-spacing: -0.025em; }
 
 /* Textarea */
 .textarea-tall { min-height: 10rem; }
+
+/* Debug/instructions text blocks — shared by troubleshooting_list.html's raw Gmail/LLM
+   dumps and prompt_suggestion_detail.html's instruction panes, which used to each carry
+   this as a repeated inline style. */
+.debug-pre { background: var(--bs-body-bg); white-space: pre-wrap; max-height: 300px; overflow: auto; border: 1px solid var(--bs-border-color); }
+.pre-wrap { white-space: pre-wrap; word-break: break-word; min-height: 5rem; }
+summary { cursor: pointer; }
 
 /* App color helpers */
 .bg-base-200 { background-color: var(--om-bg-200); }

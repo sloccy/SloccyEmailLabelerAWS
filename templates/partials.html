@@ -6,3 +6,91 @@
   <div class="d-flex align-items-center gap-2 bg-base-300 border rounded-2 px-3 py-2"><input type="checkbox" class="form-check-input mt-0" name="action_mark_read" value="1" id="{{.Prefix}}-read"{{if .ActionMarkRead}} checked{{end}}><label class="mb-0" for="{{.Prefix}}-read">Mark as Read</label></div>
 </div>
 {{end}}
+
+{{/* model_tier_picker renders one Standard/Flex model picker: a hidden tier input, the
+     btn-group toggle, and the matching pair of model <select>s. Shared by the classify and
+     improve pickers in settings_form.html, which differ only in which prompt-improver-vs-
+     classifier settings they write to. The "{{.Prefix}}-tier-toggle" btn-group id and the
+     "{{.Prefix}}-model-standard"/"-model-flex" select ids are load-bearing — app.js's
+     delegated tier-toggle click handler derives the prefix from the btn-group's own id and
+     looks the selects up by the same convention, so don't rename this scheme without
+     updating that handler. */}}
+{{define "model_tier_picker"}}
+<input type="hidden" name="{{.Prefix}}_tier" value="{{.Tier}}">
+<div class="btn-group btn-group-sm mt-2 mb-2" role="group" aria-label="{{.AriaLabel}}" id="{{.Prefix}}-tier-toggle">
+  <button type="button" class="btn btn-outline-primary{{if ne .Tier "flex"}} active{{end}}" data-tier="standard">Standard</button>
+  <button type="button" class="btn btn-outline-primary{{if eq .Tier "flex"}} active{{end}}" data-tier="flex">Flex</button>
+</div>
+<select class="form-select form-select-sm{{if eq .Tier "flex"}} d-none{{end}}" name="{{.Prefix}}_model" id="{{.Prefix}}-model-standard" style="min-width:300px;"{{if eq .Tier "flex"}} disabled{{end}}>
+  {{range .Models}}
+  <option value="{{.ID}}"{{if eq .ID $.SelectedModel}} selected{{end}}>{{.Label}} — {{if ge .InputCostPer1M 0.0}}${{printf "%.3f" .InputCostPer1M}}/1M in{{else}}n/a{{end}}</option>
+  {{end}}
+</select>
+<select class="form-select form-select-sm{{if ne .Tier "flex"}} d-none{{end}}" name="{{.Prefix}}_model" id="{{.Prefix}}-model-flex" style="min-width:300px;"{{if ne .Tier "flex"}} disabled{{end}}>
+  {{range .FlexModels}}{{if .Flex}}
+  <option value="{{.ID}}"{{if eq .ID $.SelectedModel}} selected{{end}}>{{.Label}} — {{if ge .FlexCostPer1M 0.0}}${{printf "%.3f" .FlexCostPer1M}}/1M in (flex){{else}}n/a{{end}}</option>
+  {{end}}{{end}}
+</select>
+{{end}}
+
+{{/* empty_state renders the "nothing here yet" placeholder shared by every list/table
+     fragment: a dimmed icon over one line of muted text. Icon must be safeHTML-wrapped
+     (e.g. (safeHTML "<svg ...>...</svg>")) so it renders as markup, not escaped text. */}}
+{{define "empty_state"}}
+<div class="empty">
+  <div class="empty-icon">{{.Icon}}</div>
+  {{.Text}}
+</div>
+{{end}}
+
+{{/* suggestion_status_badge renders a PromptSuggestion's status badge. Shared by
+     prompt_suggestions_list.html (the card list) and prompt_suggestion_detail.html (the
+     opened suggestion) — the list never actually has an "applied" row (apply removes the
+     card via hx-swap="delete"), but rendering that arm here anyway costs nothing and keeps
+     the two in sync if that ever changes. */}}
+{{define "suggestion_status_badge"}}
+{{if eq . "generating"}}
+  <span class="badge text-bg-warning">
+    <span class="spinner-border spinner-border-sm me-1" style="width:.65em;height:.65em" role="status" aria-hidden="true"></span>Generating&hellip;
+  </span>
+{{else if eq . "pending"}}
+  <span class="badge text-bg-primary">pending</span>
+{{else if eq . "applied"}}
+  <span class="badge text-bg-success">applied</span>
+{{else if eq . "failed"}}
+  <span class="badge text-bg-danger">failed</span>
+{{else}}
+  <span class="badge text-bg-secondary">dismissed</span>
+{{end}}
+{{end}}
+
+{{/* retention_rule_row renders one badge+detail+Remove row, shared by the exemptions list
+     and the label-rules list in retention_panel.html — identical structure, differing only
+     in the detail text (plain "never deleted" vs a "→ trash after <N days>" built with
+     safeHTML for the <strong>) and the delete endpoint. */}}
+{{define "retention_rule_row"}}
+<div class="d-flex align-items-center justify-content-between py-2 border-bottom">
+  <div>
+    <span class="badge border border-primary text-primary font-monospace">{{.LabelName}}</span>
+    <span class="small text-muted ms-2">{{.Detail}}</span>
+  </div>
+  <button class="btn btn-outline-danger btn-sm"
+    hx-delete="{{.DeletePath}}"
+    hx-target="#retention-panel"
+    hx-swap="innerHTML"
+    hx-confirm="{{.Confirm}}">Remove</button>
+</div>
+{{end}}
+
+{{/* suggestion_dismiss_btn renders the Dismiss button shared by every terminal-state branch
+     of prompt_suggestion_detail.html (generating, and pending/failed) — same hx-post/target/
+     swap/after-request in each. Takes the suggestion ID directly. */}}
+{{define "suggestion_dismiss_btn"}}
+<button type="button" class="btn btn-outline-secondary btn-sm"
+  hx-post="/fragments/prompt-suggestions/{{.}}/dismiss"
+  hx-target="#suggestion-row-{{.}}"
+  hx-swap="delete"
+  hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
+  Dismiss
+</button>
+{{end}}

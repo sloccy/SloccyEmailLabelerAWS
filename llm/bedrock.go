@@ -770,15 +770,7 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 	}
 
 	sys := systemBlock(classifySystemPrompt)
-	var fields document.Interface
-	if d := reasoningOff(modelID, reasoningOverride); !d.isZero() {
-		if d.system != "" {
-			sys = append(sys, sysText(d.system))
-		}
-		if d.fields != nil {
-			fields = document.NewLazyDocument(d.fields)
-		}
-	}
+	sys, fields := applyReasoningOff(sys, modelID, reasoningOverride)
 	return msgs, inf, sys, fields
 }
 
@@ -910,15 +902,7 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 	// Reasoning suppression (see reasoning.go): same rationale as ImprovePromptInstructions
 	// — a rule padded with chain-of-thought is exactly what this prompt is trying to avoid.
 	sys := systemBlock(systemPrompt)
-	var fields document.Interface
-	if d := reasoningOff(model, ""); !d.isZero() {
-		if d.system != "" {
-			sys = append(sys, sysText(d.system))
-		}
-		if d.fields != nil {
-			fields = document.NewLazyDocument(d.fields)
-		}
-	}
+	sys, fields := applyReasoningOff(sys, model, "")
 
 	stream, err := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:  aws.String(model),
@@ -1192,14 +1176,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	effort := c.resolveSetting(ctx, SettingImproveReasoningEffort, ReasoningEffortOff)
 	switch {
 	case effort == "" || effort == ReasoningEffortOff:
-		if d := reasoningOff(model, ""); !d.isZero() {
-			if d.system != "" {
-				sys = append(sys, sysText(d.system))
-			}
-			if d.fields != nil {
-				fields = document.NewLazyDocument(d.fields)
-			}
-		}
+		sys, fields = applyReasoningOff(sys, model, "")
 	case reasoningEffortFields(model, effort) != nil:
 		fields = document.NewLazyDocument(reasoningEffortFields(model, effort))
 	default:
@@ -1510,11 +1487,7 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		var pricingErr error
 		cat, pricingErr = fetchPricingCatalog(ctx, c.pricingClient())
 		if pricingErr != nil {
-			cat = &pricingCatalog{
-				inputPricePer1M:     map[string]float64{},
-				flexInputPricePer1M: map[string]float64{},
-				flexCapable:         map[string]bool{},
-			}
+			cat = newPricingCatalog()
 		}
 	})
 

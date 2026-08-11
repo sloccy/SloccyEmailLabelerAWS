@@ -478,7 +478,7 @@ func processEmail(
 		// db.VerdictConfirmedPositive's doc comment on why that's a deliberate omission, not
 		// an oversight). A later manual correction for this same (rule, email) pair — should
 		// the user ever make one — supersedes this at read time via
-		// selectExamplesForPrompt's newest-id-wins dedup (recategorize.go); see
+		// gatherRawExamples' newest-id-wins dedup (improve.go); see
 		// db.InsertPromptExamples' doc comment for why that dedup depends on every
 		// PromptExample write path sharing the same monotonically-ordered id source.
 		examples = append(examples, db.PromptExample{

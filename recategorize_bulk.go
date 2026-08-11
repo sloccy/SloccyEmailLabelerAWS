@@ -12,7 +12,6 @@ import (
 
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
-	"github.com/sloccy/ollamail-aws/processor"
 )
 
 // ============================================================
@@ -75,26 +74,6 @@ func parseBulkSelections(values []string) []bulkMessageKey {
 		}
 	}
 	return out
-}
-
-// parseIDList parses a repeated form field of decimal int64 ids, skipping any value that
-// doesn't parse rather than failing the whole request over one bad value.
-func parseIDList(values []string) []int64 {
-	var out []int64
-	for _, v := range values {
-		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func idSet(ids []int64) map[int64]bool {
-	set := make(map[int64]bool, len(ids))
-	for _, id := range ids {
-		set[id] = true
-	}
-	return set
 }
 
 // bulkVerdictsAndPlan computes one message's verdicts and history-rewrite plan from its
@@ -281,6 +260,11 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		byAccount[sel.AccountID] = append(byAccount[sel.AccountID], sel.MessageID)
 	}
 
+	// Derived only from the request-level apply/remove sets, not from any per-account
+	// state, so computed once here rather than rebuilt inside the per-account loop below.
+	addedCSV := joinIDs(applyIDs)
+	removedCSV := joinIDs(removeIDs)
+
 	excerptCtx, excerptCancel := context.WithTimeout(ctx, bulkExcerptBudget)
 	defer excerptCancel()
 
@@ -312,62 +296,13 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		// Gmail: apply/remove uniformly across every selected message in this account.
-		// Unlike the single-email path, no per-message diffing is needed here — Gmail's
-		// batchModify add/remove is idempotent, so applying a label a message already has
-		// is a harmless no-op. BuildLabelCache/BatchModifyEmails already group and chunk
-		// internally (gmail/client.go), so this stays a small, bounded number of Gmail API
-		// calls regardless of selection size.
-		var neededLabels []string
-		for _, pid := range applyIDs {
-			if p, ok := promptByID[pid]; ok && p.LabelName != "" {
-				neededLabels = append(neededLabels, p.LabelName)
-			}
-		}
-		labelCache, _ := gmail.BuildLabelCache(ctx, svc, neededLabels)
-
-		var addModifies, removeModifies []gmail.Modify
-		var trashReverseIDs []string
-		for _, pid := range applyIDs {
-			p, ok := promptByID[pid]
-			if !ok {
-				continue
-			}
-			// Doesn't trash on add, same gap as applyRecategorizeToGmail (recategorize.go)
-			// preserves as-is for the single-email path — not fixed here either.
-			mod, _ := processor.ModifyForPrompt(p, labelCache[p.LabelName])
-			mod.MessageIDs = messageIDs
-			if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
-				addModifies = append(addModifies, mod)
-			}
-		}
-		for _, pid := range removeIDs {
-			p, ok := promptByID[pid]
-			if !ok {
-				continue
-			}
-			mod, untrash := processor.ReverseModifyForPrompt(p, labelCache[p.LabelName])
-			mod.MessageIDs = messageIDs
-			if untrash {
-				trashReverseIDs = append(trashReverseIDs, messageIDs...)
-			}
-			if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
-				removeModifies = append(removeModifies, mod)
-			}
-		}
-		if len(addModifies) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, addModifies)
-		}
-		if len(removeModifies) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, removeModifies)
-		}
-		if len(trashReverseIDs) > 0 {
-			_ = gmail.BatchModifyEmails(ctx, svc, []gmail.Modify{{
-				MessageIDs:   trashReverseIDs,
-				AddLabels:    []string{gmail.LabelInbox},
-				RemoveLabels: []string{gmail.LabelTrash},
-			}})
-		}
+		// Gmail: apply/remove uniformly across every selected message in this account, via
+		// the same path the single-email flow uses (recategorize.go). Unlike the
+		// single-email path, no per-message diffing is needed here — Gmail's batchModify
+		// add/remove is idempotent, so applying a label a message already has is a harmless
+		// no-op — but applyRecategorizeToGmail's messageIDs parameter accepts the whole
+		// account's selection uniformly either way.
+		s.applyRecategorizeToGmail(ctx, svc, messageIDs, promptByID, applyIDs, removeIDs)
 
 		// Verdicts + history plan per message (pure, from `state` — no further DB reads).
 		plans := make([]db.RewriteMessagePlan, 0, len(messageIDs))
@@ -396,20 +331,13 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 
 		excerpts := fetchExcerptsBounded(excerptCtx, svc, needExcerpt, s.cfg.ClassifyConcurrency)
 
-		var addedCSV, removedCSV []string
-		for _, pid := range applyIDs {
-			addedCSV = append(addedCSV, strconv.FormatInt(pid, 10))
-		}
-		for _, pid := range removeIDs {
-			removedCSV = append(removedCSV, strconv.FormatInt(pid, 10))
-		}
 		for _, mid := range needExcerpt {
 			st := state[mid]
 			if _, err := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
 				AccountID:      accountID,
 				MessageID:      mid,
-				AddedPrompts:   strings.Join(addedCSV, ","),
-				RemovedPrompts: strings.Join(removedCSV, ","),
+				AddedPrompts:   addedCSV,
+				RemovedPrompts: removedCSV,
 				Note:           note,
 			}); err != nil {
 				slog.Error("bulk recategorize: insert correction", "account_id", accountID, "message_id", mid, "err", err)
@@ -428,7 +356,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 
 	// One suggestion per flagged rule, not per email — the corpus (just written above)
 	// already carries every touched message's examples, so the improve worker needs
-	// nothing email-specific to run; it reads the corpus fresh via selectExamplesForPrompt.
+	// nothing email-specific to run; it reads the corpus fresh via selectExamplesForImprove.
 	var targets []improveTarget
 	for pid := range improveSet {
 		p, ok := promptByID[pid]

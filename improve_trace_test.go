@@ -174,33 +174,6 @@ func TestTraceWriter_SeqMonotonicAcrossEventAndText(t *testing.T) {
 	}
 }
 
-// TestTraceWriter_FlushForcesOutPartialBuffer checks the explicit Flush escape hatch: a
-// caller that's about to stop writing (without a structural event of its own to piggyback
-// on) can still guarantee nothing buffered is lost.
-func TestTraceWriter_FlushForcesOutPartialBuffer(t *testing.T) {
-	store := &fakeTraceStore{}
-	tw := newTraceWriter(store, 1, 0)
-	ctx := context.Background()
-
-	tw.Text(ctx, db.TraceKindAnswer, 1, "not enough to trip either threshold")
-	if got := len(store.all()); got != 0 {
-		t.Fatalf("expected nothing flushed yet, got %d", got)
-	}
-
-	tw.Flush(ctx)
-
-	events := store.all()
-	if len(events) != 1 || events[0].Text != "not enough to trip either threshold" {
-		t.Fatalf("Flush did not force out the pending buffer: %+v", events)
-	}
-
-	// Flush with nothing pending must be a no-op, not an empty write.
-	tw.Flush(ctx)
-	if got := len(store.all()); got != 1 {
-		t.Errorf("Flush with nothing pending wrote an extra event: %d total", got)
-	}
-}
-
 // TestTraceWriter_StartSeqContinuesAcrossRegenerate guards the regenerate correctness fix:
 // newTraceWriter must start counting from startSeq, not always 0, or a second worker
 // invocation for the same suggestion (a regenerate) would reuse Seq 1..N and silently
@@ -235,8 +208,8 @@ func TestTraceWriter_StartSeqContinuesAcrossRegenerate(t *testing.T) {
 
 // TestTraceWriter_WriteFailureIsSwallowed is the load-bearing test for this file's whole
 // design: narrating a round must never be able to fail the round itself. A store that
-// always errors must not panic, must not return an error to the caller (Event/Text/Flush
-// are all void), and callers must be able to keep calling them.
+// always errors must not panic, must not return an error to the caller (Event/Text are
+// both void), and callers must be able to keep calling them.
 func TestTraceWriter_WriteFailureIsSwallowed(t *testing.T) {
 	store := &fakeTraceStore{err: errors.New("dynamodb: throttled")}
 	tw := newTraceWriter(store, 1, 0)
@@ -244,9 +217,8 @@ func TestTraceWriter_WriteFailureIsSwallowed(t *testing.T) {
 
 	tw.Event(ctx, db.TraceKindRoundStart, 1, "")
 	tw.Text(ctx, db.TraceKindAnswer, 1, strings.Repeat("x", traceFlushBytes))
-	tw.Flush(ctx)
 	tw.Event(ctx, db.TraceKindDone, 1, "")
-	// Reaching this line without a panic is the assertion — Event/Text/Flush have no error
+	// Reaching this line without a panic is the assertion — Event/Text have no error
 	// return for exactly this reason, so there's nothing else to check.
 	t.Log("no panic from a permanently-failing trace store")
 }

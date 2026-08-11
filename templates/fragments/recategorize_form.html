@@ -16,7 +16,7 @@
     <div class="d-flex align-items-start gap-2 mb-2 border rounded p-2 recategorize-row" data-pid="{{.Prompt.ID}}">
       <div class="flex-grow-1">
         <div class="form-check mb-1">
-          <input class="form-check-input recategorize-check" type="checkbox" name="prompt_ids" value="{{.Prompt.ID}}" id="rc-prompt-{{.Prompt.ID}}"
+          <input class="form-check-input" type="checkbox" name="prompt_ids" value="{{.Prompt.ID}}" id="rc-prompt-{{.Prompt.ID}}"
             {{if .Checked}}checked{{end}}
             onchange="recategorizeToggle(this)">
           <label class="form-check-label fw-medium" for="rc-prompt-{{.Prompt.ID}}">

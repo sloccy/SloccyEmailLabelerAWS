@@ -4,40 +4,12 @@
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Classification model</div>
         <div class="small text-muted mt-1">Bedrock model used to label incoming emails. Sorted cheapest input cost first, unpriced models ("n/a") last. <strong>Standard</strong> is normal-latency processing, open to any Converse-capable model; <strong>Flex</strong> is a discounted, lower-priority tier open to any flex-capable model — higher latency, but still fast.</div>
-        <input type="hidden" name="classify_tier" id="classify-tier-input" value="{{.ClassifyTier}}">
-        <div class="btn-group btn-group-sm mt-2 mb-2" role="group" aria-label="Classification tier" id="classify-tier-toggle">
-          <button type="button" class="btn btn-outline-primary{{if ne .ClassifyTier "flex"}} active{{end}}" data-tier="standard">Standard</button>
-          <button type="button" class="btn btn-outline-primary{{if eq .ClassifyTier "flex"}} active{{end}}" data-tier="flex">Flex</button>
-        </div>
-        <select class="form-select form-select-sm{{if eq .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-standard" style="min-width:300px;"{{if eq .ClassifyTier "flex"}} disabled{{end}}>
-          {{range .Models}}
-          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}} — {{if ge .InputCostPer1M 0.0}}${{printf "%.3f" .InputCostPer1M}}/1M in{{else}}n/a{{end}}</option>
-          {{end}}
-        </select>
-        <select class="form-select form-select-sm{{if ne .ClassifyTier "flex"}} d-none{{end}}" name="classify_model" id="classify-model-flex" style="min-width:300px;"{{if ne .ClassifyTier "flex"}} disabled{{end}}>
-          {{range .FlexModels}}{{if .Flex}}
-          <option value="{{.ID}}"{{if eq .ID $.ClassifyModel}} selected{{end}}>{{.Label}} — {{if ge .FlexCostPer1M 0.0}}${{printf "%.3f" .FlexCostPer1M}}/1M in (flex){{else}}n/a{{end}}</option>
-          {{end}}{{end}}
-        </select>
+        {{template "model_tier_picker" (dict "Prefix" "classify" "Tier" .ClassifyTier "AriaLabel" "Classification tier" "Models" .Models "FlexModels" .FlexModels "SelectedModel" .ClassifyModel)}}
       </div>
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="fw-medium">Prompt improver model</div>
         <div class="small text-muted mt-1">Bedrock model used for "Generate instruction" and "Improve rule". A smarter model here is fine since it runs infrequently. Same <strong>Standard</strong>/<strong>Flex</strong> tiers as classification — flex is discounted but lower-priority, which is fine for these occasional interactive calls.</div>
-        <input type="hidden" name="improve_tier" id="improve-tier-input" value="{{.ImproveTier}}">
-        <div class="btn-group btn-group-sm mt-2 mb-2" role="group" aria-label="Prompt improver tier" id="improve-tier-toggle">
-          <button type="button" class="btn btn-outline-primary{{if ne .ImproveTier "flex"}} active{{end}}" data-tier="standard">Standard</button>
-          <button type="button" class="btn btn-outline-primary{{if eq .ImproveTier "flex"}} active{{end}}" data-tier="flex">Flex</button>
-        </div>
-        <select class="form-select form-select-sm{{if eq .ImproveTier "flex"}} d-none{{end}}" name="improve_model" id="improve-model-standard" style="min-width:300px;"{{if eq .ImproveTier "flex"}} disabled{{end}}>
-          {{range .Models}}
-          <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — {{if ge .InputCostPer1M 0.0}}${{printf "%.3f" .InputCostPer1M}}/1M in{{else}}n/a{{end}}</option>
-          {{end}}
-        </select>
-        <select class="form-select form-select-sm{{if ne .ImproveTier "flex"}} d-none{{end}}" name="improve_model" id="improve-model-flex" style="min-width:300px;"{{if ne .ImproveTier "flex"}} disabled{{end}}>
-          {{range .FlexModels}}{{if .Flex}}
-          <option value="{{.ID}}"{{if eq .ID $.ImproveModel}} selected{{end}}>{{.Label}} — {{if ge .FlexCostPer1M 0.0}}${{printf "%.3f" .FlexCostPer1M}}/1M in (flex){{else}}n/a{{end}}</option>
-          {{end}}{{end}}
-        </select>
+        {{template "model_tier_picker" (dict "Prefix" "improve" "Tier" .ImproveTier "AriaLabel" "Prompt improver tier" "Models" .Models "FlexModels" .FlexModels "SelectedModel" .ImproveModel)}}
       </div>
       <div class="py-3 px-4 border-bottom setting-row">
         <div class="form-check form-switch">

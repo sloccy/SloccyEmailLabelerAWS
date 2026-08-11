@@ -36,8 +36,8 @@
     </nav>
     <div class="sidebar-footer mt-auto pt-3 border-top">
       <div class="d-flex align-items-center gap-2 font-monospace small text-muted">
-        <span class="status-dot active" id="pollerDot"></span>
-        <div class="lh-sm" id="pollerLabel">
+        <span class="status-dot active"></span>
+        <div class="lh-sm">
           <div>auto-scan</div>
           <div>Daily</div>
           <div>2am ET</div>
@@ -52,7 +52,7 @@
     <div class="page active" id="page-dashboard">
       <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
         <div><h2 class="fw-bold mb-1">Dashboard</h2><div class="small text-muted">Overview of your email scanning setup</div></div>
-        <div><button class="btn btn-outline-info btn-sm" id="btn-scan-now" hx-post="/fragments/scan" hx-swap="none" hx-disabled-elt="this" hx-on::before-request="toast('Scan started\u2026','info')">&#9654; Scan Now</button></div>
+        <div><button class="btn btn-outline-info btn-sm" hx-post="/fragments/scan" hx-swap="none" hx-disabled-elt="this" hx-on::before-request="toast('Scan started\u2026','info')">&#9654; Scan Now</button></div>
       </div>
       <div id="dashboard-content"
         hx-get="/fragments/dashboard"
@@ -137,7 +137,7 @@
     <div class="page" id="page-prompts">
       <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
         <div><h2 class="fw-bold mb-1">Prompts</h2><div class="small text-muted">Rules the AI uses to decide which labels to apply</div></div>
-        <div><button class="btn btn-outline-secondary btn-sm" onclick="exportPrompts()" id="btn-export">&#8595; Export</button> <button class="btn btn-primary btn-sm" onclick="togglePanel('add-prompt-panel')">+ Add Prompt</button></div>
+        <div><button class="btn btn-outline-secondary btn-sm" onclick="exportPrompts()">&#8595; Export</button> <button class="btn btn-primary btn-sm" onclick="togglePanel('add-prompt-panel')">+ Add Prompt</button></div>
       </div>
 
       <div class="d-flex align-items-center gap-3 mb-4">
@@ -218,7 +218,7 @@
 
         <div id="builder-result" style="display:none;margin-top:28px;">
           <hr>
-          <div id="builder-sse-container">
+          <div>
             <h6 class="section-title">Generated instruction</h6>
             <div class="mb-3">
               <textarea class="form-control" id="builder-instruction" style="min-height:6rem"></textarea>
@@ -321,7 +321,7 @@
             hx-get="/fragments/history"
             hx-trigger="intersect once, refreshHistory from:body"
             hx-swap="innerHTML">
-            <tr><td colspan="8"><div class="text-center text-muted py-5"><div class="opacity-25 mb-2"><svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>No history yet. Labels will appear here after emails are scanned.</div></td></tr>
+            <tr><td colspan="8">{{template "empty_state" (dict "Icon" (safeHTML `<svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg>`) "Text" "No history yet. Labels will appear here after emails are scanned.")}}</td></tr>
           </tbody>
         </table>
       </div>

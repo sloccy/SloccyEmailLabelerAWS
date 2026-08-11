@@ -19,7 +19,16 @@ func tmplFuncs() template.FuncMap {
 		"fmtdateStacked": fmtdateStacked,
 		"fmtretention":   fmtretention,
 		"dict":           dict,
+		"safeHTML":       safeHTML,
 	}
+}
+
+// safeHTML marks a string as pre-trusted HTML so html/template passes it through instead of
+// escaping it — used to hand a literal icon <svg> into the "empty_state" partial via dict,
+// same reasoning as fmtdateStacked's template.HTML return above. Only ever called with
+// hardcoded markup from these template files, never with request/user-controlled input.
+func safeHTML(s string) template.HTML {
+	return template.HTML(s) //nolint:gosec // G203: trusted, hardcoded template markup only
 }
 
 // dict creates a map from alternating key/value pairs, used in templates as (dict "Key" val ...).

@@ -440,8 +440,7 @@ func (s *Store) SeedSetting(key, value string) error {
 		},
 	})
 	if err != nil {
-		var ccf *types.ConditionalCheckFailedException
-		if isConditionFailed(err, &ccf) {
+		if isConditionFailed(err) {
 			return nil // already seeded
 		}
 		return err
@@ -834,8 +833,7 @@ func (s *Store) UpdateAccountWatch(ctx context.Context, arg UpdateAccountWatchPa
 		ConditionExpression: aws.String("attribute_not_exists(watchHistNum) OR watchHistNum < :hn"),
 	})
 	if err != nil {
-		var ccf *types.ConditionalCheckFailedException
-		if isConditionFailed(err, &ccf) {
+		if isConditionFailed(err) {
 			return nil // a newer history id is already stored; ignore the stale advance
 		}
 		return err
@@ -1898,8 +1896,7 @@ func (s *Store) ClaimMessages(ctx context.Context, accountID int64, messageIDs [
 			},
 		})
 		if err != nil {
-			var ccf *types.ConditionalCheckFailedException
-			if isConditionFailed(err, &ccf) {
+			if isConditionFailed(err) {
 				continue // another invocation already owns (or confirmed) this message
 			}
 			return claimed, err
@@ -1924,8 +1921,7 @@ func (s *Store) ReleaseClaim(ctx context.Context, accountID int64, messageID str
 		ConditionExpression: aws.String("attribute_exists(" + attrLeaseExp + ")"),
 	})
 	if err != nil {
-		var ccf *types.ConditionalCheckFailedException
-		if isConditionFailed(err, &ccf) {
+		if isConditionFailed(err) {
 			return nil // already confirmed or already released
 		}
 		return err
@@ -2300,8 +2296,8 @@ func (s *Store) InsertPromptExamples(ctx context.Context, examples []PromptExamp
 	}
 	// localIDs, not nextIDs: same reasoning as BatchInsertProcessingResults — the SK already
 	// carries CreatedAt for ordering, so the id only needs to be unique, not a counter round
-	// trip. This also matters for correctness, not just cost: selectExamplesForPrompt's
-	// "newest verdict wins" dedup (recategorize.go) depends on every PromptExample write
+	// trip. This also matters for correctness, not just cost: gatherRawExamples' (improve.go)
+	// "newest verdict wins" dedup depends on every PromptExample write
 	// path — this one (manual recategorize) and BatchInsertProcessingResults' (passive
 	// confirmation on classify) — sharing the same monotonically-ordered id source, so a
 	// later correction's id reliably outranks an earlier passive confirmation's regardless
@@ -2518,25 +2514,6 @@ func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, 
 	return result, nil
 }
 
-func (s *Store) CountPendingPromptSuggestions(ctx context.Context) (int64, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		FilterExpression:       aws.String("#s = :pending"),
-		ExpressionAttributeNames: map[string]string{
-			"#s": attrStatus,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK:     sv("SUGGESTION"),
-			":pending": sv(SuggestionStatusPending),
-		},
-	})
-	if err != nil {
-		return 0, err
-	}
-	return int64(len(items)), nil
-}
-
 func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePromptSuggestionParams) error {
 	return s.updateItem(ctx, "SUGGESTION", padID(arg.ID),
 		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua, "+
@@ -2559,18 +2536,6 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			":rr":         nv(arg.RoundsRun),
 			":br":         nv(arg.BestRound),
 		})
-}
-
-// UpdatePromptSuggestion saves edits to a suggestion and resets it to pending — the same
-// write as FinalizePromptSuggestion, with the status fixed to SuggestionStatusPending.
-func (s *Store) UpdatePromptSuggestion(ctx context.Context, arg UpdatePromptSuggestionParams) error {
-	return s.FinalizePromptSuggestion(ctx, FinalizePromptSuggestionParams{
-		SuggestedInstructions: arg.SuggestedInstructions,
-		ConversationJSON:      arg.ConversationJSON,
-		Status:                SuggestionStatusPending,
-		UserComment:           arg.UserComment,
-		ID:                    arg.ID,
-	})
 }
 
 // setSuggestionStatus stamps a suggestion's status + updatedAt — shared by
@@ -2641,8 +2606,7 @@ func (s *Store) ClaimPromptSuggestion(ctx context.Context, id int64) (bool, erro
 		},
 	})
 	if err != nil {
-		var ccf *types.ConditionalCheckFailedException
-		if isConditionFailed(err, &ccf) {
+		if isConditionFailed(err) {
 			return false, nil
 		}
 		return false, err
@@ -3056,13 +3020,6 @@ type FinalizePromptSuggestionParams struct {
 	BestRound  int64
 }
 
-type UpdatePromptSuggestionParams struct {
-	SuggestedInstructions string
-	ConversationJSON      string
-	UserComment           string
-	ID                    int64
-}
-
 type SetGlobalRetentionParams struct {
 	AccountID  int64
 	GlobalDays sql.NullInt64
@@ -3132,18 +3089,12 @@ type HistoryFilter struct {
 // Error helpers
 // ============================================================
 
-func isConditionFailed(err error, target **types.ConditionalCheckFailedException) bool {
+func isConditionFailed(err error) bool {
 	if err == nil {
 		return false
 	}
 	// errors.As unwraps the smithy OperationError that the SDK wraps the
 	// ConditionalCheckFailedException in; a plain type assertion would miss it.
 	var ccf *types.ConditionalCheckFailedException
-	if errors.As(err, &ccf) {
-		if target != nil {
-			*target = ccf
-		}
-		return true
-	}
-	return false
+	return errors.As(err, &ccf)
 }
