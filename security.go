@@ -40,13 +40,13 @@ func newSecurityMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 
-		// GET /api/prompts/generate-stream drives Bedrock spend, so it gets the same
+		// generateStreamPath (server.go) drives Bedrock spend, so it gets the same
 		// cross-site check as writes despite being a read. The suggestion-trace endpoint
 		// is cheap per call (a couple of DynamoDB reads), but a hostile page can hold a
 		// tab open and poll it in a loop for as long as the victim leaves it open, same
 		// abuse shape as generate-stream just at a smaller unit cost — same gate.
 		guarded := r.Method != http.MethodGet && r.Method != http.MethodHead ||
-			r.URL.Path == "/api/prompts/generate-stream" ||
+			r.URL.Path == generateStreamPath ||
 			strings.HasSuffix(r.URL.Path, "/trace")
 		if guarded {
 			switch r.Header.Get("Sec-Fetch-Site") {

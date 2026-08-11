@@ -23,39 +23,63 @@ func (d reasoningDirective) isZero() bool {
 	return d.system == "" && d.fields == nil
 }
 
-// reasoningRegistryEntry pairs a case-insensitive model-id substring with the
-// directive that suppresses that family's reasoning output.
-type reasoningRegistryEntry struct {
-	substr    string
-	directive reasoningDirective
+// modelCapability pairs a case-insensitive model-id substring with what this project has
+// actually verified about that family against Bedrock — the union of what used to be two
+// separate tables (reasoningOff's registry and reasoningEffortSupported's exempt list),
+// merged because both are keyed by the same substring-match-on-model-id mechanism, even
+// though they answer different questions. suppress and noEffort are independent: an entry
+// can set either, both, or (if it only exists to be looked up by one of the two functions
+// below) leave the other at its zero value.
+//
+// suppress is the directive that suppresses that family's chain-of-thought output for
+// classification — not a single-model assumption baked into the classify path (that was
+// the earlier bug: comments throughout this package assumed Amazon Nova specifically,
+// which broke down the moment the configured model changed; this table exists so a model
+// swap only needs a new entry here, not a re-audit of the whole classify path). A model
+// matching no entry (or matching one with a zero suppress) resolves to a zero directive —
+// a safe no-op, not an error — so an unrecognized model still classifies correctly, just
+// without reasoning suppressed (see detectReasoning, which reports when that's happening).
+//
+// noEffort marks a family verified live against Bedrock to NOT honor
+// additionalModelRequestFields.reasoning_config — every other model is assumed to support
+// it (see reasoningEffortSupported). Confirmed exceptions, both via a before/after
+// Converse comparison (baseline vs. reasoning_config:"high", checking for a
+// ReasoningContent block in the response):
+//   - nvidia.nemotron-nano-9b-v2: field silently ignored, output identical to baseline.
+//     (Contrast nvidia.nemotron-super-3-120b, same vendor, which DOES respond — this is a
+//     model-size quirk, not a family-wide one, so the substring is deliberately narrow.)
+//   - mistral.magistral-small-2509: reasons unconditionally inline in the visible text
+//     (never as a structured ReasoningContent block), unaffected by the field either way.
+//
+// A new noEffort entry needs the same live comparison, not a guess.
+type modelCapability struct {
+	substr   string
+	suppress reasoningDirective // zero value: no suppression directive for this family
+	noEffort bool               // true: reasoningEffortSupported returns false for a match
 }
 
-// reasoningRegistry is a maintained capability map for the model families this
-// project has actually run against Bedrock classification — it is NOT a
-// single-model assumption baked into the classify path. (That was the earlier bug:
-// comments throughout this package assumed Amazon Nova specifically, which broke
-// down the moment the configured model changed. This table exists so a model swap
-// only needs a new entry here, not a re-audit of the whole classify path.) An
-// unmatched model id resolves to a zero directive — a safe no-op, not an error —
-// so an unrecognized model still classifies correctly, just without reasoning
-// suppressed (see detectReasoning, which reports when that's happening).
-var reasoningRegistry = []reasoningRegistryEntry{
-	{substr: "qwen", directive: reasoningDirective{system: "/no_think"}},
-	{substr: "nemotron", directive: reasoningDirective{system: "detailed thinking off"}},
+var modelCapabilities = []modelCapability{
+	{substr: "qwen", suppress: reasoningDirective{system: "/no_think"}},
+	{substr: "nemotron", suppress: reasoningDirective{system: "detailed thinking off"}},
+	{substr: "nemotron-nano", noEffort: true},
+	{substr: "magistral", noEffort: true},
 }
 
-// reasoningOff returns the directive that suppresses reasoning output for modelID,
-// looked up by case-insensitive substring match against reasoningRegistry. override,
-// when non-empty, replaces the registry's system string — the escape hatch for a
-// model family the registry doesn't know about yet (see
-// SettingClassifyReasoningDirective). A model matching no registry entry and given
-// no override returns a zero directive (no-op).
+// reasoningOff returns the directive that suppresses reasoning output for modelID, looked
+// up by case-insensitive substring match against modelCapabilities' suppress entries.
+// override, when non-empty, replaces the matched (or zero) directive's system string — the
+// escape hatch for a model family the table doesn't know about yet (see
+// SettingClassifyReasoningDirective). A model matching no suppress entry and given no
+// override returns a zero directive (no-op).
 func reasoningOff(modelID, override string) reasoningDirective {
 	var d reasoningDirective
 	lower := strings.ToLower(modelID)
-	for _, e := range reasoningRegistry {
+	for _, e := range modelCapabilities {
+		if e.suppress.isZero() {
+			continue
+		}
 		if strings.Contains(lower, e.substr) {
-			d = e.directive
+			d = e.suppress
 			break
 		}
 	}
@@ -86,40 +110,25 @@ func applyReasoningOff(sys []types.SystemContentBlock, modelID, override string)
 	return sys, fields
 }
 
-// reasoningEffortExempt lists case-insensitive model-id substrings verified live against
-// Bedrock to NOT honor additionalModelRequestFields.reasoning_config — every other model is
-// assumed to support it (see reasoningEffortSupported). Confirmed exceptions, both via a
-// before/after Converse comparison (baseline vs. reasoning_config:"high", checking for a
-// ReasoningContent block in the response):
-//   - nvidia.nemotron-nano-9b-v2: field silently ignored, output identical to baseline.
-//     (Contrast nvidia.nemotron-super-3-120b, same vendor, which DOES respond — this is a
-//     model-size quirk, not a family-wide one, so the substring is deliberately narrow.)
-//   - mistral.magistral-small-2509: reasons unconditionally inline in the visible text
-//     (never as a structured ReasoningContent block), unaffected by the field either way.
-//
-// A new entry here needs the same live comparison, not a guess.
-var reasoningEffortExempt = []string{
-	"nemotron-nano",
-	"magistral",
-}
-
 // reasoningEffortSupported reports whether modelID is expected to honor
-// additionalModelRequestFields.reasoning_config:"high" — true unless modelID matches
-// reasoningEffortExempt. Verified broadly, not universally: sweeping every reasoning-capable
-// chat model available in this account's Bedrock catalog, 9 of 12 spanning DeepSeek,
-// Zhipu/GLM (5, 4.7, 4.7-flash), Moonshot/Kimi, MiniMax, Alibaba/Qwen3, NVIDIA Nemotron (the
-// larger variant), and OpenAI gpt-oss all turned on visible chain-of-thought for this exact
-// field/value regardless of vendor. That consistency across unrelated model providers is
-// itself evidence Bedrock translates this specific field server-side rather than every
-// vendor happening to use the identical native parameter name — GLM-5's own
-// ValidationException on a malformed value once named the backend param "reasoning_effort"
-// for a request that sent "reasoning_config", i.e. Bedrock renamed it in transit. So an
-// unverified model defaults to "assume it works"; ImprovePromptInstructions'
-// ValidationException retry is the safety net for a model where that assumption is wrong.
+// additionalModelRequestFields.reasoning_config:"high" — true unless modelID matches a
+// modelCapability entry with noEffort set (see its doc comment for the two confirmed
+// exceptions and how they were verified). Verified broadly, not universally: sweeping
+// every reasoning-capable chat model available in this account's Bedrock catalog, 9 of 12
+// spanning DeepSeek, Zhipu/GLM (5, 4.7, 4.7-flash), Moonshot/Kimi, MiniMax, Alibaba/Qwen3,
+// NVIDIA Nemotron (the larger variant), and OpenAI gpt-oss all turned on visible
+// chain-of-thought for this exact field/value regardless of vendor. That consistency
+// across unrelated model providers is itself evidence Bedrock translates this specific
+// field server-side rather than every vendor happening to use the identical native
+// parameter name — GLM-5's own ValidationException on a malformed value once named the
+// backend param "reasoning_effort" for a request that sent "reasoning_config", i.e.
+// Bedrock renamed it in transit. So an unverified model defaults to "assume it works";
+// ImprovePromptInstructions' ValidationException retry is the safety net for a model where
+// that assumption is wrong.
 func reasoningEffortSupported(modelID string) bool {
 	lower := strings.ToLower(modelID)
-	for _, s := range reasoningEffortExempt {
-		if strings.Contains(lower, s) {
+	for _, e := range modelCapabilities {
+		if e.noEffort && strings.Contains(lower, e.substr) {
 			return false
 		}
 	}
@@ -128,8 +137,8 @@ func reasoningEffortSupported(modelID string) bool {
 
 // ReasoningEffortLevels returns the non-off SettingImproveReasoningEffort values modelID
 // supports — today always []string{ReasoningEffortOn} for a supported model (see
-// reasoningEffortSupported), since no model in reasoningEffortExempt's sibling set has been
-// verified to have a real graduated ladder rather than a bare on/off switch (GLM-5
+// reasoningEffortSupported), since no verified model has been found to have a real
+// graduated ladder rather than a bare on/off switch (GLM-5
 // specifically: "none"/"low"/"medium" were all indistinguishable from omitting the field,
 // only "high" did anything — see reasoningEffortFields). Returns nil for an exempt model —
 // the Settings UI reads that as "reasoning effort isn't controllable here" and disables the
@@ -158,7 +167,7 @@ func reasoningEffortFields(modelID, effort string) map[string]any {
 // detectReasoning reports whether a classify response contains reasoning/
 // chain-of-thought content despite the reasoning directive — either as a dedicated
 // Converse ReasoningContent block, or as an inline "<think>...</think>" span in the
-// text output (the two forms observed across the model families reasoningRegistry
+// text output (the two forms observed across the model families modelCapabilities
 // covers). This is the "is suppression actually working" signal: no Bedrock API
 // reports it directly, so ClassifyEmailBatch logs this on every call instead.
 func detectReasoning(output types.ConverseOutput, rawText string) bool {

@@ -56,6 +56,13 @@ const (
 	headerAcceptEncoding          = "Accept-Encoding"
 )
 
+// generateStreamPath is the SSE endpoint that both ServeHTTP below (skips gzip —
+// flushing one small chunk per generated token shouldn't pay a compress+flush cycle per
+// chunk) and newSecurityMiddleware (security.go — CSRF-guards it despite being a GET,
+// since it drives Bedrock spend) special-case. One shared constant so a route rename
+// can't silently drop either exception out of sync with the other.
+const generateStreamPath = "/api/prompts/generate-stream"
+
 // server holds all dependencies and the route mux.
 type server struct {
 	ctx   context.Context
@@ -133,7 +140,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// /static/ serves pre-gzipped files itself (see registerRoutes); the SSE stream flushes
 	// one small chunk per generated token, and wrapping it in gzip would force a compress+
 	// flush cycle on every chunk for no real size benefit — both skip the wrapper entirely.
-	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/api/prompts/generate-stream" {
+	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == generateStreamPath {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -890,9 +897,9 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	v.ImproveModel = s.applyModelSetting(ctx, r, "improve_model", llm.SettingImproveModel, cur.ImproveModel, v.ImproveTier, findModel)
 
 	// Reasoning-suppression override: free text, no validation beyond trimming — it's an
-	// escape hatch for a model family reasoningRegistry (llm/reasoning.go) doesn't know
+	// escape hatch for a model family modelCapabilities (llm/reasoning.go) doesn't know
 	// about yet, so any soft-switch string the model expects is valid. Empty clears the
-	// override and falls back to the registry (see resolveSetting).
+	// override and falls back to the table (see resolveSetting).
 	v.ReasoningDirective = strings.TrimSpace(r.FormValue("classify_reasoning_directive"))
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: v.ReasoningDirective})
 

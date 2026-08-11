@@ -90,9 +90,9 @@ const (
 	SettingImproveTier = "improve_tier"
 	// SettingClassifyReasoningDirective holds an optional override for the
 	// reasoning-suppression system-prompt switch reasoningOff would otherwise pick from
-	// reasoningRegistry (reasoning.go) based on the classify model's id. Only needed for
-	// a model family the registry doesn't recognize yet; empty (the default) means "use
-	// the registry, or no-op if the model isn't in it."
+	// modelCapabilities (reasoning.go) based on the classify model's id. Only needed for
+	// a model family the table doesn't recognize yet; empty (the default) means "use
+	// the table, or no-op if the model isn't in it."
 	SettingClassifyReasoningDirective = "classify_reasoning_directive"
 	// SettingImproveReplay toggles replaying a candidate rule against its example corpus
 	// on the classify model before showing a suggestion (see ReplayAgainstExamples).
@@ -234,7 +234,7 @@ type Client struct {
 // one (no classify_model setting and no BEDROCK_MODEL env var) — e.g. on a fresh
 // install before Settings has been configured. The model actually used for
 // classification at runtime is whatever's configured there; nothing elsewhere in this
-// package should assume this specific model's behavior (see reasoningRegistry in
+// package should assume this specific model's behavior (see modelCapabilities in
 // reasoning.go for why that assumption bit us before).
 const DefaultModel = "us.amazon.nova-micro-v1:0"
 
@@ -746,7 +746,7 @@ func systemBlock(text string) []types.SystemContentBlock {
 
 // classifyPayload returns the request pieces for a classify Converse call: the user
 // message, inference config, the system content blocks (the invariant role/output
-// contract, plus — when modelID's family is in reasoningRegistry, or reasoningOverride
+// contract, plus — when modelID's family is in modelCapabilities, or reasoningOverride
 // is set — a trailing chain-of-thought-suppression block; see reasoning.go), and any
 // additional model request fields that suppression directive also carries.
 func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride string) ([]types.Message, *types.InferenceConfiguration, []types.SystemContentBlock, document.Interface) {
@@ -777,9 +777,9 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 // ClassifyEmailBatch classifies one email against prompts using the given model and
 // service tier. Callers classifying many emails in one pass should resolve
 // model/tier/reasoningOverride once via ResolveClassifySettings and reuse them across
-// calls. reasoningOverride overrides reasoningRegistry's suppression directive for a
-// model the registry doesn't know about yet (see SettingClassifyReasoningDirective);
-// pass "" to use the registry as-is. debug gates building the (comparatively expensive)
+// calls. reasoningOverride overrides modelCapabilities' suppression directive for a
+// model the table doesn't know about yet (see SettingClassifyReasoningDirective);
+// pass "" to use the table as-is. debug gates building the (comparatively expensive)
 // serialized request JSON onto ClassifyResult.RequestJSON — it's only ever read by the
 // Troubleshooting UI's debug write, so normal operation skips it.
 func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, email Email, prompts []Prompt, model, tier, reasoningOverride string, debug bool) (ClassifyResult, error) {
@@ -884,6 +884,41 @@ func (c *Client) StreamGeneratePromptInstruction(ctx context.Context, descriptio
 	return ch
 }
 
+// drainConverseStream reads es's events until the stream ends, calling onText/onReasoning
+// for each non-empty delta and stopping (returning the callback's error immediately) the
+// moment either one does. Shared by streamGenerate and ImprovePromptInstructions's stream
+// closure, which differ only in what they do with each delta — send it over a channel with
+// ctx cancellation vs. accumulate it into a strings.Builder — not in how the SDK's
+// delta-type taxonomy is unwrapped. The returned StopReason reflects the last
+// ConverseStreamOutputMemberMessageStop event seen (the zero value if none arrived, e.g. a
+// callback error cut the drain short); the returned error is the last callback error, or
+// es.Err() if the stream ended without one.
+func drainConverseStream(es *bedrockruntime.ConverseStreamEventStream, onText, onReasoning func(string) error) (types.StopReason, error) {
+	var stopReason types.StopReason
+	for event := range es.Events() {
+		switch e := event.(type) {
+		case *types.ConverseStreamOutputMemberContentBlockDelta:
+			switch d := e.Value.Delta.(type) {
+			case *types.ContentBlockDeltaMemberText:
+				if d.Value != "" && onText != nil {
+					if err := onText(d.Value); err != nil {
+						return stopReason, err
+					}
+				}
+			case *types.ContentBlockDeltaMemberReasoningContent:
+				if rt, ok := d.Value.(*types.ReasoningContentBlockDeltaMemberText); ok && rt.Value != "" && onReasoning != nil {
+					if err := onReasoning(rt.Value); err != nil {
+						return stopReason, err
+					}
+				}
+			}
+		case *types.ConverseStreamOutputMemberMessageStop:
+			stopReason = e.Value.StopReason
+		}
+	}
+	return stopReason, es.Err()
+}
+
 func (c *Client) streamGenerate(ctx context.Context, description string, ch chan<- StreamChunk) error {
 	model := c.resolveModel(ctx, SettingImproveModel)
 	// Same 60-word/single-line/no-markdown shape as improveSystemPrompt, so a rule
@@ -921,38 +956,30 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 	}
 	defer func() { _ = stream.Close() }()
 
-	for event := range stream.Events() {
-		switch e := event.(type) {
-		case *types.ConverseStreamOutputMemberContentBlockDelta:
-			switch d := e.Value.Delta.(type) {
-			case *types.ContentBlockDeltaMemberText:
-				if d.Value != "" {
-					select {
-					case ch <- StreamChunk{Text: d.Value}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				}
-			case *types.ContentBlockDeltaMemberReasoningContent:
-				// Same thinking view ImprovePromptInstructions streams — the builder call
-				// uses this system prompt's own reasoning suppression above, but a model
-				// that leaks a ReasoningContent block anyway is worth showing rather than
-				// silently dropping (matches ImprovePromptInstructions' behavior).
-				if rt, ok := d.Value.(*types.ReasoningContentBlockDeltaMemberText); ok && rt.Value != "" {
-					select {
-					case ch <- StreamChunk{Reasoning: rt.Value}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				}
-			}
-		case *types.ConverseStreamOutputMemberMessageStop:
-			if e.Value.StopReason == types.StopReasonMaxTokens {
-				return errors.New("LLM response truncated at max_tokens")
-			}
+	// Same thinking view ImprovePromptInstructions streams — the builder call uses this
+	// system prompt's own reasoning suppression above, but a model that leaks a
+	// ReasoningContent block anyway is worth showing rather than silently dropping
+	// (matches ImprovePromptInstructions' behavior).
+	sendChunk := func(chunk StreamChunk) error {
+		select {
+		case ch <- chunk:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	return stream.Err()
+	stopReason, err := drainConverseStream(stream,
+		func(text string) error { return sendChunk(StreamChunk{Text: text}) },
+		func(reasoning string) error { return sendChunk(StreamChunk{Reasoning: reasoning}) },
+	)
+	// Checked before err (a cancellation error can only follow a callback error, never a
+	// MaxTokens stop — MessageStop is the stream's terminal event) so a truncation is
+	// always reported as truncation, the same priority the original inline loop gave it
+	// by returning on MaxTokens without ever consulting the stream's own error.
+	if stopReason == types.StopReasonMaxTokens {
+		return errors.New("LLM response truncated at max_tokens")
+	}
+	return err
 }
 
 // ============================================================
@@ -1230,30 +1257,20 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		defer func() { _ = es.Close() }()
 
 		var sb strings.Builder
-		for event := range es.Events() {
-			switch e := event.(type) {
-			case *types.ConverseStreamOutputMemberContentBlockDelta:
-				switch d := e.Value.Delta.(type) {
-				case *types.ContentBlockDeltaMemberText:
-					if d.Value != "" {
-						sb.WriteString(d.Value)
-						emitted = true
-						emit(StreamChunk{Text: d.Value})
-					}
-				case *types.ContentBlockDeltaMemberReasoningContent:
-					if rt, ok := d.Value.(*types.ReasoningContentBlockDeltaMemberText); ok && rt.Value != "" {
-						emitted = true
-						emit(StreamChunk{Reasoning: rt.Value})
-					}
-				}
-			case *types.ConverseStreamOutputMemberMessageStop:
-				stopReason = e.Value.StopReason
-			}
-		}
-		if streamErr := es.Err(); streamErr != nil {
-			return sb.String(), stopReason, emitted, streamErr
-		}
-		return sb.String(), stopReason, emitted, nil
+		stopReason, err = drainConverseStream(es,
+			func(text string) error {
+				sb.WriteString(text)
+				emitted = true
+				emit(StreamChunk{Text: text})
+				return nil
+			},
+			func(reasoning string) error {
+				emitted = true
+				emit(StreamChunk{Reasoning: reasoning})
+				return nil
+			},
+		)
+		return sb.String(), stopReason, emitted, err
 	}
 
 	answer, stopReason, emitted, err := stream(fields)
