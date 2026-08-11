@@ -149,16 +149,24 @@ type pricingCatalog struct {
 	flexCapable          map[string]bool
 }
 
-// fetchPricingCatalog queries the AWS Price List API for Amazon Bedrock's us-east-1
-// on-demand catalog and derives per-model standard and flex-tier input pricing.
-func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatalog, error) {
-	cat := &pricingCatalog{
+// newPricingCatalog returns an empty catalog with every map initialized (never nil) — the
+// shape both fetchPricingCatalog's happy path and its caller's fetch-failure fallback
+// (bedrock.go) need. Sharing this constructor is what caught the fallback silently omitting
+// outputPricePer1M/flexOutputPricePer1M, which fetchPricingCatalog always populated.
+func newPricingCatalog() *pricingCatalog {
+	return &pricingCatalog{
 		inputPricePer1M:      map[string]float64{},
 		outputPricePer1M:     map[string]float64{},
 		flexInputPricePer1M:  map[string]float64{},
 		flexOutputPricePer1M: map[string]float64{},
 		flexCapable:          map[string]bool{},
 	}
+}
+
+// fetchPricingCatalog queries the AWS Price List API for Amazon Bedrock's us-east-1
+// on-demand catalog and derives per-model standard and flex-tier input pricing.
+func fetchPricingCatalog(ctx context.Context, pc *pricing.Client) (*pricingCatalog, error) {
+	cat := newPricingCatalog()
 
 	paginator := pricing.NewGetProductsPaginator(pc, &pricing.GetProductsInput{
 		ServiceCode: aws.String("AmazonBedrock"),

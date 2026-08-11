@@ -8,19 +8,7 @@
         {{else}}
           <span class="badge text-bg-danger">wrong match (false positive)</span>
         {{end}}
-        {{if eq .Status "generating"}}
-          <span class="badge text-bg-warning">
-            <span class="spinner-border spinner-border-sm me-1" style="width:.65em;height:.65em" role="status" aria-hidden="true"></span>Generating&hellip;
-          </span>
-        {{else if eq .Status "pending"}}
-          <span class="badge text-bg-primary">pending</span>
-        {{else if eq .Status "applied"}}
-          <span class="badge text-bg-success">applied</span>
-        {{else if eq .Status "failed"}}
-          <span class="badge text-bg-danger">failed</span>
-        {{else}}
-          <span class="badge text-bg-secondary">dismissed</span>
-        {{end}}
+        {{template "suggestion_status_badge" .Status}}
       </div>
     </div>
     <button type="button" class="btn btn-outline-secondary btn-sm"
@@ -31,7 +19,7 @@
 
   {{if .ExampleGroups}}
   <details class="mb-3">
-    <summary class="small text-muted" style="cursor:pointer">Example history used ({{range $i, $g := .ExampleGroups}}{{if $i}}, {{end}}{{len $g.Examples}} {{$g.Verdict}}{{end}})</summary>
+    <summary class="small text-muted">Example history used ({{range $i, $g := .ExampleGroups}}{{if $i}}, {{end}}{{len $g.Examples}} {{$g.Verdict}}{{end}})</summary>
     <div class="mt-2 d-flex flex-column gap-3">
       {{range .ExampleGroups}}
       <div>
@@ -57,7 +45,7 @@
     <span class="text-muted">&middot; replayed on {{.ReplayModel}}</span>
     {{if .ReplayFailures}}
     <details class="mt-1">
-      <summary class="text-muted" style="cursor:pointer">{{len .ReplayFailures}} mismatch{{if ne (len .ReplayFailures) 1}}es{{end}} &#9656;</summary>
+      <summary class="text-muted">{{len .ReplayFailures}} mismatch{{if ne (len .ReplayFailures) 1}}es{{end}} &#9656;</summary>
       <ul class="small mt-1 ps-3 mb-0">
         {{range .ReplayFailures}}
         <li>{{.Verdict}}: <span class="text-muted">{{.Sender}}</span> &mdash; {{if .Subject}}{{.Subject}}{{else}}(no subject){{end}} <span class="text-muted">(model said {{.Got}})</span></li>
@@ -73,7 +61,7 @@
        a single-round suggestion (replay off, or improve_max_rounds=1) has nothing to
        compare and this would just repeat the Suggested Instructions pane below. */}}
   <details class="mb-3">
-    <summary class="small text-muted" style="cursor:pointer">Attempts ({{len .Rounds}}) &mdash; round {{.BestRound}} applied &#9656;</summary>
+    <summary class="small text-muted">Attempts ({{len .Rounds}}) &mdash; round {{.BestRound}} applied &#9656;</summary>
     <ul class="small mt-2 ps-3 mb-0">
       {{range .Rounds}}
       <li class="mb-1{{if eq .N $.BestRound}} fw-semibold{{end}}">
@@ -88,7 +76,7 @@
   <div class="row g-3 mb-4">
     <div class="col-md-6">
       <div class="form-label small fw-semibold text-muted text-uppercase">Current Instructions</div>
-      <pre class="p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.OriginalInstructions}}</pre>
+      <pre class="p-2 border rounded bg-body-secondary font-monospace small pre-wrap">{{.OriginalInstructions}}</pre>
     </div>
     <div class="col-md-6">
       <div class="form-label small fw-semibold text-success text-uppercase">Suggested Instructions</div>
@@ -98,34 +86,28 @@
            seq cursor (see handlePromptSuggestionTrace, server.go); the polling loop starts
            itself on htmx:afterSwap (see #suggestion-detail-container's listener) rather
            than needing a <script> tag embedded in this fragment. */}}
-      <div class="trace-live" data-suggestion-id="{{.ID}}" data-after-seq="0">
-        <div class="p-2 border rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">
+      <div class="trace-live" data-suggestion-id="{{.ID}}">
+        <div class="p-2 border rounded bg-body-secondary font-monospace small pre-wrap">
           <span class="trace-answer text-muted fst-italic">Waiting for the model to start&hellip;</span><span class="spinner-border spinner-border-sm ms-1" role="status" aria-hidden="true"></span>
         </div>
         <details class="mt-2">
-          <summary class="small text-muted" style="cursor:pointer">Thinking&hellip;</summary>
+          <summary class="small text-muted">Thinking&hellip;</summary>
           <pre class="trace-thinking small text-muted mt-1 mb-0" style="white-space:pre-wrap;word-break:break-word;max-height:12rem;overflow-y:auto"></pre>
         </details>
         <ul class="trace-steps small text-muted mt-2 mb-0 ps-3"></ul>
         <div class="trace-stalled small text-danger mt-2 d-none">No progress for a few minutes &mdash; the worker may have died. Try regenerating.</div>
       </div>
       {{else if eq .Status "failed"}}
-      <div class="p-2 border border-danger rounded bg-body-secondary font-monospace small text-danger" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.UserComment}}</div>
+      <div class="p-2 border border-danger rounded bg-body-secondary font-monospace small text-danger pre-wrap">{{.UserComment}}</div>
       {{else}}
-      <pre class="p-2 border border-success rounded bg-body-secondary font-monospace small" style="white-space:pre-wrap;word-break:break-word;min-height:5rem">{{.SuggestedInstructions}}</pre>
+      <pre class="p-2 border border-success rounded bg-body-secondary font-monospace small pre-wrap">{{.SuggestedInstructions}}</pre>
       {{end}}
     </div>
   </div>
 
   {{if eq .Status "generating"}}
   <div class="d-flex gap-2 flex-wrap">
-    <button type="button" class="btn btn-outline-secondary btn-sm"
-      hx-post="/fragments/prompt-suggestions/{{.ID}}/dismiss"
-      hx-target="#suggestion-row-{{.ID}}"
-      hx-swap="delete"
-      hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
-      Dismiss
-    </button>
+    {{template "suggestion_dismiss_btn" .ID}}
   </div>
   {{else if or (eq .Status "pending") (eq .Status "failed")}}
   <form hx-post="/fragments/prompt-suggestions/{{.ID}}/regenerate"
@@ -147,13 +129,7 @@
         Apply to Prompt
       </button>
       {{end}}
-      <button type="button" class="btn btn-outline-secondary btn-sm"
-        hx-post="/fragments/prompt-suggestions/{{.ID}}/dismiss"
-        hx-target="#suggestion-row-{{.ID}}"
-        hx-swap="delete"
-        hx-on::after-request="document.getElementById('suggestion-detail-container').innerHTML = ''">
-        Dismiss
-      </button>
+      {{template "suggestion_dismiss_btn" .ID}}
     </div>
   </form>
   {{else}}

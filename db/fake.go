@@ -244,7 +244,7 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, _ []LogEntry
 
 // ListExamplesByVerdict mirrors Store.ListExamplesByVerdict for tests: the newest (highest
 // ID) up to limit examples of one verdict for a prompt, newest first — same contract real
-// callers (selectExamplesForPrompt) depend on.
+// callers (gatherRawExamples, improve.go) depend on.
 func (s *FakeStore) ListExamplesByVerdict(_ context.Context, promptID int64, verdict string, limit int32) ([]PromptExample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -262,7 +262,7 @@ func (c *Client) post(ctx context.Context, path string, in any, out any) error {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("gmail API %s: %s", path, b)
+		return &httpStatusError{status: resp.StatusCode, path: path, body: b}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -370,18 +370,12 @@ func cloneLabels(m map[string]string) map[string]string {
 	return out
 }
 
-// EnsureLabel creates a label if it doesn't exist. Safe to call concurrently.
+// EnsureLabel creates a label if it doesn't exist. Safe to call concurrently. A thin
+// wrapper over BuildLabelCache (which already does exactly this — list, check, create on
+// miss — for a whole batch of names at once).
 func EnsureLabel(ctx context.Context, svc *Client, name string) error {
-	labels, err := ListLabels(ctx, svc)
-	if err != nil {
-		return err
-	}
-	for _, l := range labels {
-		if l.Name == name {
-			return nil
-		}
-	}
-	return svc.post(ctx, "/labels", map[string]string{"name": name}, nil)
+	_, err := BuildLabelCache(ctx, svc, []string{name})
+	return err
 }
 
 // ErrHistoryTooOld is returned by ListHistoryAddedMessageIDs when the supplied

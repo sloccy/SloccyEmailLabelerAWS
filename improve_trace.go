@@ -153,18 +153,6 @@ func (t *traceWriter) Sink(ctx context.Context, round int64) llm.ImproveSink {
 	}
 }
 
-// Flush forces out whatever streamed text is still buffered without waiting for the next
-// Event or threshold trip — a safety net for a code path that returns without emitting a
-// structural event of its own, so nothing buffered is ever silently lost.
-func (t *traceWriter) Flush(ctx context.Context) {
-	t.mu.Lock()
-	ev, ok := t.drainPendingLocked()
-	t.mu.Unlock()
-	if ok {
-		t.write(ctx, []db.SuggestionTraceEvent{ev})
-	}
-}
-
 // write appends events to the store, best-effort — see this file's package doc comment.
 func (t *traceWriter) write(ctx context.Context, events []db.SuggestionTraceEvent) {
 	if len(events) == 0 {

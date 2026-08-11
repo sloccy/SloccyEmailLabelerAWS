@@ -18,6 +18,41 @@ import (
 // Recategorize
 // ============================================================
 
+// parseIDList parses a repeated form field of decimal int64 ids, skipping any value that
+// doesn't parse rather than failing the whole request over one bad value. Shared by the
+// single-email and bulk recategorize handlers.
+func parseIDList(values []string) []int64 {
+	var out []int64
+	for _, v := range values {
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func idSet(ids []int64) map[int64]bool {
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
+// joinIDs renders ids as a comma-separated decimal string, for the CSV-encoded prompt-id
+// columns (AddedPrompts/RemovedPrompts/CurrentPromptIds) db.InsertEmailCorrectionParams
+// expects. Returns "" for an empty/nil slice.
+func joinIDs(ids []int64) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
 type recategorizeFormData struct {
 	HistoryID int64
 	MessageID string
@@ -56,15 +91,6 @@ func singleRecategorizeVerdicts(currentIDs, requestedIDs map[int64]bool, addedID
 	return verdicts
 }
 
-// buildPromptExamples turns a promptID->verdict map into example rows ready for
-// InsertPromptExamples. Every row from one recategorization shares the same email metadata
-// (account/message/sender/subject/excerpt/note) — they all describe the same underlying
-// correction, just from a different rule's point of view. promptByID stamps each example
-// with the rule's CurrentVersionID — which text actually produced this verdict — so a
-// later improve round can attribute a recurring problem to the version that caused it (see
-// db.PromptExample.PromptVersionID/Recurred). A promptID missing from promptByID (shouldn't
-// happen — the caller builds it from the same prompts the verdict map was computed against)
-// just stamps 0, same as a pre-ledger example.
 // incrementVersionObservedFor updates each example's PromptVersion with what it actually
 // turned out to be — a false_positive/false_negative correction is one more piece of
 // production evidence against whatever rule text was live when the mismatched email came
@@ -85,6 +111,15 @@ type versionObserver interface {
 	IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string)
 }
 
+// buildPromptExamples turns a promptID->verdict map into example rows ready for
+// InsertPromptExamples. Every row from one recategorization shares the same email metadata
+// (account/message/sender/subject/excerpt/note) — they all describe the same underlying
+// correction, just from a different rule's point of view. promptByID stamps each example
+// with the rule's CurrentVersionID — which text actually produced this verdict — so a
+// later improve round can attribute a recurring problem to the version that caused it (see
+// db.PromptExample.PromptVersionID/Recurred). A promptID missing from promptByID (shouldn't
+// happen — the caller builds it from the same prompts the verdict map was computed against)
+// just stamps 0, same as a pre-ledger example.
 func buildPromptExamples(accountID int64, messageID, sender, subject, excerpt, note string, verdicts map[int64]string, promptByID map[int64]db.Prompt) []db.PromptExample {
 	if len(verdicts) == 0 {
 		return nil
@@ -159,23 +194,9 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build set of newly-requested prompt IDs
-	requested := make(map[int64]bool)
-	for _, v := range r.Form["prompt_ids"] {
-		pid, err := strconv.ParseInt(v, 10, 64)
-		if err == nil {
-			requested[pid] = true
-		}
-	}
-
-	// Build set of prompts to improve
-	improveSet := make(map[int64]bool)
-	for _, v := range r.Form["improve_prompt_ids"] {
-		pid, err := strconv.ParseInt(v, 10, 64)
-		if err == nil {
-			improveSet[pid] = true
-		}
-	}
+	requestedList := parseIDList(r.Form["prompt_ids"])
+	requested := idSet(requestedList)
+	improveSet := idSet(parseIDList(r.Form["improve_prompt_ids"]))
 
 	note := r.FormValue("note")
 
@@ -189,29 +210,23 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		promptByID[p.ID] = p
 	}
 
-	// Compute diffs
-	var addedIDs, removedIDs []int64
+	// Compute diffs. keptIDs (prompts requested and already current) is derived here
+	// alongside removedIDs rather than in a second pass over newCurrentIDs below: since
+	// requested is exactly the post-correction current set (see requestedList's use as
+	// CurrentPromptIds further down), keptIDs = currentIDs ∩ requested and removedIDs =
+	// currentIDs \ requested fall out of one loop.
+	var addedIDs, removedIDs, keptIDs []int64
 	for pid := range requested {
 		if !currentIDs[pid] {
 			addedIDs = append(addedIDs, pid)
 		}
 	}
 	for pid := range currentIDs {
-		if !requested[pid] {
+		if requested[pid] {
+			keptIDs = append(keptIDs, pid)
+		} else {
 			removedIDs = append(removedIDs, pid)
 		}
-	}
-
-	// Build new current set for storage
-	newCurrentIDs := map[int64]bool{}
-	for pid := range currentIDs {
-		newCurrentIDs[pid] = true
-	}
-	for _, pid := range addedIDs {
-		newCurrentIDs[pid] = true
-	}
-	for _, pid := range removedIDs {
-		delete(newCurrentIDs, pid)
 	}
 
 	// Apply Gmail changes if we have an account
@@ -221,11 +236,11 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		svc, _ = s.gmailServiceFor(ctx, account)
 	}
 
-	s.applyRecategorizeToGmail(ctx, svc, row, promptByID, addedIDs, removedIDs)
+	s.applyRecategorizeToGmail(ctx, svc, []string{row.MessageID}, promptByID, addedIDs, removedIDs)
 
 	// Record permanent examples for every rule this correction touched or affirmed — see
 	// singleRecategorizeVerdicts for the exact table. This is the corpus AI prompt
-	// improvement now draws from (selectExamplesForPrompt), instead of seeing only whatever
+	// improvement now draws from (selectExamplesForImprove, improve.go), instead of seeing only whatever
 	// single email triggered the current round.
 	verdicts := singleRecategorizeVerdicts(currentIDs, requested, addedIDs, removedIDs)
 	var msg gmail.Message
@@ -259,12 +274,6 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rewrite history so it mirrors the post-correction labeling state
-	var keptIDs []int64
-	for pid := range newCurrentIDs {
-		if !slices.Contains(addedIDs, pid) {
-			keptIDs = append(keptIDs, pid)
-		}
-	}
 	var addedPrompts []db.Prompt
 	for _, pid := range addedIDs {
 		if p, ok := promptByID[pid]; ok {
@@ -279,26 +288,12 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		Sender:       row.Sender,
 	})
 
-	// Build CSV of new current prompt IDs
-	var newCurrentSlice []string
-	for pid := range newCurrentIDs {
-		newCurrentSlice = append(newCurrentSlice, strconv.FormatInt(pid, 10))
-	}
-
-	var addedCSV, removedCSV []string
-	for _, pid := range addedIDs {
-		addedCSV = append(addedCSV, strconv.FormatInt(pid, 10))
-	}
-	for _, pid := range removedIDs {
-		removedCSV = append(removedCSV, strconv.FormatInt(pid, 10))
-	}
-
 	correctionID, corrErr := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
 		AccountID:        row.AccountID,
 		MessageID:        row.MessageID,
-		AddedPrompts:     strings.Join(addedCSV, ","),
-		RemovedPrompts:   strings.Join(removedCSV, ","),
-		CurrentPromptIds: strings.Join(newCurrentSlice, ","),
+		AddedPrompts:     joinIDs(addedIDs),
+		RemovedPrompts:   joinIDs(removedIDs),
+		CurrentPromptIds: joinIDs(requestedList),
 		Note:             note,
 	})
 
@@ -315,12 +310,16 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 }
 
-// applyRecategorizeToGmail pushes an add/remove prompt diff to Gmail: it builds a label
-// cache for any newly-needed labels, applies the added prompts' label/action changes (via
-// processor.ModifyForPrompt), and reverses the removed prompts' changes (via
+// applyRecategorizeToGmail pushes an add/remove prompt diff to Gmail for messageIDs: it
+// builds a label cache for any newly-needed labels, applies the added prompts' label/action
+// changes (via processor.ModifyForPrompt), and reverses the removed prompts' changes (via
 // processor.ReverseModifyForPrompt, including restoring INBOX for any message untrashed by a
-// removed prompt). No-op if svc is nil or there's nothing to apply.
-func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client, row db.CategorizationHistory, promptByID map[int64]db.Prompt, addedIDs, removedIDs []int64) {
+// removed prompt). No-op if svc is nil or there's nothing to apply. Shared by the
+// single-email path (recategorize.go, one-element messageIDs) and the bulk path
+// (recategorize_bulk.go, one call per account covering every selected message in it) — Gmail's
+// batchModify add/remove is idempotent, so applying the same diff across multiple messages at
+// once is safe.
+func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client, messageIDs []string, promptByID map[int64]db.Prompt, addedIDs, removedIDs []int64) {
 	if svc == nil || (len(addedIDs) == 0 && len(removedIDs) == 0) {
 		return
 	}
@@ -343,7 +342,7 @@ func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client
 			continue
 		}
 		mod, _ := processor.ModifyForPrompt(p, labelCache[p.LabelName])
-		mod.MessageIDs = []string{row.MessageID}
+		mod.MessageIDs = messageIDs
 		if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
 			addModifies = append(addModifies, mod)
 		}
@@ -363,10 +362,10 @@ func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client
 			continue
 		}
 		mod, untrash := processor.ReverseModifyForPrompt(p, labelCache[p.LabelName])
-		mod.MessageIDs = []string{row.MessageID}
+		mod.MessageIDs = messageIDs
 		if untrash {
 			// Untrash: remove TRASH, add INBOX
-			trashReverseIDs = append(trashReverseIDs, row.MessageID)
+			trashReverseIDs = append(trashReverseIDs, messageIDs...)
 		}
 		if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
 			removeModifies = append(removeModifies, mod)

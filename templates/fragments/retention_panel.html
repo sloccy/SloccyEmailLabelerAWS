@@ -14,7 +14,7 @@
           <div class="form-check form-switch mb-0">
             <input class="form-check-input" type="checkbox" role="switch" name="enabled" value="1" id="retention-global-enabled"
               {{if .GlobalEnabled}}checked{{end}}
-              onchange="var v=document.getElementById('rg-value'),u=document.getElementById('rg-unit');v.disabled=!this.checked;u.disabled=!this.checked;if(!this.checked){v.value='';u.value='days';}">
+              onchange="retentionGlobalToggle(this)">
           </div>
           <input type="number" class="form-control form-control-sm" name="value" id="rg-value" min="1" step="1" placeholder="1" style="width:70px;text-align:right;" value="{{.GlobalValue}}"{{if not .GlobalEnabled}} disabled{{end}}>
           <select name="unit" id="rg-unit" class="form-select form-select-sm" style="width:90px;"{{if not .GlobalEnabled}} disabled{{end}}>
@@ -38,23 +38,10 @@
     <div id="label-exemptions-list">
       {{if .Exemptions}}
         {{range .Exemptions}}
-        <div class="d-flex align-items-center justify-content-between py-2 border-bottom">
-          <div>
-            <span class="badge border border-primary text-primary font-monospace">{{.LabelName}}</span>
-            <span class="small text-muted ms-2">never deleted</span>
-          </div>
-          <button class="btn btn-outline-danger btn-sm"
-            hx-delete="/fragments/retention/{{$.AccountID}}/exemptions/{{.ID}}"
-            hx-target="#retention-panel"
-            hx-swap="innerHTML"
-            hx-confirm="Remove this exemption?">Remove</button>
-        </div>
+        {{template "retention_rule_row" (dict "LabelName" .LabelName "Detail" "never deleted" "DeletePath" (printf "/fragments/retention/%d/exemptions/%d" $.AccountID .ID) "Confirm" "Remove this exemption?")}}
         {{end}}
       {{else}}
-      <div class="empty">
-        <div class="empty-icon"><svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="6" width="24" height="6" rx="1"/><path d="M6 12v14h20V12"/><path d="M12 18h8" stroke-linecap="round"/></svg></div>
-        No exemptions yet.
-      </div>
+      {{template "empty_state" (dict "Icon" (safeHTML `<svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="6" width="24" height="6" rx="1"/><path d="M6 12v14h20V12"/><path d="M12 18h8" stroke-linecap="round"/></svg>`) "Text" "No exemptions yet.")}}
       {{end}}
     </div>
     <hr>
@@ -83,23 +70,10 @@
     <div id="label-retention-list">
       {{if .LabelRules}}
         {{range .LabelRules}}
-        <div class="d-flex align-items-center justify-content-between py-2 border-bottom">
-          <div>
-            <span class="badge border border-primary text-primary font-monospace">{{.LabelName}}</span>
-            <span class="small text-muted ms-2">→ trash after <strong>{{fmtretention .Days}}</strong></span>
-          </div>
-          <button class="btn btn-outline-danger btn-sm"
-            hx-delete="/fragments/retention/{{$.AccountID}}/labels/{{.ID}}"
-            hx-target="#retention-panel"
-            hx-swap="innerHTML"
-            hx-confirm="Remove this rule?">Remove</button>
-        </div>
+        {{template "retention_rule_row" (dict "LabelName" .LabelName "Detail" (safeHTML (printf "→ trash after <strong>%s</strong>" (fmtretention .Days))) "DeletePath" (printf "/fragments/retention/%d/labels/%d" $.AccountID .ID) "Confirm" "Remove this rule?")}}
         {{end}}
       {{else}}
-      <div class="empty">
-        <div class="empty-icon"><svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="6" width="24" height="6" rx="1"/><path d="M6 12v14h20V12"/><path d="M12 18h8" stroke-linecap="round"/></svg></div>
-        No label rules yet.
-      </div>
+      {{template "empty_state" (dict "Icon" (safeHTML `<svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="6" width="24" height="6" rx="1"/><path d="M6 12v14h20V12"/><path d="M12 18h8" stroke-linecap="round"/></svg>`) "Text" "No label rules yet.")}}
       {{end}}
     </div>
     <hr>

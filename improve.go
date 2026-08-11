@@ -164,6 +164,22 @@ func (r *improveRunner) runOne(ctx context.Context, t improveTarget) {
 	done = true
 }
 
+// finalizeFailure stamps a terminal 'failed' status with cause's message as UserComment —
+// the one write shape shared by every path that gives up on a suggestion rather than
+// letting improveAndFinalizeSuggestion finish it normally: writeFailure (a panic/blown
+// deadline/missing prompt row), round 1 failing with no earlier round to fall back on, and
+// failDispatch (the hand-off to the worker itself never got to run). Callers log their own
+// contextual message on error; this only carries the write itself.
+func finalizeFailure(ctx context.Context, store *db.Store, sid int64, cause error) error {
+	return store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
+		ID:                    sid,
+		SuggestedInstructions: "",
+		ConversationJSON:      "[]",
+		Status:                db.SuggestionStatusFailed,
+		UserComment:           cause.Error(),
+	})
+}
+
 // writeFailure stamps a terminal 'failed' status directly, bypassing the normal
 // improveAndFinalizeSuggestion path — used when something has gone wrong badly enough
 // (a panic, a blown deadline, a missing prompt row) that the normal path can't be trusted
@@ -176,13 +192,7 @@ func (r *improveRunner) writeFailure(ctx context.Context, tw *traceWriter, sugge
 	// The trace's error event is emitted after the status write, same reasoning as
 	// improveAndFinalizeSuggestion's done event: the trace poll's terminal signal must mean
 	// "the suggestion's status is actually final," not merely "about to be."
-	if err := r.store.FinalizePromptSuggestion(writeCtx, db.FinalizePromptSuggestionParams{
-		ID:                    suggestionID,
-		SuggestedInstructions: "",
-		ConversationJSON:      "[]",
-		Status:                db.SuggestionStatusFailed,
-		UserComment:           cause.Error(),
-	}); err != nil {
+	if err := finalizeFailure(writeCtx, r.store, suggestionID, cause); err != nil {
 		slog.Error("improve worker: write failure status failed", "suggestion_id", suggestionID, "err", err)
 	}
 	tw.Event(writeCtx, db.TraceKindError, 0, cause.Error())
@@ -214,7 +224,7 @@ func rawLimitForVerdict(verdict string) int32 {
 // samples, rather than fetching the corpus twice for the same round.
 func gatherRawExamples(ctx context.Context, store *db.Store, promptID int64) []db.PromptExample {
 	var all []db.PromptExample
-	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+	for _, v := range db.VerdictOrder {
 		examples, err := store.ListExamplesByVerdict(ctx, promptID, v, rawLimitForVerdict(v))
 		if err != nil {
 			slog.Error("gather raw examples", "prompt_id", promptID, "verdict", v, "err", err)
@@ -336,7 +346,7 @@ func sampleExamples(examples []db.PromptExample, perVerdictCap int) []db.PromptE
 		byVerdict[ex.Verdict] = append(byVerdict[ex.Verdict], ex)
 	}
 	var out []db.PromptExample
-	for _, v := range []string{db.VerdictFalseNegative, db.VerdictFalsePositive, db.VerdictConfirmedPositive} {
+	for _, v := range db.VerdictOrder {
 		out = append(out, sampleVerdict(byVerdict[v], perVerdictCap)...)
 	}
 	return out
@@ -440,9 +450,10 @@ func shouldPruneVerdict(count int64, verdictCap int) bool {
 // pruneKeepSet decides, from one verdict's bounded raw read (newest-first, per
 // ListExamplesByVerdict's contract — pruneVerdict in prune.go is the only caller, passing a
 // much wider raw window than selection ever reads), which examples survive a daily prune
-// pass. This is the reverse of selectExamplesForImprove/selectExamplesForReplay: whatever
-// falls outside the keep set this returns is exactly what sampleVerdict would never pick for
-// either purpose, so it's safe to delete permanently (see db.Store.DeletePromptExamples).
+// pass. This is the reverse of selectExamplesForImprove and improveAndFinalizeSuggestion's
+// replay sampling (both wrap sampleExamples at a different cap): whatever falls outside the
+// keep set this returns is exactly what sampleVerdict would never pick for either purpose,
+// so it's safe to delete permanently (see db.Store.DeletePromptExamples).
 //
 // Unlike selection's gatherRawExamples, a resolved example isn't dropped outright here — it
 // still has one job left, letting markRecurrences flag a live row as a regression — so it's
@@ -868,13 +879,7 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 			if len(rounds) == 0 {
 				// Round 1 failing is fatal — there's no earlier candidate to fall back on,
 				// same as the single-shot version of this function always did.
-				if err := r.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
-					ID:                    sid,
-					SuggestedInstructions: "",
-					ConversationJSON:      "[]",
-					Status:                db.SuggestionStatusFailed,
-					UserComment:           llmErr.Error(),
-				}); err != nil {
+				if err := finalizeFailure(ctx, r.store, sid, llmErr); err != nil {
 					slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
 				}
 				return
@@ -1023,14 +1028,9 @@ func (s *server) dispatchImprove(ctx context.Context, targets []improveTarget) {
 // worker even starts, since nothing downstream of a failed Invoke call will ever run
 // ClaimPromptSuggestion or improveAndFinalizeSuggestion for it.
 func (s *server) failDispatch(ctx context.Context, targets []improveTarget, cause error) {
+	startErr := fmt.Errorf("failed to start: %w", cause)
 	for _, t := range targets {
-		if err := s.store.FinalizePromptSuggestion(ctx, db.FinalizePromptSuggestionParams{
-			ID:                    t.SuggestionID,
-			SuggestedInstructions: "",
-			ConversationJSON:      "[]",
-			Status:                db.SuggestionStatusFailed,
-			UserComment:           "failed to start: " + cause.Error(),
-		}); err != nil {
+		if err := finalizeFailure(ctx, s.store, t.SuggestionID, startErr); err != nil {
 			slog.Error("dispatch improve: write failure status failed", "suggestion_id", t.SuggestionID, "err", err)
 		}
 	}

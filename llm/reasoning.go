@@ -3,6 +3,7 @@ package llm
 import (
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
@@ -62,6 +63,27 @@ func reasoningOff(modelID, override string) reasoningDirective {
 		d.system = override
 	}
 	return d
+}
+
+// applyReasoningOff resolves reasoningOff(modelID, override) and, if it isn't a no-op,
+// applies it: appending its system soft-switch text to sys and wrapping its
+// AdditionalModelRequestFields as a document.Interface. Returns sys unchanged and a nil
+// fields document for a zero directive. Factors out the identical "if d := reasoningOff(...);
+// !d.isZero() { ... }" shape classifyPayload, streamGenerate, and ImprovePromptInstructions
+// (bedrock.go) each used to paste independently.
+func applyReasoningOff(sys []types.SystemContentBlock, modelID, override string) ([]types.SystemContentBlock, document.Interface) {
+	d := reasoningOff(modelID, override)
+	if d.isZero() {
+		return sys, nil
+	}
+	var fields document.Interface
+	if d.system != "" {
+		sys = append(sys, sysText(d.system))
+	}
+	if d.fields != nil {
+		fields = document.NewLazyDocument(d.fields)
+	}
+	return sys, fields
 }
 
 // reasoningEffortExempt lists case-insensitive model-id substrings verified live against

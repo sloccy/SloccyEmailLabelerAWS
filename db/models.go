@@ -158,7 +158,7 @@ type PromptVersion struct {
 }
 
 // ExampleExcerptRunes bounds a PromptExample's stored body excerpt (via
-// gmail.CollapseExcerpt). Small on purpose: selectExamplesForPrompt (recategorize.go) feeds
+// gmail.CollapseExcerpt). Small on purpose: selectExamplesForImprove (improve.go) feeds
 // up to several dozen examples into one improve call, so each excerpt has to stay compact
 // enough that the whole set fits comfortably in a small model's context — full email bodies
 // would blow that budget for even a modest corpus.
@@ -174,7 +174,7 @@ const ExampleExcerptRunes = 400
 // without reading the rest of the partition, so cost stays flat as the corpus grows. IDs
 // from both write paths come from the same monotonically-ordered source (localID/localIDs,
 // not the atomic nextIDs counter — see db/store.go), which is what lets
-// selectExamplesForPrompt's "newest verdict wins" dedup correctly drop a passively-confirmed
+// gatherRawExamples' (improve.go) "newest verdict wins" dedup correctly drop a passively-confirmed
 // row once a later manual correction supersedes it. No TTL: see the "Growth and retention"
 // note in db/store.go's prompt-examples section for why unbounded retention stays cheap even
 // with passive confirmation's much higher write volume than manual correction alone.
@@ -193,7 +193,7 @@ type PromptExample struct {
 	// ResolvedBySuggestionID is nil for a still-live example. Set to a PromptSuggestion's
 	// ID once that suggestion — built from this example, among others — is applied: the
 	// rule text has now actually incorporated whatever this example was evidence of, so
-	// selectExamplesForPrompt (recategorize.go) excludes it from future improve rounds.
+	// selectExamplesForImprove (improve.go) excludes it from future improve rounds.
 	// Only ever set on false_negative/false_positive rows; confirmed_positive examples
 	// aren't "problems" to resolve. If the fix didn't actually work, a later correction on
 	// the same email writes a fresh, unresolved row (examples are append-only) that the
@@ -228,7 +228,7 @@ type PromptExample struct {
 	// example exists for the same message and verdict — i.e. a previous suggestion claimed
 	// to have fixed exactly this and the rule regressed. This is the signal that lets the
 	// improver see "already tried and failed" instead of treating a recurrence as a
-	// brand-new problem (see selectExamplesForPrompt's doc comment in improve.go).
+	// brand-new problem (see gatherRawExamples' doc comment in improve.go).
 	Recurred            bool  `dynamodbav:"-"`
 	RecurredFromVersion int64 `dynamodbav:"-"`
 }
