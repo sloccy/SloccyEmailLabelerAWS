@@ -317,6 +317,45 @@ func (s *Store) queryAll(ctx context.Context, input *dynamodb.QueryInput) ([]map
 	return items, nil
 }
 
+// queryOpt configures an optional field on a queryPartition call.
+type queryOpt func(*dynamodb.QueryInput)
+
+// withProjection limits a queryPartition call to the given comma-separated attribute list.
+// None of the current call sites project a reserved word (contrast GetTurnaroundSamples'
+// "ts" alias, which needs the extra SK >= :since key condition queryPartition doesn't
+// support) — add an ExpressionAttributeNames param here if a future one does.
+func withProjection(expr string) queryOpt {
+	return func(in *dynamodb.QueryInput) { in.ProjectionExpression = aws.String(expr) }
+}
+
+// withDescending sorts a queryPartition call newest-first (by SK) instead of the default
+// ascending order.
+func withDescending() queryOpt {
+	return func(in *dynamodb.QueryInput) { in.ScanIndexForward = aws.Bool(false) }
+}
+
+// queryPartition runs a plain "PK = :pk" query against pk, paginating via queryAll, with
+// any opts applied — the exact-partition-match shape shared by roughly a dozen call sites
+// in this file (accounts, prompts, suggestions, label retention/exemptions, LLM debug, a
+// history partition scoped to one account, ...). Callers needing a KeyConditionExpression
+// beyond a bare PK match (an SK range, a begins_with prefix) or a FilterExpression still
+// build their own dynamodb.QueryInput and call queryAll directly — forcing those into this
+// same option set would need a wider API for a handful of callers, each already reading
+// clearly on their own.
+func (s *Store) queryPartition(ctx context.Context, pk string, opts ...queryOpt) ([]map[string]types.AttributeValue, error) {
+	in := &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			exprPK: sv(pk),
+		},
+	}
+	for _, opt := range opts {
+		opt(in)
+	}
+	return s.queryAll(ctx, in)
+}
+
 // batchDelete deletes items in batches of 25.
 func (s *Store) batchDelete(ctx context.Context, keys []map[string]types.AttributeValue) error {
 	for i := 0; i < len(keys); i += 25 {
@@ -338,14 +377,7 @@ func (s *Store) batchDelete(ctx context.Context, keys []map[string]types.Attribu
 
 // deleteAllByPK deletes every item under one partition key.
 func (s *Store) deleteAllByPK(ctx context.Context, pk string) error {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pk),
-		},
-		ProjectionExpression: aws.String("PK, SK"),
-	})
+	items, err := s.queryPartition(ctx, pk, withProjection("PK, SK"))
 	if err != nil {
 		return err
 	}
@@ -659,13 +691,7 @@ func itemToAccount(it map[string]types.AttributeValue) Account { return unmarsha
 // account, so callers that don't build a Gmail client from the result should call this
 // directly, not ListAccounts, to avoid paying for and then discarding every account's token.
 func (s *Store) listAccounts(ctx context.Context) ([]Account, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv("ACCOUNT"),
-		},
-	})
+	items, err := s.queryPartition(ctx, "ACCOUNT")
 	if err != nil {
 		return nil, err
 	}
@@ -950,13 +976,7 @@ func promptToItem(p Prompt) map[string]types.AttributeValue {
 }
 
 func (s *Store) listAllPrompts(ctx context.Context) ([]Prompt, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv("PROMPT"),
-		},
-	})
+	items, err := s.queryPartition(ctx, "PROMPT")
 	if err != nil {
 		return nil, err
 	}
@@ -1426,13 +1446,7 @@ func (s *Store) GetHistoryRow(ctx context.Context, id int64) (CategorizationHist
 		return CategorizationHistory{}, err
 	}
 	for _, acc := range accs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK: sv(pkHistory(acc.ID)),
-			},
-		})
+		items, err := s.queryPartition(ctx, pkHistory(acc.ID))
 		if err != nil {
 			continue
 		}
@@ -1739,18 +1753,12 @@ func (s *Store) GetHistoryStateForMessages(ctx context.Context, accountID int64,
 		want[mid] = true
 	}
 
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pkHistory(accountID)),
-		},
-		// Only these five attributes are read below — this reads the whole account
-		// partition (not just the selected messageIDs, which DynamoDB can't filter a Query
-		// by without a FilterExpression scan anyway), so skipping llmResponse and the rest
-		// matters here more than most projections in this file.
-		ProjectionExpression: aws.String("messageId, subject, sender, accountEmail, promptId"),
-	})
+	// Only these five attributes are read below — this reads the whole account partition
+	// (not just the selected messageIDs, which DynamoDB can't filter a Query by without a
+	// FilterExpression scan anyway), so skipping llmResponse and the rest matters here more
+	// than most projections in this file.
+	items, err := s.queryPartition(ctx, pkHistory(accountID),
+		withProjection("messageId, subject, sender, accountEmail, promptId"))
 	if err != nil {
 		return nil, err
 	}
@@ -1805,16 +1813,10 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 		want[p.MessageID] = true
 	}
 
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pkHistory(accountID)),
-		},
-		// Only the key (deleteKeys), messageId (grouping), and promptId (keep/delete
-		// decision) are read below.
-		ProjectionExpression: aws.String("PK, SK, messageId, promptId"),
-	})
+	// Only the key (deleteKeys), messageId (grouping), and promptId (keep/delete decision)
+	// are read below.
+	items, err := s.queryPartition(ctx, pkHistory(accountID),
+		withProjection("PK, SK, messageId, promptId"))
 	if err != nil {
 		return err
 	}
@@ -2130,13 +2132,7 @@ func (s *Store) DeleteAccountRetention(ctx context.Context, accountID int64) err
 }
 
 func (s *Store) GetLabelRetention(ctx context.Context, accountID int64) ([]LabelRetention, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pkLabelRetention(accountID)),
-		},
-	})
+	items, err := s.queryPartition(ctx, pkLabelRetention(accountID))
 	if err != nil {
 		return nil, err
 	}
@@ -2206,13 +2202,7 @@ func (s *Store) DeleteLabelRetentionByAccount(ctx context.Context, accountID int
 }
 
 func (s *Store) GetLabelExemptions(ctx context.Context, accountID int64) ([]LabelExemption, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pkLabelExemption(accountID)),
-		},
-	})
+	items, err := s.queryPartition(ctx, pkLabelExemption(accountID))
 	if err != nil {
 		return nil, err
 	}
@@ -2559,14 +2549,7 @@ func (s *Store) GetPromptSuggestion(ctx context.Context, id int64) (PromptSugges
 }
 
 func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, error) {
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv("SUGGESTION"),
-		},
-		ScanIndexForward: aws.Bool(false),
-	})
+	items, err := s.queryPartition(ctx, "SUGGESTION", withDescending())
 	if err != nil {
 		return nil, err
 	}
@@ -2922,15 +2905,7 @@ func (s *Store) AddLlmDebug(ctx context.Context, arg AddLlmDebugParams) error {
 
 func (s *Store) TrimLlmDebug(ctx context.Context) error {
 	// Keep only the 3 most recent items
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv("LLM_DEBUG"),
-		},
-		ScanIndexForward:     aws.Bool(false),
-		ProjectionExpression: aws.String("PK, SK"),
-	})
+	items, err := s.queryPartition(ctx, "LLM_DEBUG", withDescending(), withProjection("PK, SK"))
 	if err != nil {
 		return err
 	}
