@@ -288,7 +288,13 @@ func keysMatch(a, b string) bool {
 // lookup finds the first catalog entry matching any candidate key of id, trying exact
 // matches (over all candidates) before falling back to the fuzzy keysMatch.
 func lookup[V any](cat map[string]V, id string) (V, bool) {
-	cands := candidateKeys(id)
+	return lookupCands(cat, candidateKeys(id))
+}
+
+// lookupCands is lookup's core against an already-computed candidate-key list — split out
+// so a caller resolving several catalogs for the same id (see pricesFor) can compute
+// candidateKeys once instead of once per catalog.
+func lookupCands[V any](cat map[string]V, cands []string) (V, bool) {
 	for _, c := range cands {
 		if v, ok := cat[c]; ok {
 			return v, true
@@ -323,27 +329,32 @@ func (cat *pricingCatalog) flexCostPer1M(baseModelID string) float64 {
 	return CostUnknown
 }
 
-// outputCostPer1M returns the on-demand output price per 1M tokens for a Bedrock base
-// model id (region prefix already stripped), or CostUnknown if the catalog has no match.
-func (cat *pricingCatalog) outputCostPer1M(baseModelID string) float64 {
-	if price, ok := lookup(cat.outputPricePer1M, baseModelID); ok {
-		return price
-	}
-	return CostUnknown
-}
-
-// flexOutputCostPer1M returns the flex-tier output price per 1M tokens for a Bedrock base
-// model id (region prefix already stripped), or CostUnknown if the catalog has no match.
-func (cat *pricingCatalog) flexOutputCostPer1M(baseModelID string) float64 {
-	if price, ok := lookup(cat.flexOutputPricePer1M, baseModelID); ok {
-		return price
-	}
-	return CostUnknown
-}
-
 // isFlexCapable reports whether a Bedrock base model id (region prefix already
 // stripped) appears in the Price List catalog with a flex-tier SKU.
 func (cat *pricingCatalog) isFlexCapable(baseModelID string) bool {
 	_, ok := lookup(cat.flexCapable, baseModelID)
 	return ok
+}
+
+// pricesFor resolves all five pricing/flex-capability lookups for one base model id at
+// once, computing candidateKeys — a regex-strip-and-normalize pass, and on a catalog miss a
+// full fuzzy scan of the map — exactly once instead of once per lookup. inputCostPer1M/
+// outputCostPer1M/flexCostPer1M/flexOutputCostPer1M/isFlexCapable each independently redid
+// this; callers building a ModelOption for every model in the catalog (bedrock.go's
+// FetchModels, run twice: once per foundation model, once per inference profile) called all
+// five back to back for the same id, so this replaces 5x the work with 1x.
+func (cat *pricingCatalog) pricesFor(baseModelID string) (inPrice, outPrice, flexIn, flexOut float64, flexCapable bool) {
+	cands := candidateKeys(baseModelID)
+	priceOr := func(m map[string]float64) float64 {
+		if v, ok := lookupCands(m, cands); ok {
+			return v
+		}
+		return CostUnknown
+	}
+	inPrice = priceOr(cat.inputPricePer1M)
+	outPrice = priceOr(cat.outputPricePer1M)
+	flexIn = priceOr(cat.flexInputPricePer1M)
+	flexOut = priceOr(cat.flexOutputPricePer1M)
+	_, flexCapable = lookupCands(cat.flexCapable, cands)
+	return
 }

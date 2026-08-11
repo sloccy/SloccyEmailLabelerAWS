@@ -95,20 +95,34 @@ func singleRecategorizeVerdicts(currentIDs, requestedIDs map[int64]bool, addedID
 // turned out to be — a false_positive/false_negative correction is one more piece of
 // production evidence against whatever rule text was live when the mismatched email came
 // in (see db.PromptVersion.ObservedFP/ObservedFN). confirmed_positive examples are skipped
-// by IncrementVersionObserved itself, not filtered here, so this can just iterate every
-// example unconditionally. Best-effort and fire-and-forget by design (matches
-// IncrementVersionObserved's own doc comment) — bookkeeping for a future improve round must
-// never be able to slow down or fail a correction the user is actively waiting on.
+// by IncrementVersionObservedBy itself, not filtered here, so this can just iterate every
+// example unconditionally.
+//
+// Examples sharing the same (promptID, versionID, verdict) — routine from the bulk
+// recategorize path, where the same rule version is touched by many messages in one action
+// — are aggregated into a single ADD update for their combined count, rather than one
+// UpdateItem per example; a 50-email bulk action touching a handful of rules costs a
+// handful of writes here instead of up to 50. Best-effort and fire-and-forget by design
+// (matches IncrementVersionObservedBy's own doc comment) — bookkeeping for a future improve
+// round must never be able to slow down or fail a correction the user is actively waiting on.
 func incrementVersionObservedFor(ctx context.Context, store versionObserver, examples []db.PromptExample) {
+	type versionVerdict struct {
+		promptID, versionID int64
+		verdict             string
+	}
+	counts := make(map[versionVerdict]int64, len(examples))
 	for _, ex := range examples {
-		store.IncrementVersionObserved(ctx, ex.PromptID, ex.PromptVersionID, ex.Verdict)
+		counts[versionVerdict{ex.PromptID, ex.PromptVersionID, ex.Verdict}]++
+	}
+	for k, n := range counts {
+		store.IncrementVersionObservedBy(ctx, k.promptID, k.versionID, k.verdict, n)
 	}
 }
 
 // versionObserver is the one method incrementVersionObservedFor needs — declared locally
 // so a test can supply a trivial fake without pulling in the rest of db.Store's surface.
 type versionObserver interface {
-	IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string)
+	IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, verdict string, n int64)
 }
 
 // buildPromptExamples turns a promptID->verdict map into example rows ready for

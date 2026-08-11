@@ -317,7 +317,7 @@ func selectExamplesForImprove(ctx context.Context, store *db.Store, promptID int
 // standalone named entry point the way selectExamplesForImprove does: its only caller,
 // improveAndFinalizeSuggestion, already has the raw window in hand (see gatherRawExamples'
 // doc comment) and just samples it again at replayExampleCap, only when replay is actually
-// enabled (improveReplayEnabled).
+// enabled (llm.SettingImproveReplay, resolved once per round via loadSettings).
 
 // senderSubjectKey normalizes a sender+subject pair for the round-robin sampler below:
 // trimmed and case-folded, so trailing whitespace or casing differences (a mail client
@@ -615,15 +615,6 @@ func replayExamplesFor(examples []db.PromptExample) []llm.ReplayExample {
 	return out
 }
 
-// improveReplayEnabled reports whether a candidate suggestion should be replay-validated
-// against the classify model (see llm.ReplayAgainstExamples). Defaults to enabled — "1" or
-// unset — since it's a correctness signal the user would otherwise have to eyeball; set
-// llm.SettingImproveReplay to anything else in Settings to skip the extra classify calls.
-func (r *improveRunner) improveReplayEnabled(ctx context.Context) bool {
-	v, err := r.store.GetSetting(ctx, llm.SettingImproveReplay)
-	return err != nil || v == "" || v == "1"
-}
-
 // versionLister is the one method attemptsForPrompt needs from db.Store — declared locally
 // rather than widening db.StoreIface, matching this codebase's established pattern for a
 // narrow, consumer-declared interface (see llm.Settings/llm.StoreLogger, and traceStore in
@@ -680,17 +671,6 @@ func parseImproveMaxRounds(raw string) int {
 		return llm.ImproveMaxRoundsCap
 	}
 	return n
-}
-
-// improveMaxRounds resolves llm.SettingImproveMaxRounds. Read directly via GetSetting
-// rather than through llm.Client: the loop is orchestrated by this package, not by the LLM
-// client (same reasoning SettingImproveReplay's doc comment gives).
-func (r *improveRunner) improveMaxRounds(ctx context.Context) int {
-	v, err := r.store.GetSetting(ctx, llm.SettingImproveMaxRounds)
-	if err != nil || v == "" {
-		return llm.ImproveMaxRoundsDefault
-	}
-	return parseImproveMaxRounds(v)
 }
 
 // selectBestRound returns the index into rounds of the best-scoring round: strictly
@@ -831,23 +811,33 @@ func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExampl
 // Shared by every improveTarget runOne works, batch or regenerate alike, so this logic
 // can't drift between the two call sites — see this file's package doc comment.
 func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *traceWriter, sid int64, p db.Prompt, originalInstructions string, priorConv []llm.ChatMessage, note, userComment string) {
+	// One settings Query for the whole round, resolved with the same pure parsers
+	// improveExampleCap/replayExampleCap/parseImproveMaxRounds use — instead of the four
+	// independent GetSetting round trips (one per setting) this used to make every round.
+	settings := loadSettings(ctx, r.store)
+	improveCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
+	replayCap := parseExampleCap(settings[llm.SettingReplayExampleCap], llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
+	// llm.SettingImproveReplay defaults to enabled (unset or "1") — it's a correctness
+	// signal the user would otherwise have to eyeball; set it to anything else to skip the
+	// extra classify calls replay costs.
+	replayOn := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
+	maxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
+
 	// One raw fetch, sampled twice at different caps — see gatherRawExamples' doc comment
 	// on why this avoids re-querying the corpus twice in one round. examples (small,
 	// token-bounded) drives the improve prompt itself and what gets marked resolved;
 	// replayExamples (larger, more representative) is only built when replay will actually
 	// use it — no reason to pay for that if replay is off.
 	raw := gatherRawExamples(ctx, r.store, p.ID)
-	examples := sampleExamples(raw, improveExampleCap(ctx, r.store))
+	examples := sampleExamples(raw, improveCap)
 	shouldMatch, shouldNotMatch, alreadyCorrect := improveRequestExamples(examples)
-	replayOn := r.improveReplayEnabled(ctx)
-	maxRounds := r.improveMaxRounds(ctx)
 	if !replayOn {
 		// No score to iterate on — same behavior as the pre-loop code, exactly one round.
 		maxRounds = 1
 	}
 	var replayExamples []db.PromptExample
 	if replayOn {
-		replayExamples = sampleExamples(raw, replayExampleCap(ctx, r.store))
+		replayExamples = sampleExamples(raw, replayCap)
 	}
 
 	req := llm.ImproveRequest{
