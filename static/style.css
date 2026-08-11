@@ -241,6 +241,9 @@ summary { cursor: pointer; }
 
 /* OAuth step badge */
 .step-badge { width: 1.75rem; height: 1.75rem; display: inline-flex; align-items: center; justify-content: center; margin-top: 2px; }
+/* Step 1 dims once its link has been generated (app.js toggles .done on #oauth-step-1),
+   so attention reads as having moved on to step 2; closing the panel resets it. */
+#oauth-step-1.done { opacity: 0.6; }
 
 /* 2-column form grid (collapses on small screens) */
 .form-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.75rem; margin-bottom: 0.75rem; }

@@ -29,7 +29,7 @@ function syncAccountSelects() {
 function toast(msg, type = 'success') {
   const el = document.getElementById('toast');
   const body = document.getElementById('toast-body');
-  el.className = 'toast align-items-center border-0 text-bg-' + (type === 'error' ? 'danger' : type === 'warning' ? 'warning' : 'success');
+  el.className = 'toast align-items-center border-0 text-bg-' + (type === 'error' ? 'danger' : type === 'warning' ? 'warning' : type === 'info' ? 'info' : 'success');
   body.textContent = msg;
   bootstrap.Toast.getOrCreateInstance(el, { delay: 3500 }).show();
 }
@@ -512,9 +512,11 @@ function _refreshSuggestionsBadge() {
 }
 
 document.body.addEventListener('refreshSuggestionBadge', _refreshSuggestionsBadge);
+// refreshSuggestions is only ever fired alongside refreshSuggestionBadge (see
+// recategorize.go/recategorize_bulk.go's setHxTrigger calls) — the badge listener above
+// already handles the count update, so this only needs to reload the list itself, not
+// call _refreshSuggestionsBadge() a second time for the same response.
 window.addEventListener('refreshSuggestions', function() {
-  _refreshSuggestionsBadge();
-  // Reload suggestions list if on that page
   const listContainer = document.getElementById('suggestions-list-container');
   if (listContainer && document.getElementById('page-prompt-suggestions').classList.contains('active')) {
     htmx.ajax('GET', '/fragments/prompt-suggestions', { target: '#suggestions-list-container', swap: 'innerHTML' });

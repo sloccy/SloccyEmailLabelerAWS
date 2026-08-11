@@ -509,14 +509,17 @@ func IterMessageDetails(ctx context.Context, svc *Client, ids []string, maxBodyC
 				defer func() { <-sem }()
 
 				msg, err := fetchMessage(ctx, svc, id, maxBodyChars)
-				mu.Lock()
-				defer mu.Unlock()
 				if err != nil {
+					mu.Lock()
 					if firstErr == nil {
 						firstErr = err
 					}
+					mu.Unlock()
 					return
 				}
+				// mu only ever guards firstErr above — the send itself needs no lock, and
+				// holding one across it would serialize every worker behind whichever one
+				// is currently blocked on a full/slow-draining msgCh (buffered 5).
 				select {
 				case msgCh <- msg:
 				case <-ctx.Done():
