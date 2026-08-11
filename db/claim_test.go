@@ -62,7 +62,7 @@ func TestReleaseClaim_CannotDeleteConfirmedMarker(t *testing.T) {
 	s := NewFake()
 	accID, _ := s.UpsertAccount(t.Context(), UpsertAccountParams{Email: "confirm@example.com"})
 
-	if err := s.BatchInsertProcessingResults(t.Context(), nil, nil, nil, accID, "m1"); err != nil {
+	if err := s.BatchInsertProcessingResults(t.Context(), ProcessingResults{AccountID: accID, MessageID: "m1", Confirm: true}); err != nil {
 		t.Fatalf("BatchInsertProcessingResults: %v", err)
 	}
 	if err := s.ReleaseClaim(t.Context(), accID, "m1"); err != nil {

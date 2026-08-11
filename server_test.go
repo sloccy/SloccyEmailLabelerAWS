@@ -227,7 +227,13 @@ func TestSettingsFormRendersTierControls(t *testing.T) {
 
 	render := func(classifyTier, improveTier string) string {
 		var sb strings.Builder
-		data := settingsTemplateData("us.amazon.nova-micro-v1:0", "us.amazon.nova-micro-v1:0", classifyTier, improveTier, "", true, llm.ImproveMaxRoundsDefault, llm.ImproveExampleCapDefault, llm.ReplayExampleCapDefault, llm.ReasoningEffortOff, models)
+		data := settingsTemplateData(settingsView{
+			ClassifyModel: "us.amazon.nova-micro-v1:0", ImproveModel: "us.amazon.nova-micro-v1:0",
+			ClassifyTier: classifyTier, ImproveTier: improveTier,
+			ImproveReplay: true, ImproveMaxRounds: llm.ImproveMaxRoundsDefault,
+			ImproveExampleCap: llm.ImproveExampleCapDefault, ReplayExampleCap: llm.ReplayExampleCapDefault,
+			ImproveReasoningEffort: llm.ReasoningEffortOff,
+		}, models)
 		if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
 			t.Fatalf("ExecuteTemplate: %v", err)
 		}
@@ -284,7 +290,13 @@ func TestSettingsFormRendersImproveMaxRoundsOptions(t *testing.T) {
 	models := []llm.ModelOption{{ID: "m", Label: "M"}}
 
 	var sb strings.Builder
-	data := settingsTemplateData("m", "m", llm.TierStandard, llm.TierStandard, "", true, 4, llm.ImproveExampleCapDefault, llm.ReplayExampleCapDefault, llm.ReasoningEffortOff, models)
+	data := settingsTemplateData(settingsView{
+		ClassifyModel: "m", ImproveModel: "m",
+		ClassifyTier: llm.TierStandard, ImproveTier: llm.TierStandard,
+		ImproveReplay: true, ImproveMaxRounds: 4,
+		ImproveExampleCap: llm.ImproveExampleCapDefault, ReplayExampleCap: llm.ReplayExampleCapDefault,
+		ImproveReasoningEffort: llm.ReasoningEffortOff,
+	}, models)
 	if err := tmpl.ExecuteTemplate(&sb, "settings_form.html", data); err != nil {
 		t.Fatalf("ExecuteTemplate: %v", err)
 	}

@@ -294,13 +294,12 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 			addedPrompts = append(addedPrompts, p)
 		}
 	}
-	_ = s.store.RewriteHistoryForMessage(ctx, row.MessageID, keptIDs, addedPrompts, db.CategorizationHistory{
-		AccountID:    row.AccountID,
-		AccountEmail: row.AccountEmail,
-		MessageID:    row.MessageID,
-		Subject:      row.Subject,
-		Sender:       row.Sender,
-	})
+	// RewriteHistoryForMessages, not a dedicated single-message method — one-element plan
+	// slice, same batched delete+put path the bulk recategorize handler uses.
+	_ = s.store.RewriteHistoryForMessages(ctx, row.AccountID, row.AccountEmail, []db.RewriteMessagePlan{{
+		MessageID: row.MessageID, Subject: row.Subject, Sender: row.Sender,
+		KeptIDs: keptIDs, AddedPrompts: addedPrompts,
+	}})
 
 	correctionID, corrErr := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
 		AccountID:        row.AccountID,
@@ -355,7 +354,7 @@ func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client
 		if !ok {
 			continue
 		}
-		mod, _ := processor.ModifyForPrompt(p, labelCache[p.LabelName])
+		mod, _, _ := processor.ModifyForPrompt(p, labelCache[p.LabelName])
 		mod.MessageIDs = messageIDs
 		if len(mod.AddLabels) > 0 || len(mod.RemoveLabels) > 0 {
 			addModifies = append(addModifies, mod)

@@ -105,6 +105,8 @@ type ssmAPI interface {
 }
 
 // Store wraps a DynamoDB client. All methods are safe for concurrent use.
+var _ StoreIface = (*Store)(nil)
+
 type Store struct {
 	ddb   *dynamodb.Client
 	table string
@@ -971,6 +973,38 @@ func (s *Store) listAllPrompts(ctx context.Context) ([]Prompt, error) {
 	return prompts, nil
 }
 
+// FilterActivePrompts returns the active prompts in prompts — the pure predicate
+// ListActivePrompts applies to an already-fetched list.
+func FilterActivePrompts(prompts []Prompt) []Prompt {
+	var out []Prompt
+	for _, p := range prompts {
+		if p.Active != 0 {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// FilterActivePromptsForAccount returns the active prompts in prompts visible to accountID:
+// global rules (AccountID nil) plus rules scoped to this specific account. Pure — no store
+// access — so both Store.ListActivePromptsByAccount (given the full fetched list) and
+// processor's per-batch prompt filtering (given a batch's already-fetched prompt list,
+// where a second query would be wasted work) share one predicate instead of two
+// independently maintained copies of the same four-field check.
+func FilterActivePromptsForAccount(prompts []Prompt, accountID int64) []Prompt {
+	var out []Prompt
+	for _, p := range prompts {
+		if p.Active == 0 {
+			continue
+		}
+		if p.AccountID != nil && *p.AccountID != accountID {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func (s *Store) ListPrompts(ctx context.Context) ([]Prompt, error) {
 	return s.listAllPrompts(ctx)
 }
@@ -997,13 +1031,7 @@ func (s *Store) ListActivePrompts(ctx context.Context) ([]Prompt, error) {
 	if err != nil {
 		return nil, err
 	}
-	var active []Prompt
-	for _, p := range all {
-		if p.Active == 1 {
-			active = append(active, p)
-		}
-	}
-	return active, nil
+	return FilterActivePrompts(all), nil
 }
 
 func (s *Store) ListActivePromptsByAccount(ctx context.Context, accountID sql.NullInt64) ([]Prompt, error) {
@@ -1011,17 +1039,10 @@ func (s *Store) ListActivePromptsByAccount(ctx context.Context, accountID sql.Nu
 	if err != nil {
 		return nil, err
 	}
-	var filtered []Prompt
-	for _, p := range all {
-		if p.Active == 0 {
-			continue
-		}
-		if accountID.Valid && p.AccountID != nil && *p.AccountID != accountID.Int64 {
-			continue
-		}
-		filtered = append(filtered, p)
+	if !accountID.Valid {
+		return FilterActivePrompts(all), nil
 	}
-	return filtered, nil
+	return FilterActivePromptsForAccount(all, accountID.Int64), nil
 }
 
 // ListActivePromptsForAccount returns the active prompts scoped to accountID, or every
@@ -1696,75 +1717,6 @@ func (s *Store) GetCurrentPromptIDsForMessage(ctx context.Context, accountID int
 	return set, nil
 }
 
-// RewriteHistoryForMessage rewrites categorization history for a message after manual
-// correction, scoped to base.AccountID (the caller already resolved the row, so the
-// account is known — no need to fan out across every account's partition).
-func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, keptIDs []int64, addedPrompts []Prompt, base CategorizationHistory) error {
-	keptSet := map[int64]bool{}
-	for _, id := range keptIDs {
-		keptSet[id] = true
-	}
-
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk"),
-		FilterExpression:       aws.String("messageId = :mid"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK: sv(pkHistory(base.AccountID)),
-			":mid": sv(messageID),
-		},
-		// Only the key (to build deleteKeys) and promptId (to decide keep/delete) are read
-		// below.
-		ProjectionExpression: aws.String("PK, SK, promptId"),
-	})
-	if err != nil {
-		return err
-	}
-	var deleteKeys []map[string]types.AttributeValue
-	for _, it := range items {
-		pid := getNullInt64(it, "promptId")
-		if len(keptIDs) == 0 || !pid.Valid || !keptSet[pid.Int64] {
-			deleteKeys = append(deleteKeys, map[string]types.AttributeValue{
-				"PK": it["PK"], "SK": it["SK"],
-			})
-		}
-	}
-	if err := s.batchDelete(ctx, deleteKeys); err != nil {
-		return err
-	}
-
-	for _, p := range addedPrompts {
-		var labelName *string
-		if p.LabelName != "" {
-			labelName = ptr(p.LabelName)
-		}
-		if err := s.AddHistory(ctx, AddHistoryParams{
-			AccountID:    base.AccountID,
-			AccountEmail: base.AccountEmail,
-			MessageID:    messageID,
-			Subject:      base.Subject,
-			Sender:       base.Sender,
-			PromptID:     ptr(p.ID),
-			PromptName:   ptr(p.Name),
-			LabelName:    labelName,
-			Actions:      "manual",
-		}); err != nil {
-			return err
-		}
-	}
-
-	if len(keptIDs) == 0 && len(addedPrompts) == 0 {
-		return s.AddHistory(ctx, AddHistoryParams{
-			AccountID:    base.AccountID,
-			AccountEmail: base.AccountEmail,
-			MessageID:    messageID,
-			Subject:      base.Subject,
-			Sender:       base.Sender,
-		})
-	}
-	return nil
-}
-
 // MessageHistoryState is one message's resolved state within an account's HIST# partition:
 // its subject/sender/account-email (identical across every row for that message) and the
 // set of prompt ids currently applied to it. Returned by GetHistoryStateForMessages.
@@ -1827,8 +1779,8 @@ func (s *Store) GetHistoryStateForMessages(ctx context.Context, accountID int64,
 }
 
 // RewriteMessagePlan is one message's post-correction state for RewriteHistoryForMessages:
-// the prompt ids that should remain (already-history rows to keep, same semantics as
-// RewriteHistoryForMessage's keptIDs) and the prompts newly applied (fresh rows to add).
+// the prompt ids that should remain (already-history rows to keep) and the prompts newly
+// applied (fresh rows to add).
 type RewriteMessagePlan struct {
 	MessageID    string
 	Subject      string
@@ -1837,11 +1789,13 @@ type RewriteMessagePlan struct {
 	AddedPrompts []Prompt
 }
 
-// RewriteHistoryForMessages is the bulk counterpart to RewriteHistoryForMessage: one query
-// over the account's HIST# partition instead of one per message, then batched deletes and
-// puts across every plan. This is the change that keeps a 50-email bulk recategorize inside
-// the 2 RCU/2 WCU provisioned table instead of throttling — looping
-// RewriteHistoryForMessage would mean 50 full partition reads.
+// RewriteHistoryForMessages rewrites categorization history for one or more messages in one
+// account after a manual correction (single-email recategorize passes a one-element plans
+// slice; bulk recategorize passes one plan per selected message) — one query over the
+// account's HIST# partition regardless of how many messages are being rewritten, then
+// batched deletes and puts across every plan. This is what keeps a 50-email bulk
+// recategorize inside the 2 RCU/2 WCU provisioned table instead of throttling: a
+// one-query-per-message version would mean 50 full partition reads.
 func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, accountEmail string, plans []RewriteMessagePlan) error {
 	if len(plans) == 0 {
 		return nil
@@ -1933,6 +1887,13 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 // next lookback scan, whichever comes first).
 const claimLeaseSeconds = 900
 
+// processedTTLDays is how long a "PROC#" marker survives — both the lease claim
+// (ClaimMessages) and the confirmed marker it's overwritten with
+// (BatchInsertProcessingResults) — before DynamoDB's TTL sweep reclaims it. Named because
+// the two writes must agree: a confirmed marker that outlived a claim by a different TTL
+// would change how far back FilterUnprocessed's "already processed" check reaches.
+const processedTTLDays = 7
+
 // attrLeaseExp is the "PROC#" item's lease-expiry attribute (epoch seconds). Present
 // and in the future: another invocation owns this message, still classifying it.
 // Present and in the past: the owner crashed; reclaimable. Absent: either never seen
@@ -1956,7 +1917,7 @@ func (s *Store) ClaimMessages(ctx context.Context, accountID int64, messageIDs [
 				"PK":         sv(pkProcessed(accountID)),
 				"SK":         sv(mid),
 				attrLeaseExp: nv(now + claimLeaseSeconds),
-				attrTTL:      nv(ttlDays(7)), // keep processed record for 7 days (2x lookback default)
+				attrTTL:      nv(ttlDays(processedTTLDays)), // 2x lookback default
 			},
 			ConditionExpression: aws.String("attribute_not_exists(PK) OR " + attrLeaseExp + " < :now"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -2051,51 +2012,66 @@ func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID in
 	return s.deleteAllByPK(ctx, pkProcessed(accountID))
 }
 
+// ProcessingResults is one email's worth of DynamoDB writes for BatchInsertProcessingResults:
+// log lines, history entries, and (passively-confirmed) prompt examples, plus whether to
+// fold in the confirmed "PROC#" marker for MessageID. Confirm is explicit — processor's
+// LLM-error retry path needs to write logs/history without touching the claim (that
+// decision belongs to a separate ReleaseClaim call instead), which used to be expressed by
+// passing "" for MessageID rather than naming the intent directly.
+type ProcessingResults struct {
+	Logs      []LogEntry
+	History   []HistoryEntry
+	Examples  []PromptExample
+	AccountID int64
+	MessageID string
+	Confirm   bool
+}
+
 // BatchInsertProcessingResults writes one email's worth of log lines, history entries, and
 // (passively-confirmed) prompt examples in a single batched write. IDs come from localIDs
 // for every entity here — a process-local, no-round-trip generator, not the atomic nextIDs
 // counter — since each entity's SK already carries a real timestamp for ordering, so the id
 // only needs to be unique, not globally sequential (see localID's doc comment). That's what
 // keeps this call to exactly one BatchWriteItem call per 25 items total, regardless of how
-// many of logs/history/examples are non-empty, instead of a counter round trip per entity.
+// many of Logs/History/Examples are non-empty, instead of a counter round trip per entity.
 //
-// examples is usually just the confirmed_positive rows for whichever prompts this email
+// Examples is usually just the confirmed_positive rows for whichever prompts this email
 // matched (processor.processEmail) — every email a rule matches and the user never corrects
 // becomes evidence the rule is right about it. Folding them into this same call (rather than
 // a separate InsertPromptExamples call per email) is deliberate: it means passive
 // confirmation adds zero extra DynamoDB API calls per email, only more items in the same
 // existing batch.
-func (s *Store) BatchInsertProcessingResults(ctx context.Context, logs []LogEntry, history []HistoryEntry, examples []PromptExample, accountID int64, messageID string) error {
+func (s *Store) BatchInsertProcessingResults(ctx context.Context, r ProcessingResults) error {
 	ts := Now()
-	items := make([]map[string]types.AttributeValue, 0, len(logs)+len(history)+len(examples))
+	items := make([]map[string]types.AttributeValue, 0, len(r.Logs)+len(r.History)+len(r.Examples))
 
-	if len(logs) > 0 {
-		ids := localIDs(len(logs))
-		for i, l := range logs {
+	if len(r.Logs) > 0 {
+		ids := localIDs(len(r.Logs))
+		for i, l := range r.Logs {
 			items = append(items, logItem(ids[i], ts, l))
 		}
 	}
-	if len(history) > 0 {
-		ids := localIDs(len(history))
-		for i, h := range history {
+	if len(r.History) > 0 {
+		ids := localIDs(len(r.History))
+		for i, h := range r.History {
 			items = append(items, historyItem(ids[i], ts, h))
 		}
 	}
-	if len(examples) > 0 {
-		ids := localIDs(len(examples))
-		for i, e := range examples {
+	if len(r.Examples) > 0 {
+		ids := localIDs(len(r.Examples))
+		for i, e := range r.Examples {
 			e.ID = ids[i]
 			e.CreatedAt = ts
 			items = append(items, promptExampleItem(e))
 		}
 	}
-	if messageID != "" {
+	if r.Confirm {
 		// Overwrite our own claim with a confirmed marker (no leaseExp attribute), folded
 		// into the same batch rather than a separate MarkProcessed call.
 		items = append(items, map[string]types.AttributeValue{
-			"PK":    sv(pkProcessed(accountID)),
-			"SK":    sv(messageID),
-			attrTTL: nv(ttlDays(7)),
+			"PK":    sv(pkProcessed(r.AccountID)),
+			"SK":    sv(r.MessageID),
+			attrTTL: nv(ttlDays(processedTTLDays)),
 		})
 	}
 	if len(items) > 0 {

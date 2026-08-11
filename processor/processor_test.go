@@ -43,12 +43,13 @@ func toLLMPrompts(prompts []db.Prompt) []llm.Prompt {
 
 func TestModifyForPrompt(t *testing.T) {
 	tests := []struct {
-		name       string
-		prompt     db.Prompt
-		labelID    string
-		wantAdd    []string
-		wantRemove []string
-		wantTrash  bool
+		name        string
+		prompt      db.Prompt
+		labelID     string
+		wantAdd     []string
+		wantRemove  []string
+		wantTrash   bool
+		wantActions []string
 	}{
 		{
 			name:    "label only",
@@ -63,39 +64,44 @@ func TestModifyForPrompt(t *testing.T) {
 			wantAdd: nil,
 		},
 		{
-			name:       "spam adds SPAM, removes INBOX",
-			prompt:     db.Prompt{ActionSpam: 1},
-			wantAdd:    []string{gmailpkg.LabelSpam},
-			wantRemove: []string{gmailpkg.LabelInbox},
+			name:        "spam adds SPAM, removes INBOX",
+			prompt:      db.Prompt{ActionSpam: 1},
+			wantAdd:     []string{gmailpkg.LabelSpam},
+			wantRemove:  []string{gmailpkg.LabelInbox},
+			wantActions: []string{"sent to spam"},
 		},
 		{
-			name:      "trash sets trash flag, no label mutation",
-			prompt:    db.Prompt{ActionTrash: 1},
-			wantTrash: true,
+			name:        "trash sets trash flag, no label mutation",
+			prompt:      db.Prompt{ActionTrash: 1},
+			wantTrash:   true,
+			wantActions: []string{"trashed"},
 		},
 		{
-			name:       "archive removes INBOX",
-			prompt:     db.Prompt{ActionArchive: 1},
-			wantRemove: []string{gmailpkg.LabelInbox},
+			name:        "archive removes INBOX",
+			prompt:      db.Prompt{ActionArchive: 1},
+			wantRemove:  []string{gmailpkg.LabelInbox},
+			wantActions: []string{"archived"},
 		},
 		{
-			name:       "mark read removes UNREAD, composes with label",
-			prompt:     db.Prompt{LabelName: "Receipts", ActionMarkRead: 1},
-			labelID:    "Label_2",
-			wantAdd:    []string{"Label_2"},
-			wantRemove: []string{gmailpkg.LabelUnread},
+			name:        "mark read removes UNREAD, composes with label",
+			prompt:      db.Prompt{LabelName: "Receipts", ActionMarkRead: 1},
+			labelID:     "Label_2",
+			wantAdd:     []string{"Label_2"},
+			wantRemove:  []string{gmailpkg.LabelUnread},
+			wantActions: []string{"marked as read"},
 		},
 		{
-			name:       "spam takes priority over trash/archive",
-			prompt:     db.Prompt{ActionSpam: 1, ActionTrash: 1, ActionArchive: 1},
-			wantAdd:    []string{gmailpkg.LabelSpam},
-			wantRemove: []string{gmailpkg.LabelInbox},
-			wantTrash:  false,
+			name:        "spam takes priority over trash/archive",
+			prompt:      db.Prompt{ActionSpam: 1, ActionTrash: 1, ActionArchive: 1},
+			wantAdd:     []string{gmailpkg.LabelSpam},
+			wantRemove:  []string{gmailpkg.LabelInbox},
+			wantTrash:   false,
+			wantActions: []string{"sent to spam"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mod, trash := ModifyForPrompt(tc.prompt, tc.labelID)
+			mod, trash, actions := ModifyForPrompt(tc.prompt, tc.labelID)
 			if !slicesEqual(mod.AddLabels, tc.wantAdd) {
 				t.Errorf("AddLabels = %v, want %v", mod.AddLabels, tc.wantAdd)
 			}
@@ -104,6 +110,9 @@ func TestModifyForPrompt(t *testing.T) {
 			}
 			if trash != tc.wantTrash {
 				t.Errorf("trash = %v, want %v", trash, tc.wantTrash)
+			}
+			if !slicesEqual(actions, tc.wantActions) {
+				t.Errorf("actions = %v, want %v", actions, tc.wantActions)
 			}
 			if len(mod.MessageIDs) != 0 {
 				t.Errorf("MessageIDs should be left for the caller to set, got %v", mod.MessageIDs)
@@ -128,7 +137,12 @@ func slicesEqual(a, b []string) bool {
 // filterPrompts
 // ============================================================
 
-func TestFilterPrompts(t *testing.T) {
+// TestFilterActivePromptsForAccount exercises db.FilterActivePromptsForAccount — the
+// predicate setupAccountContext applies to an already-fetched prompt list (see
+// setupAccountContext's own doc comment for why a second query would be wasted work here).
+// Kept in this package since setupAccountContext is what actually depends on it; the
+// predicate itself lives in db (shared with Store.ListActivePromptsByAccount).
+func TestFilterActivePromptsForAccount(t *testing.T) {
 	prompt := func(id int64, active int64, accountID *int64) db.Prompt {
 		return db.Prompt{ID: id, Name: "P", Instructions: "x", Active: active, AccountID: accountID}
 	}
@@ -192,7 +206,7 @@ func TestFilterPrompts(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := filterPrompts(tc.prompts, tc.accountID)
+			got := db.FilterActivePromptsForAccount(tc.prompts, tc.accountID)
 			if len(got) != len(tc.wantIDs) {
 				t.Fatalf("len = %d, want %d; got IDs: %v", len(got), len(tc.wantIDs), idsOf(got))
 			}
@@ -260,7 +274,10 @@ func TestProcessEmail_MatchedPrompt(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "Label_42"}
 
-	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 
 	if len(modifies) == 0 {
 		t.Fatal("expected at least one modify")
@@ -291,7 +308,10 @@ func TestProcessEmail_NoMatch(t *testing.T) {
 		{ID: 10, Name: "Newsletter", LabelName: "newsletters", Active: 1, Instructions: "label newsletters"},
 	}
 
-	modifies, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
+	modifies, trashIDs, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: nil, debugLogging: false,
+	}, msg)
 
 	if len(modifies) != 0 {
 		t.Errorf("expected no modifies for no-match, got %v", modifies)
@@ -310,7 +330,10 @@ func TestProcessEmail_TrashAction(t *testing.T) {
 		{ID: 5, Name: "Spam", LabelName: "spam", ActionTrash: 1, Active: 1, Instructions: "trash spam"},
 	}
 
-	_, trashIDs, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), map[string]string{}, false, "", "", "")
+	_, trashIDs, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: map[string]string{}, debugLogging: false,
+	}, msg)
 
 	if !contains(trashIDs, "trash1") {
 		t.Errorf("expected trash1 in trashIDs, got %v", trashIDs)
@@ -329,7 +352,10 @@ func TestProcessEmail_StopProcessing(t *testing.T) {
 	}
 	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	modifies, _, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 
 	for _, m := range modifies {
 		if contains(m.AddLabels, "L2") {
@@ -345,7 +371,10 @@ func TestProcessEmail_LLMError(t *testing.T) {
 	msg := gmailpkg.Message{ID: "err1", Subject: "Test"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 
-	modifies, trashIDs, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
+	modifies, trashIDs, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: nil, debugLogging: false,
+	}, msg)
 
 	// On LLM error, processEmail returns nil and releases (rather than confirms) the
 	// claim taken before classification, so the message becomes claimable again instead
@@ -370,7 +399,10 @@ func TestProcessEmail_ArchiveAction(t *testing.T) {
 		{ID: 1, Name: "Archive", LabelName: "", ActionArchive: 1, Active: 1, Instructions: "archive"},
 	}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
+	modifies, _, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: nil, debugLogging: false,
+	}, msg)
 
 	if len(modifies) == 0 {
 		t.Fatal("expected a modify for archive action")
@@ -395,7 +427,10 @@ func TestProcessEmail_MarkReadAction(t *testing.T) {
 		{ID: 1, Name: "MarkRead", LabelName: "", ActionMarkRead: 1, Active: 1, Instructions: "mark read"},
 	}
 
-	modifies, _, _ := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
+	modifies, _, _ := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: nil, debugLogging: false,
+	}, msg)
 
 	found := false
 	for _, m := range modifies {
@@ -424,7 +459,10 @@ func TestProcessEmail_WritesHistoryAndLlmDebug(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "L1"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	_, _, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 	applyWriteJob(t.Context(), store, job)
 
 	// Verify history was written.
@@ -459,7 +497,10 @@ func TestProcessEmail_WritesConfirmedPositiveExample(t *testing.T) {
 	}
 	labelCache := map[string]string{"newsletters": "L1"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	_, _, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 	applyWriteJob(t.Context(), store, job)
 
 	examples, err := store.ListExamplesByVerdict(t.Context(), 1, db.VerdictConfirmedPositive, 10)
@@ -497,7 +538,10 @@ func TestProcessEmail_NoConfirmedExampleForStopShadowedPrompt(t *testing.T) {
 	}
 	labelCache := map[string]string{"l1": "L1", "l2": "L2"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	_, _, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 	applyWriteJob(t.Context(), store, job)
 
 	first, _ := store.ListExamplesByVerdict(t.Context(), 1, db.VerdictConfirmedPositive, 10)
@@ -521,12 +565,18 @@ func TestProcessEmail_LlmDebugGatedOnDebugLogging(t *testing.T) {
 	prompts := []db.Prompt{{ID: 1, Name: "P", LabelName: "l", Active: 1, Instructions: "x"}}
 	labelCache := map[string]string{"l": "L1"}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+	_, _, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: false,
+	}, msg)
 	if job.llmDebug != nil {
 		t.Error("expected llmDebug to be nil when DebugLogging is false")
 	}
 
-	_, _, job = processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, true, "", "", "")
+	_, _, job = processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: labelCache, debugLogging: true,
+	}, msg)
 	if job.llmDebug == nil {
 		t.Error("expected llmDebug to be populated when DebugLogging is true")
 	}
@@ -541,7 +591,10 @@ func TestProcessEmail_NoMatchWritesSentinelHistory(t *testing.T) {
 	msg := gmailpkg.Message{ID: "nomatch1", Subject: "No Match"}
 	prompts := []db.Prompt{{ID: 1, Name: "P", Active: 1, Instructions: "x"}}
 
-	_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), nil, false, "", "", "")
+	_, _, job := processEmail(t.Context(), &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+		labelCache: nil, debugLogging: false,
+	}, msg)
 	applyWriteJob(t.Context(), store, job)
 
 	page, _ := store.GetHistoryFiltered(t.Context(), db.HistoryFilter{Unmatched: true, Limit: 10})
@@ -621,7 +674,10 @@ func TestProcessEmail_ConcurrentFanOut(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+			modifies, _, job := processEmail(t.Context(), &batchCtx{
+				llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+				labelCache: labelCache, debugLogging: false,
+			}, msg)
 
 			mu.Lock()
 			for _, m := range modifies {
@@ -713,7 +769,10 @@ func TestClaimMessages_ExactlyOnceUnderRace(t *testing.T) {
 			if len(claimed) == 0 {
 				return // lost the race; a real caller would stop here too
 			}
-			_, _, job := processEmail(t.Context(), llmClient, account, msg, prompts, toLLMPrompts(prompts), labelCache, false, "", "", "")
+			_, _, job := processEmail(t.Context(), &batchCtx{
+				llmClient: llmClient, account: account, prompts: prompts, llmPrompts: toLLMPrompts(prompts),
+				labelCache: labelCache, debugLogging: false,
+			}, msg)
 			applyWriteJob(t.Context(), store, job)
 		})
 	}

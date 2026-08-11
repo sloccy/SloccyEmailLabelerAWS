@@ -35,13 +35,16 @@ func labelNamePtr(name string) *string {
 	return &name
 }
 
-// ModifyForPrompt returns the Gmail label changes to apply when prompt p matches an
-// email, plus whether the message should be trashed (kept separate from mod since
-// trashing is a distinct Gmail API call, not a label add/remove). labelID is the
-// resolved Gmail label id for p.LabelName (pass "" if unresolved/not needed).
-// Shared by the classify path (processEmail) and the recategorize "add" path
-// (server.go's handleRecategorize) so the two can't drift.
-func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bool) {
+// ModifyForPrompt returns the Gmail label changes to apply when prompt p matches an email,
+// whether the message should be trashed (kept separate from mod since trashing is a
+// distinct Gmail API call, not a label add/remove), and a human-readable description of
+// which of the spam/trash/archive/mark-read actions applied — the same phrases processEmail
+// appends to its log line, computed here once so the action→label mapping and its log-text
+// description can't drift apart the way two independently maintained switches over the same
+// four fields eventually would. labelID is the resolved Gmail label id for p.LabelName
+// (pass "" if unresolved/not needed). Shared by the classify path (processEmail) and the
+// recategorize "add" path (server.go's handleRecategorize) so the two can't drift either.
+func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bool, actions []string) {
 	if p.LabelName != "" && labelID != "" {
 		mod.AddLabels = append(mod.AddLabels, labelID)
 	}
@@ -49,15 +52,19 @@ func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bo
 	case p.ActionSpam != 0:
 		mod.AddLabels = append(mod.AddLabels, gmailpkg.LabelSpam)
 		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
+		actions = append(actions, "sent to spam")
 	case p.ActionTrash != 0:
 		trash = true
+		actions = append(actions, "trashed")
 	case p.ActionArchive != 0:
 		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelInbox)
+		actions = append(actions, "archived")
 	}
 	if p.ActionMarkRead != 0 {
 		mod.RemoveLabels = append(mod.RemoveLabels, gmailpkg.LabelUnread)
+		actions = append(actions, "marked as read")
 	}
-	return mod, trash
+	return mod, trash, actions
 }
 
 // ReverseModifyForPrompt returns the Gmail label changes that undo what ModifyForPrompt
@@ -67,7 +74,7 @@ func ModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, trash bo
 // a label op") instead of re-deriving the action→label mapping a second time, so the two
 // can't drift apart.
 func ReverseModifyForPrompt(p db.Prompt, labelID string) (mod gmailpkg.Modify, untrash bool) {
-	fwd, trash := ModifyForPrompt(p, labelID)
+	fwd, trash, _ := ModifyForPrompt(p, labelID)
 	mod.AddLabels = fwd.RemoveLabels
 	mod.RemoveLabels = fwd.AddLabels
 	return mod, trash
@@ -82,10 +89,15 @@ func NewAccountGmailService(ctx context.Context, store db.StoreIface, gmailAuth 
 	if err != nil {
 		return nil, fmt.Errorf("load oauth config: %w", err)
 	}
+	// Capture just the id, not account itself: this callback is retained for the Gmail
+	// client's whole lifetime (gmailpkg.refreshingTokenSource), so closing over the full
+	// Account struct would keep its CredentialsJSON (the very secret being rotated) pinned
+	// in memory for as long as the client lives, for a value the closure never reads.
+	id := account.ID
 	svc, err := gmailpkg.NewService(ctx, account.CredentialsJSON, oauthCfg, func(newCreds string) {
 		_ = store.UpdateAccountCredentials(ctx, db.UpdateAccountCredentialsParams{
 			CredentialsJSON: newCreds,
-			ID:              account.ID,
+			ID:              id,
 		})
 	})
 	if err != nil {
@@ -101,7 +113,7 @@ func setupAccountContext(ctx context.Context, store db.StoreIface, gmailAuth *gm
 	if err != nil {
 		return nil, nil, err
 	}
-	return svc, filterPrompts(allPrompts, account.ID), nil
+	return svc, db.FilterActivePromptsForAccount(allPrompts, account.ID), nil
 }
 
 // bufferedLogger collects log entries in memory instead of writing each one straight to
@@ -245,6 +257,12 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 		llmPrompts[i] = llm.Prompt{ID: p.ID, Name: p.Name, Instructions: p.Instructions}
 	}
 
+	bc := &batchCtx{
+		llmClient: llmClient, account: account, prompts: prompts, llmPrompts: llmPrompts,
+		labelCache: labelCache, debugLogging: cfg.DebugLogging,
+		model: model, tier: tier, reasoningOverride: reasoningOverride,
+	}
+
 	// Fetch and classify messages. Fetching is already concurrent (IterMessageDetails);
 	// classification is now fanned out too, capped at cfg.ClassifyConcurrency, since flex-tier
 	// Bedrock requests can queue for minutes and no longer have to be serialized one-by-one.
@@ -280,7 +298,7 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			modifies, trash, job := processEmail(ctx, llmClient, account, msg, prompts, llmPrompts, labelCache, cfg.DebugLogging, model, tier, reasoningOverride)
+			modifies, trash, job := processEmail(ctx, bc, msg)
 
 			mu.Lock()
 			allModifies = append(allModifies, modifies...)
@@ -334,15 +352,13 @@ type writeJob struct {
 // applyWriteJob persists one writeJob. Errors are logged, not propagated — matching the
 // prior inline behavior where a DB write failure doesn't block or retry email processing.
 func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
-	// Passing "" here (rather than job.messageID) means: write the logs/history/examples
-	// collected so far, but never touch the "PROC#" marker via this call — for a release,
-	// that decision belongs solely to the ReleaseClaim call below, not to whatever
-	// messageID happens to be non-empty.
-	confirmID := job.messageID
-	if job.release {
-		confirmID = ""
-	}
-	if err := store.BatchInsertProcessingResults(ctx, job.logs, job.history, job.examples, job.accountID, confirmID); err != nil {
+	// Confirm: false on release — write the logs/history/examples collected so far, but
+	// never touch the "PROC#" marker via this call; that decision belongs solely to the
+	// ReleaseClaim call below.
+	if err := store.BatchInsertProcessingResults(ctx, db.ProcessingResults{
+		Logs: job.logs, History: job.history, Examples: job.examples,
+		AccountID: job.accountID, MessageID: job.messageID, Confirm: !job.release,
+	}); err != nil {
 		slog.Error("db write failed", "err", err)
 	}
 	if job.release {
@@ -361,17 +377,25 @@ func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
 	}
 }
 
-func processEmail(
-	ctx context.Context,
-	llmClient llm.ClientIface,
-	account db.Account,
-	msg gmailpkg.Message,
-	prompts []db.Prompt,
-	llmPrompts []llm.Prompt,
-	labelCache map[string]string,
-	debugLogging bool,
-	model, tier, reasoningOverride string,
-) (modifies []gmailpkg.Modify, trashIDs []string, job writeJob) {
+// batchCtx bundles everything processEmail needs that stays constant across every email in
+// one processMessageIDs batch: the account being scanned, its active prompts (both as
+// db.Prompt and the llm.Prompt projection classify sends), the label cache, and the
+// resolved classify model/tier/reasoning-override (see ResolveClassifySettings — resolved
+// once per batch, not per email, to avoid a GetSetting round trip per email). Built once in
+// processMessageIDs and passed by pointer into the classify fan-out closure, instead of
+// threading all of this through processEmail as separate parameters and capturing each one
+// individually in the closure.
+type batchCtx struct {
+	llmClient                      llm.ClientIface
+	account                        db.Account
+	prompts                        []db.Prompt
+	llmPrompts                     []llm.Prompt
+	labelCache                     map[string]string
+	debugLogging                   bool
+	model, tier, reasoningOverride string
+}
+
+func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modifies []gmailpkg.Modify, trashIDs []string, job writeJob) {
 	email := llm.Email{
 		Sender:  msg.Sender,
 		Subject: msg.Subject,
@@ -382,8 +406,8 @@ func processEmail(
 	logs := []db.LogEntry{{
 		Level: logInfo,
 		Message: fmt.Sprintf("[%s] Classifying: '%s' from %s against %d rule(s) (model: %s, tier: %s)",
-			account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60),
-			len(llmPrompts), model, tier),
+			bc.account.Email, gmailpkg.Truncate(msg.Subject, 60), gmailpkg.Truncate(msg.Sender, 60),
+			len(bc.llmPrompts), bc.model, bc.tier),
 	}}
 
 	// Buffer the classify call's own log lines instead of writing each one straight to
@@ -391,7 +415,7 @@ func processEmail(
 	// times per call, and buffering lets all of it flush through the single
 	// BatchInsertProcessingResults call below, alongside history, instead.
 	logger := &bufferedLogger{}
-	classified, llmErr := llmClient.ClassifyEmailBatch(ctx, logger, email, llmPrompts, model, tier, reasoningOverride, debugLogging)
+	classified, llmErr := bc.llmClient.ClassifyEmailBatch(ctx, logger, email, bc.llmPrompts, bc.model, bc.tier, bc.reasoningOverride, bc.debugLogging)
 	logs = append(logs, logger.entries...)
 
 	var history []db.HistoryEntry
@@ -401,7 +425,7 @@ func processEmail(
 		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
 		// Release the claim taken before classification instead of confirming it, so the
 		// message is immediately eligible for retry rather than waiting out the full lease.
-		return nil, nil, writeJob{accountID: account.ID, logs: logs, messageID: msg.ID, release: true}
+		return nil, nil, writeJob{accountID: bc.account.ID, logs: logs, messageID: msg.ID, release: true}
 	}
 
 	// Computed once and reused for every matched prompt below — msg.Body is already in
@@ -411,7 +435,7 @@ func processEmail(
 
 	var matched []string
 	stop := false
-	for _, p := range prompts {
+	for _, p := range bc.prompts {
 		if !classified.Results[p.ID] {
 			continue
 		}
@@ -425,23 +449,11 @@ func processEmail(
 			actions = append(actions, "labeled → "+p.LabelName)
 		}
 
-		mod, trash := ModifyForPrompt(p, labelCache[p.LabelName])
+		mod, trash, modActions := ModifyForPrompt(p, bc.labelCache[p.LabelName])
 		mod.MessageIDs = []string{msg.ID}
-
-		// Action log text (spam takes priority over trash/archive, matching ModifyForPrompt).
-		switch {
-		case p.ActionSpam != 0:
-			actions = append(actions, "sent to spam")
-		case p.ActionTrash != 0:
-			actions = append(actions, "trashed")
-		case p.ActionArchive != 0:
-			actions = append(actions, "archived")
-		}
+		actions = append(actions, modActions...)
 		if trash {
 			trashIDs = append(trashIDs, msg.ID)
-		}
-		if p.ActionMarkRead != 0 {
-			actions = append(actions, "marked as read")
 		}
 
 		if p.StopProcessing != 0 {
@@ -455,11 +467,11 @@ func processEmail(
 
 		logs = append(logs, db.LogEntry{
 			Level:   logInfo,
-			Message: fmt.Sprintf("[%s] '%s' \u2014 %s (rule: %s)", account.Email, gmailpkg.Truncate(msg.Subject, 60), strings.Join(actions, ", "), p.Name),
+			Message: fmt.Sprintf("[%s] '%s' \u2014 %s (rule: %s)", bc.account.Email, gmailpkg.Truncate(msg.Subject, 60), strings.Join(actions, ", "), p.Name),
 		})
 		history = append(history, db.HistoryEntry{
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
+			AccountID:    bc.account.ID,
+			AccountEmail: bc.account.Email,
 			MessageID:    msg.ID,
 			Subject:      msg.Subject,
 			Sender:       msg.Sender,
@@ -483,7 +495,7 @@ func processEmail(
 		// PromptExample write path sharing the same monotonically-ordered id source.
 		examples = append(examples, db.PromptExample{
 			PromptID:        p.ID,
-			AccountID:       account.ID,
+			AccountID:       bc.account.ID,
 			MessageID:       msg.ID,
 			Verdict:         db.VerdictConfirmedPositive,
 			Sender:          msg.Sender,
@@ -497,8 +509,8 @@ func processEmail(
 	// If no prompts matched, record a "no match" entry
 	if len(history) == 0 {
 		history = append(history, db.HistoryEntry{
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
+			AccountID:    bc.account.ID,
+			AccountEmail: bc.account.Email,
 			MessageID:    msg.ID,
 			Subject:      msg.Subject,
 			Sender:       msg.Sender,
@@ -509,11 +521,11 @@ func processEmail(
 	}
 
 	if len(matched) > 0 {
-		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: %d match(es): %v", account.Email, msg.Subject, len(matched), matched)})
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: %d match(es): %v", bc.account.Email, msg.Subject, len(matched), matched)})
 	} else {
-		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: 0 match(es): none", account.Email, msg.Subject)})
+		logs = append(logs, db.LogEntry{Level: logInfo, Message: fmt.Sprintf("[%s] Processed %q: 0 match(es): none", bc.account.Email, msg.Subject)})
 	}
-	if debugLogging {
+	if bc.debugLogging {
 		logs = append(logs, db.LogEntry{Level: logDebug, Message: "LLM response: " + classified.RawResponse})
 	}
 
@@ -521,10 +533,10 @@ func processEmail(
 	// write, so it's only built and written when DebugLogging is on — keeping normal
 	// operation to just the batched logs+history write plus the processed marker.
 	var llmDebug *db.AddLlmDebugParams
-	if debugLogging {
+	if bc.debugLogging {
 		llmDebug = &db.AddLlmDebugParams{
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
+			AccountID:    bc.account.ID,
+			AccountEmail: bc.account.Email,
 			MessageID:    msg.ID,
 			Subject:      msg.Subject,
 			Sender:       msg.Sender,
@@ -535,7 +547,7 @@ func processEmail(
 	}
 
 	job = writeJob{
-		accountID: account.ID,
+		accountID: bc.account.ID,
 		logs:      logs,
 		history:   history,
 		examples:  examples,
@@ -544,20 +556,6 @@ func processEmail(
 	}
 
 	return modifies, trashIDs, job
-}
-
-func filterPrompts(prompts []db.Prompt, accountID int64) []db.Prompt {
-	var out []db.Prompt
-	for _, p := range prompts {
-		if p.Active == 0 {
-			continue
-		}
-		if p.AccountID != nil && *p.AccountID != accountID {
-			continue
-		}
-		out = append(out, p)
-	}
-	return out
 }
 
 // ProcessConfig holds runtime configuration for the processor.
