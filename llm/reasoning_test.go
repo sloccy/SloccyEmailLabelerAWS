@@ -59,8 +59,9 @@ func TestReasoningEffortFields_OffIsNoop(t *testing.T) {
 }
 
 // TestReasoningEffortFields_DefaultOnForUnverifiedModel locks in the default-on design: a
-// model this project has never explicitly tested (i.e. not in reasoningEffortExempt) is
-// assumed to honor additionalModelRequestFields.reasoning_config — verified broadly enough
+// model this project has never explicitly tested (i.e. no matching noEffort entry in
+// modelCapabilities) is assumed to honor additionalModelRequestFields.reasoning_config —
+// verified broadly enough
 // across independent vendors (see reasoningEffortSupported's doc comment) that "assume it
 // works" beats "require a code change per new model," with ImprovePromptInstructions'
 // ValidationException retry as the fallback if a given model turns out not to.

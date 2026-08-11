@@ -881,8 +881,9 @@ func TestImprovePromptInstructions_ServiceTierFollowsImproveTierSetting(t *testi
 // TestImprovePromptInstructions_UnsupportedEffortDoesNotInvertToSuppression guards the fix
 // for a real inversion bug, using the one model where it can actually happen:
 // nvidia.nemotron-nano-9b-v2 is both exempt from reasoningEffortFields (verified live to
-// ignore reasoning_config — see reasoningEffortExempt) AND matched by reasoningRegistry's
-// *suppression* table ("nemotron" -> "detailed thinking off", reasoningOff). Requesting
+// ignore reasoning_config — see modelCapabilities' noEffort entries) AND matched by
+// modelCapabilities' *suppression* entry ("nemotron" -> "detailed thinking off",
+// reasoningOff). Requesting
 // ReasoningEffortOn on this exact model must leave it at its own default — it must NOT fall
 // through into reasoningOff and inject the suppression text, which would answer "turn
 // reasoning on" by turning it off, the opposite of what was asked.
@@ -1084,6 +1085,57 @@ func TestImprovePromptInstructions_StreamsAnswerAndReasoningSeparately(t *testin
 		if strings.Contains(m.Content, "think about this rule") {
 			t.Errorf("returned conversation leaked reasoning text: %+v", conv)
 		}
+	}
+}
+
+// ---- streamGenerate: drainConverseStream's other caller ----
+//
+// Unlike ImprovePromptInstructions, streamGenerate had no test coverage before
+// drainConverseStream was factored out to share the ConverseStream event loop between the
+// two — StreamGeneratePromptInstruction is only exercised through FakeClient (a hand-rolled
+// test double) elsewhere in this codebase, never through the real streamGenerate. These two
+// guard the behavior drainConverseStream must preserve for this call site: text/reasoning
+// deltas routed onto the channel, and a MaxTokens stop reported as truncation.
+
+func TestStreamGenerate_StreamsTextAndReasoning(t *testing.T) {
+	fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{{
+		reasoningDeltaEvent("thinking about the rule. "),
+		textDeltaEvent("Match newsletters "),
+		textDeltaEvent("from any sender."),
+		stopEvent(types.StopReasonEndTurn),
+	}}}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	ch := make(chan StreamChunk, 16)
+
+	if err := c.streamGenerate(context.Background(), "newsletters", ch); err != nil {
+		t.Fatalf("streamGenerate error: %v", err)
+	}
+	close(ch)
+
+	var textBuf, reasoningBuf strings.Builder
+	for chunk := range ch {
+		textBuf.WriteString(chunk.Text)
+		reasoningBuf.WriteString(chunk.Reasoning)
+	}
+	if got := textBuf.String(); got != "Match newsletters from any sender." {
+		t.Errorf("accumulated text = %q, want %q", got, "Match newsletters from any sender.")
+	}
+	if got := reasoningBuf.String(); got != "thinking about the rule. " {
+		t.Errorf("accumulated reasoning = %q, want %q", got, "thinking about the rule. ")
+	}
+}
+
+func TestStreamGenerate_MaxTokensReturnsTruncationError(t *testing.T) {
+	fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{{
+		textDeltaEvent("Match newsl"),
+		stopEvent(types.StopReasonMaxTokens),
+	}}}
+	c := &Client{br: fake, defaultModel: "us.amazon.nova-micro-v1:0"}
+	ch := make(chan StreamChunk, 16)
+
+	err := c.streamGenerate(context.Background(), "newsletters", ch)
+	if err == nil || !strings.Contains(err.Error(), "truncated at max_tokens") {
+		t.Fatalf("err = %v, want it to mention truncation at max_tokens", err)
 	}
 }
 
