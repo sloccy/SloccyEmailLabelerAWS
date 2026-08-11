@@ -289,12 +289,22 @@ func setHxTrigger(w http.ResponseWriter, triggers map[string]any) {
 
 func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	accounts, _ := s.store.ListAccountsSafe(ctx)
-	activePrompts, _ := s.store.CountActivePrompts(ctx)
-	logs, _ := s.store.GetLogs(ctx, 100)
 	since30d := time.Now().AddDate(0, 0, -30)
-	turnaround, _ := s.store.GetTurnaroundSamples(ctx, since30d)
-	timeoutCount, _ := s.store.CountLogsByLevel(ctx, llm.LogLevelTimeout, since30d)
+
+	// Five independent reads, no data dependency between them — fanned out rather than run
+	// serially, since this is the page users hit first and refreshDashboard re-triggers it.
+	var accounts []db.ListAccountsSafeRow
+	var activePrompts int64
+	var logs []db.Log
+	var turnaround []db.TurnaroundSample
+	var timeoutCount int64
+	var wg sync.WaitGroup
+	wg.Go(func() { accounts, _ = s.store.ListAccountsSafe(ctx) })
+	wg.Go(func() { activePrompts, _ = s.store.CountActivePrompts(ctx) })
+	wg.Go(func() { logs, _ = s.store.GetLogs(ctx, 100) })
+	wg.Go(func() { turnaround, _ = s.store.GetTurnaroundSamples(ctx, since30d) })
+	wg.Go(func() { timeoutCount, _ = s.store.CountLogsByLevel(ctx, llm.LogLevelTimeout, since30d) })
+	wg.Wait()
 
 	data := map[string]any{
 		"AccountCount":   len(accounts),
@@ -739,10 +749,12 @@ func improveMaxRoundsOptions() []int {
 }
 
 // loadSettings fetches every stored setting in one Query and returns it as a key->value
-// map, for handlers that need several keys in one request instead of a separate
-// GetSetting round trip per key.
-func (s *server) loadSettings(ctx context.Context) map[string]string {
-	all, _ := s.store.GetAllSettings(ctx)
+// map, for callers that need several keys in one call instead of a separate GetSetting
+// round trip per key. A free function (not a *server method) so improveAndFinalizeSuggestion
+// (improve.go) can call it with just a *db.Store, the same reasoning improveExampleCap's doc
+// comment gives for its own free-function shape.
+func loadSettings(ctx context.Context, store *db.Store) map[string]string {
+	all, _ := store.GetAllSettings(ctx)
 	m := make(map[string]string, len(all))
 	for _, st := range all {
 		m[st.Key] = st.Value
@@ -760,7 +772,7 @@ func settingOr(settings map[string]string, key, def string) string {
 
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	settings := s.loadSettings(ctx)
+	settings := loadSettings(ctx, s.store)
 	classifyModel := settingOr(settings, llm.SettingClassifyModel, s.cfg.BedrockModel)
 	improveModel := settingOr(settings, llm.SettingImproveModel, s.cfg.BedrockModel)
 	classifyTier := settingOr(settings, llm.SettingClassifyTier, llm.TierStandard)
@@ -807,7 +819,7 @@ func (s *server) applyModelSetting(ctx context.Context, r *http.Request, formKey
 func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_ = r.ParseForm()
-	settings := s.loadSettings(ctx)
+	settings := loadSettings(ctx, s.store)
 
 	// Model selections — validate against available models to ignore garbage input
 	models := s.cachedModels(ctx)
@@ -842,8 +854,9 @@ func (s *server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.SetSetting(ctx, db.SetSettingParams{Key: llm.SettingClassifyReasoningDirective, Value: reasoningDirective})
 
 	// Checkbox semantics: the browser only sends improve_replay when checked, so its
-	// presence (any value) means enabled — persisted as "1"/"0" to match improveReplayEnabled's
-	// (improve.go) unset-means-enabled default.
+	// presence (any value) means enabled — persisted as "1"/"0" to match
+	// improveAndFinalizeSuggestion's (improve.go) unset-means-enabled default for this
+	// setting.
 	improveReplay := r.FormValue("improve_replay") != ""
 	replayValue := "0"
 	if improveReplay {
@@ -1494,10 +1507,24 @@ func (s *server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One partition read for every existing global prompt's name, instead of
+	// PromptExistsGlobal's own full PROMPT partition scan once per imported prompt — an
+	// import of 40 prompts used to cost 40 full partition reads to check a name set that's
+	// static except for what this very loop adds to it (see the map update below, which
+	// keeps a global-named duplicate within the same import file still caught, matching
+	// PromptExistsGlobal's original per-iteration re-query).
+	existingGlobalNames := make(map[string]bool)
+	if existing, err := s.store.ListPrompts(ctx); err == nil {
+		for _, p := range existing {
+			if p.AccountID == nil {
+				existingGlobalNames[p.Name] = true
+			}
+		}
+	}
+
 	imported := 0
 	for _, p := range cfg.Prompts {
-		exists, _ := s.store.PromptExistsGlobal(ctx, p.Name)
-		if exists != 0 {
+		if existingGlobalNames[p.Name] {
 			continue
 		}
 		var accountID sql.NullInt64
@@ -1516,6 +1543,9 @@ func (s *server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 			StopProcessing: p.StopProcessing,
 			AccountID:      accountID,
 		})
+		if p.AccountID == nil {
+			existingGlobalNames[p.Name] = true
+		}
 		imported++
 	}
 	for _, setting := range cfg.Settings {

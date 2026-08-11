@@ -53,23 +53,27 @@ const pruneCapMultiplier = 2
 func prunePromptExamples(ctx context.Context, store *db.Store, prompts []db.Prompt) {
 	promptCap := pruneCapMultiplier * replayExampleCap(ctx, store)
 	for _, p := range prompts {
+		// CountExamplesByVerdict already counts all three verdicts in one call (3
+		// Select:COUNT queries) — call it once per prompt here rather than once per verdict
+		// inside pruneVerdict, which would repeat the same 3 queries 3x for nothing.
+		counts, err := store.CountExamplesByVerdict(ctx, p.ID)
+		if err != nil {
+			slog.Error("prune: count examples", "prompt_id", p.ID, "err", err)
+			continue
+		}
 		for _, verdict := range db.VerdictOrder {
-			pruneVerdict(ctx, store, p.ID, verdict, promptCap)
+			pruneVerdict(ctx, store, p.ID, verdict, promptCap, counts[verdict])
 		}
 	}
 }
 
 // pruneVerdict prunes one prompt's one verdict, if it needs it: a cheap count precheck
-// (shouldPruneVerdict, improve.go — 3 Select:COUNT queries via CountExamplesByVerdict,
-// cheap regardless of corpus size) skips the expensive read+rank+delete path entirely once
-// a corpus has stabilized near cap, which is the common case on most scheduled runs.
-func pruneVerdict(ctx context.Context, store *db.Store, promptID int64, verdict string, promptCap int) {
-	counts, err := store.CountExamplesByVerdict(ctx, promptID)
-	if err != nil {
-		slog.Error("prune: count examples", "prompt_id", promptID, "verdict", verdict, "err", err)
-		return
-	}
-	if !shouldPruneVerdict(counts[verdict], promptCap) {
+// (shouldPruneVerdict, improve.go, against count — already fetched by the caller via one
+// CountExamplesByVerdict call per prompt) skips the expensive read+rank+delete path
+// entirely once a corpus has stabilized near cap, which is the common case on most
+// scheduled runs.
+func pruneVerdict(ctx context.Context, store *db.Store, promptID int64, verdict string, promptCap int, count int64) {
+	if !shouldPruneVerdict(count, promptCap) {
 		return
 	}
 

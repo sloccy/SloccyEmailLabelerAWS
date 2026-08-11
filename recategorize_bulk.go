@@ -270,6 +270,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 
 	promptByID := make(map[int64]db.Prompt)
 	var allExamples []db.PromptExample
+	var allCorrections []db.InsertEmailCorrectionParams
 
 	for accountID, messageIDs := range byAccount {
 		account, err := s.store.GetAccount(ctx, accountID)
@@ -333,17 +334,24 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 
 		for _, mid := range needExcerpt {
 			st := state[mid]
-			if _, err := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
+			allCorrections = append(allCorrections, db.InsertEmailCorrectionParams{
 				AccountID:      accountID,
 				MessageID:      mid,
 				AddedPrompts:   addedCSV,
 				RemovedPrompts: removedCSV,
 				Note:           note,
-			}); err != nil {
-				slog.Error("bulk recategorize: insert correction", "account_id", accountID, "message_id", mid, "err", err)
-			}
+			})
 			examples := buildPromptExamples(accountID, mid, st.Sender, st.Subject, excerpts[mid], note, perMessageVerdicts[mid], promptByID)
 			allExamples = append(allExamples, examples...)
+		}
+	}
+
+	// Batched across the whole action, not per account or per message — see
+	// InsertEmailCorrections' doc comment for why a bulk action's corrections don't need
+	// the single-email path's sequential nextID.
+	if len(allCorrections) > 0 {
+		if err := s.store.InsertEmailCorrections(ctx, allCorrections); err != nil {
+			slog.Error("bulk recategorize: insert corrections", "count", len(allCorrections), "err", err)
 		}
 	}
 

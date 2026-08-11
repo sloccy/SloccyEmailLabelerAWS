@@ -1189,6 +1189,11 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		}
 	}
 
+	// Resolved once here rather than inside the stream closure below: stream can run twice
+	// (the ValidationException retry), and each call would otherwise re-issue this
+	// GetSetting DynamoDB read for a value that can't have changed mid-call.
+	tier := c.resolveImproveTier(ctx)
+
 	// stream runs one ConverseStream call and accumulates its answer text. emitted reports
 	// whether any delta at all reached the sink — used below to gate the ValidationException
 	// retry, since that retry must never re-run after a partial answer has already been
@@ -1215,7 +1220,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 				MaxTokens:   aws.Int32(maxTokens),
 				Temperature: aws.Float32(0.4),
 			},
-			ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
+			ServiceTier:                  serviceTierFor(tier),
 			AdditionalModelRequestFields: f,
 			RequestMetadata:              requestMetadataFor("improve"),
 		})
@@ -1530,14 +1535,15 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 			label = id
 		}
 		seen[id] = true
+		inCost, outCost, flexIn, flexOut, flexCapable := cat.pricesFor(id)
 		opts = append(opts, ModelOption{
 			ID:                  id,
 			Label:               label,
-			InputCostPer1M:      cat.inputCostPer1M(id),
-			OutputCostPer1M:     cat.outputCostPer1M(id),
-			FlexCostPer1M:       cat.flexCostPer1M(id),
-			FlexOutputCostPer1M: cat.flexOutputCostPer1M(id),
-			Flex:                cat.isFlexCapable(id),
+			InputCostPer1M:      inCost,
+			OutputCostPer1M:     outCost,
+			FlexCostPer1M:       flexIn,
+			FlexOutputCostPer1M: flexOut,
+			Flex:                flexCapable,
 		}) // ProfileRegion left as "" — bare foundation-model id, single datacenter
 	}
 
@@ -1577,15 +1583,16 @@ func (c *Client) ListAvailableModels(ctx context.Context) ([]ModelOption, error)
 		}
 		seen[id] = true
 		base := baseModelID(id)
+		inCost, outCost, flexIn, flexOut, flexCapable := cat.pricesFor(base)
 		opts = append(opts, ModelOption{
 			ID:                  id,
 			Label:               label,
-			InputCostPer1M:      cat.inputCostPer1M(base),
-			OutputCostPer1M:     cat.outputCostPer1M(base),
-			FlexCostPer1M:       cat.flexCostPer1M(base),
-			FlexOutputCostPer1M: cat.flexOutputCostPer1M(base),
+			InputCostPer1M:      inCost,
+			OutputCostPer1M:     outCost,
+			FlexCostPer1M:       flexIn,
+			FlexOutputCostPer1M: flexOut,
 			ProfileRegion:       profileRegion(id),
-			Flex:                cat.isFlexCapable(base),
+			Flex:                flexCapable,
 		})
 	}
 

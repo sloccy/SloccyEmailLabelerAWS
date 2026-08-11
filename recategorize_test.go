@@ -163,27 +163,28 @@ func TestBuildPromptExamples_EmptyVerdictsProducesNil(t *testing.T) {
 	}
 }
 
-// fakeVersionObserver records every IncrementVersionObserved call for
-// TestIncrementVersionObservedFor to assert against.
+// fakeVersionObserver records every IncrementVersionObservedBy call, keyed by
+// (promptID, versionID, verdict), for TestIncrementVersionObservedFor to assert against.
 type fakeVersionObserver struct {
-	calls []struct {
-		promptID, versionID int64
-		verdict             string
-	}
+	calls map[[3]any]int64
 }
 
-func (f *fakeVersionObserver) IncrementVersionObserved(_ context.Context, promptID, versionID int64, verdict string) {
-	f.calls = append(f.calls, struct {
-		promptID, versionID int64
-		verdict             string
-	}{promptID, versionID, verdict})
+func (f *fakeVersionObserver) IncrementVersionObservedBy(_ context.Context, promptID, versionID int64, verdict string, n int64) {
+	if f.calls == nil {
+		f.calls = map[[3]any]int64{}
+	}
+	f.calls[[3]any{promptID, versionID, verdict}] += n
 }
 
 func TestIncrementVersionObservedFor(t *testing.T) {
-	// Deliberately includes a confirmed_positive example — IncrementVersionObserved itself
-	// (db/store.go) is responsible for skipping it, not this loop, so this test doubles as
-	// a check that the loop really does call through for every example unconditionally.
+	// Deliberately includes a confirmed_positive example — IncrementVersionObservedBy
+	// itself (db/store.go) is responsible for skipping it, not this loop, so this test
+	// doubles as a check that the loop really does pass through every distinct key
+	// unconditionally. Also includes two examples sharing the same (promptID, versionID,
+	// verdict) — the case incrementVersionObservedFor's aggregation exists for — to confirm
+	// they collapse into one call carrying the combined count rather than two separate ones.
 	examples := []db.PromptExample{
+		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictFalsePositive},
 		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictFalsePositive},
 		{PromptID: 2, PromptVersionID: 20, Verdict: db.VerdictFalseNegative},
 		{PromptID: 3, PromptVersionID: 30, Verdict: db.VerdictConfirmedPositive},
@@ -191,13 +192,17 @@ func TestIncrementVersionObservedFor(t *testing.T) {
 	f := &fakeVersionObserver{}
 	incrementVersionObservedFor(t.Context(), f, examples)
 
-	if len(f.calls) != 3 {
-		t.Fatalf("expected 3 calls (one per example), got %d: %+v", len(f.calls), f.calls)
+	want := map[[3]any]int64{
+		{int64(1), int64(10), db.VerdictFalsePositive}:     2,
+		{int64(2), int64(20), db.VerdictFalseNegative}:     1,
+		{int64(3), int64(30), db.VerdictConfirmedPositive}: 1,
 	}
-	for i, ex := range examples {
-		c := f.calls[i]
-		if c.promptID != ex.PromptID || c.versionID != ex.PromptVersionID || c.verdict != ex.Verdict {
-			t.Errorf("call %d = %+v, want promptID=%d versionID=%d verdict=%s", i, c, ex.PromptID, ex.PromptVersionID, ex.Verdict)
+	if len(f.calls) != len(want) {
+		t.Fatalf("expected %d distinct calls, got %d: %+v", len(want), len(f.calls), f.calls)
+	}
+	for k, n := range want {
+		if got := f.calls[k]; got != n {
+			t.Errorf("call %v: count = %d, want %d", k, got, n)
 		}
 	}
 }

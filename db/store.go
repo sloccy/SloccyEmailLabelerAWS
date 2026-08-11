@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -511,27 +512,36 @@ func (s *Store) GetLogs(ctx context.Context, limit int64) ([]Log, error) {
 }
 
 // CountLogsByLevel returns how many logs at the given level were recorded at or after
-// since — used for the dashboard's rolling 30-day Bedrock-timeout counter.
+// since — used for the dashboard's rolling 30-day Bedrock-timeout counter. Select: COUNT
+// (mirroring CountExamplesByVerdict's pagination shape) so DynamoDB returns a running count
+// instead of every row's full message text just to be thrown away in Go.
 func (s *Store) CountLogsByLevel(ctx context.Context, level string, since time.Time) (int64, error) {
 	sinceKey := tsKey(since.UTC().Format(tsLayout), 0)
-	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.table),
-		KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			exprPK:   sv("LOG"),
-			":since": sv(sinceKey),
-		},
-	})
-	if err != nil {
-		return 0, err
-	}
-	var count int64
-	for _, it := range items {
-		if getStr(it, "level") == level {
-			count++
+	var total int64
+	var start map[string]types.AttributeValue
+	for {
+		out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(s.table),
+			KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
+			FilterExpression:       aws.String("level = :level"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				exprPK:   sv("LOG"),
+				":since": sv(sinceKey),
+				":level": sv(level),
+			},
+			Select:            types.SelectCount,
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
+			return 0, err
 		}
+		total += int64(out.Count)
+		if out.LastEvaluatedKey == nil {
+			break
+		}
+		start = out.LastEvaluatedKey
 	}
-	return count, nil
+	return total, nil
 }
 
 func (s *Store) GetLogsRange(ctx context.Context, arg GetLogsRangeParams) ([]Log, error) {
@@ -641,7 +651,12 @@ func accountItem(a Account) map[string]types.AttributeValue {
 
 func itemToAccount(it map[string]types.AttributeValue) Account { return unmarshalItem[Account](it) }
 
-func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+// listAccounts returns every account without hydrating CredentialsJSON — the token-free
+// core both ListAccounts and every internal caller that only needs id/email/status shares.
+// hydrateAccountToken is one ssm:GetParameter (with decryption, i.e. a KMS call) per
+// account, so callers that don't build a Gmail client from the result should call this
+// directly, not ListAccounts, to avoid paying for and then discarding every account's token.
+func (s *Store) listAccounts(ctx context.Context) ([]Account, error) {
 	items, err := s.queryAll(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
 		KeyConditionExpression: aws.String("PK = :pk"),
@@ -655,16 +670,31 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	accs := make([]Account, len(items))
 	for i, it := range items {
 		accs[i] = itemToAccount(it)
-		if err := s.hydrateAccountToken(ctx, &accs[i]); err != nil {
-			return nil, err
-		}
 	}
 	sort.Slice(accs, func(i, j int) bool { return accs[i].AddedAt > accs[j].AddedAt })
 	return accs, nil
 }
 
+// ListAccounts returns every account with CredentialsJSON hydrated from SSM — for callers
+// that actually build a Gmail client from the result (scan.go, and the account-management
+// handlers in server.go). Callers that only need id/email/status (listing, filtering,
+// aggregating by account) should call the unexported listAccounts instead, which skips the
+// per-account SSM round trip entirely.
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	accs, err := s.listAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range accs {
+		if err := s.hydrateAccountToken(ctx, &accs[i]); err != nil {
+			return nil, err
+		}
+	}
+	return accs, nil
+}
+
 func (s *Store) ListAccountsSafe(ctx context.Context) ([]ListAccountsSafeRow, error) {
-	accs, err := s.ListAccounts(ctx)
+	accs, err := s.listAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,7 +1265,16 @@ func (s *Store) ListPromptVersions(ctx context.Context, promptID int64, limit in
 // improve round, not the primary effect of recording a correction, so it must never be
 // able to block one.
 func (s *Store) IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string) {
-	if versionID == 0 {
+	s.IncrementVersionObservedBy(ctx, promptID, versionID, verdict, 1)
+}
+
+// IncrementVersionObservedBy adds n (rather than a fixed 1) to the false_positive/
+// false_negative observed counter for one prompt version — lets a caller that's already
+// aggregated several examples sharing the same (promptID, versionID, verdict) issue one ADD
+// update for the total instead of one UpdateItem per example (see incrementVersionObservedFor,
+// recategorize.go, for the aggregating caller).
+func (s *Store) IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, verdict string, n int64) {
+	if versionID == 0 || n <= 0 {
 		return
 	}
 	var attr string
@@ -1248,8 +1287,8 @@ func (s *Store) IncrementVersionObserved(ctx context.Context, promptID, versionI
 		return
 	}
 	if err := s.updateItem(ctx, pkPromptVersion(promptID), padID(versionID),
-		"ADD "+attr+" :one", nil, map[string]types.AttributeValue{":one": nv(1)}); err != nil {
-		slog.Error("increment version observed", "prompt_id", promptID, "version_id", versionID, "verdict", verdict, "err", err)
+		"ADD "+attr+" :n", nil, map[string]types.AttributeValue{":n": nv(n)}); err != nil {
+		slog.Error("increment version observed", "prompt_id", promptID, "version_id", versionID, "verdict", verdict, "n", n, "err", err)
 	}
 }
 
@@ -1286,19 +1325,6 @@ func (s *Store) CountActivePrompts(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return int64(len(all)), nil
-}
-
-func (s *Store) PromptExistsGlobal(ctx context.Context, name string) (int64, error) {
-	all, err := s.listAllPrompts(ctx)
-	if err != nil {
-		return 0, err
-	}
-	for _, p := range all {
-		if p.Name == name && p.AccountID == nil {
-			return 1, nil
-		}
-	}
-	return 0, nil
 }
 
 // ReorderPrompts updates sort_order for each prompt ID in order.
@@ -1374,7 +1400,7 @@ func (s *Store) AddHistory(ctx context.Context, arg AddHistoryParams) error {
 func (s *Store) GetHistoryRow(ctx context.Context, id int64) (CategorizationHistory, error) {
 	// We need to scan to find by ID (no GSI). For this personal-scale app,
 	// query all accounts and find the row. Callers only use this for single rows.
-	accs, err := s.ListAccounts(ctx)
+	accs, err := s.listAccounts(ctx)
 	if err != nil {
 		return CategorizationHistory{}, err
 	}
@@ -1432,7 +1458,7 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 	if f.AccountID != nil {
 		accountIDs = []int64{*f.AccountID}
 	} else {
-		accs, err := s.ListAccounts(ctx)
+		accs, err := s.listAccounts(ctx)
 		if err != nil {
 			return HistoryPage{}, err
 		}
@@ -1466,37 +1492,48 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 	// fetched here, so the overall result can't be "done" even if every fetched item gets
 	// consumed below.
 	moreBeyondFetched := false
+	// One independent Query per account — fanned out rather than run serially, guarded by
+	// mu since all/moreBeyondFetched are shared across the goroutines.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, aid := range accountIDs {
-		vals := map[string]types.AttributeValue{exprPK: sv(pkHistory(aid))}
-		if f.Cursor != "" {
-			vals[":cur"] = sv(f.Cursor)
-		}
-		maps.Copy(vals, filterVals)
-		out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
-			TableName:                 aws.String(s.table),
-			KeyConditionExpression:    aws.String(keyCond),
-			FilterExpression:          filterExpr,
-			ExpressionAttributeValues: vals,
-			ScanIndexForward:          aws.Bool(false),
-			Limit:                     aws.Int32(i32(pageSize)),
-		})
-		if err != nil {
-			continue
-		}
-		if out.LastEvaluatedKey != nil {
-			moreBeyondFetched = true
-		}
-		for _, it := range out.Items {
-			h := itemToHistory(it)
-			// Strip llmResponse for list view (return sentinel if exists)
-			llmR := h.LlmResponse
-			h.LlmResponse = ""
-			if llmR != "" {
-				h.LlmResponse = "1"
+		wg.Go(func() {
+			vals := map[string]types.AttributeValue{exprPK: sv(pkHistory(aid))}
+			if f.Cursor != "" {
+				vals[":cur"] = sv(f.Cursor)
 			}
-			all = append(all, h)
-		}
+			maps.Copy(vals, filterVals)
+			out, err := s.ddb.Query(ctx, &dynamodb.QueryInput{
+				TableName:                 aws.String(s.table),
+				KeyConditionExpression:    aws.String(keyCond),
+				FilterExpression:          filterExpr,
+				ExpressionAttributeValues: vals,
+				ScanIndexForward:          aws.Bool(false),
+				Limit:                     aws.Int32(i32(pageSize)),
+			})
+			if err != nil {
+				return
+			}
+			items := make([]CategorizationHistory, 0, len(out.Items))
+			for _, it := range out.Items {
+				h := itemToHistory(it)
+				// Strip llmResponse for list view (return sentinel if exists)
+				llmR := h.LlmResponse
+				h.LlmResponse = ""
+				if llmR != "" {
+					h.LlmResponse = "1"
+				}
+				items = append(items, h)
+			}
+			mu.Lock()
+			all = append(all, items...)
+			if out.LastEvaluatedKey != nil {
+				moreBeyondFetched = true
+			}
+			mu.Unlock()
+		})
 	}
+	wg.Wait()
 
 	// Merge-sort newest first — same order as the SK each row came from, so walking this
 	// list in order and cutting at any point yields a valid resume cursor.
@@ -1549,7 +1586,7 @@ type TurnaroundSample struct {
 // email. A single email can produce multiple history rows (one per matched rule, all
 // carrying the same LLM latency), so rows are deduped by MessageID.
 func (s *Store) GetTurnaroundSamples(ctx context.Context, since time.Time) ([]TurnaroundSample, error) {
-	accs, err := s.ListAccounts(ctx)
+	accs, err := s.listAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1560,35 +1597,52 @@ func (s *Store) GetTurnaroundSamples(ctx context.Context, since time.Time) ([]Tu
 
 	seen := make(map[string]bool)
 	var samples []TurnaroundSample
+	// One independent Query per account — fanned out rather than run serially, guarded by
+	// mu since seen/samples are shared across the goroutines.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, acc := range accs {
-		items, err := s.queryAll(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				exprPK:   sv(pkHistory(acc.ID)),
-				":since": sv(sinceKey),
-			},
-		})
-		if err != nil {
-			continue
-		}
-		for _, it := range items {
-			dur := getInt64(it, "durationMs")
-			if dur <= 0 {
-				continue
+		wg.Go(func() {
+			// Projected to the three attributes actually read below — a history item also
+			// carries llmResponse (GetHistoryFiltered strips that same field as too large
+			// to ship), so an unprojected read here pulls and discards it for every row in
+			// the window, for every account, on every dashboard render.
+			items, err := s.queryAll(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(s.table),
+				KeyConditionExpression: aws.String("PK = :pk AND SK >= :since"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					exprPK:   sv(pkHistory(acc.ID)),
+					":since": sv(sinceKey),
+				},
+				ProjectionExpression: aws.String("#ts, durationMs, " + attrMessageID),
+				ExpressionAttributeNames: map[string]string{
+					"#ts": "ts",
+				},
+			})
+			if err != nil {
+				return
 			}
-			if msgID := getStr(it, "messageId"); msgID != "" {
-				if seen[msgID] {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, it := range items {
+				dur := getInt64(it, "durationMs")
+				if dur <= 0 {
 					continue
 				}
-				seen[msgID] = true
+				if msgID := getStr(it, "messageId"); msgID != "" {
+					if seen[msgID] {
+						continue
+					}
+					seen[msgID] = true
+				}
+				samples = append(samples, TurnaroundSample{
+					Timestamp:  getStr(it, "ts"),
+					DurationMs: dur,
+				})
 			}
-			samples = append(samples, TurnaroundSample{
-				Timestamp:  getStr(it, "ts"),
-				DurationMs: dur,
-			})
-		}
+		})
 	}
+	wg.Wait()
 	return samples, nil
 }
 
@@ -1609,6 +1663,9 @@ func (s *Store) GetPromptIDsByMessageID(ctx context.Context, accountID int64, me
 			exprPK: sv(pkHistory(accountID)),
 			":mid": sv(messageID),
 		},
+		// Only promptId is read below — this partition's items also carry llmResponse,
+		// which is otherwise pulled and discarded for every row in the message's history.
+		ProjectionExpression: aws.String("promptId"),
 	})
 	if err != nil {
 		return nil, err
@@ -1656,6 +1713,9 @@ func (s *Store) RewriteHistoryForMessage(ctx context.Context, messageID string, 
 			exprPK: sv(pkHistory(base.AccountID)),
 			":mid": sv(messageID),
 		},
+		// Only the key (to build deleteKeys) and promptId (to decide keep/delete) are read
+		// below.
+		ProjectionExpression: aws.String("PK, SK, promptId"),
 	})
 	if err != nil {
 		return err
@@ -1733,6 +1793,11 @@ func (s *Store) GetHistoryStateForMessages(ctx context.Context, accountID int64,
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			exprPK: sv(pkHistory(accountID)),
 		},
+		// Only these five attributes are read below — this reads the whole account
+		// partition (not just the selected messageIDs, which DynamoDB can't filter a Query
+		// by without a FilterExpression scan anyway), so skipping llmResponse and the rest
+		// matters here more than most projections in this file.
+		ProjectionExpression: aws.String("messageId, subject, sender, accountEmail, promptId"),
 	})
 	if err != nil {
 		return nil, err
@@ -1792,6 +1857,9 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			exprPK: sv(pkHistory(accountID)),
 		},
+		// Only the key (deleteKeys), messageId (grouping), and promptId (keep/delete
+		// decision) are read below.
+		ProjectionExpression: aws.String("PK, SK, messageId, promptId"),
 	})
 	if err != nil {
 		return err
@@ -2249,6 +2317,38 @@ func (s *Store) InsertEmailCorrection(ctx context.Context, arg InsertEmailCorrec
 		},
 	})
 	return id, err
+}
+
+// InsertEmailCorrections writes a batch of corrections in one BatchWriteItem pass instead of
+// one nextID (counter UpdateItem) + PutItem round trip per message — for the bulk
+// recategorize path, where the ids are never read back. (Contrast the single-email path's
+// InsertEmailCorrection, which needs its one id to stamp PromptSuggestion.CorrectionID, so it
+// keeps the sequential nextID.) localIDs, not nextIDs: each correction's SK already carries
+// its own timestamp for ordering (same reasoning as InsertPromptExamples), so the id only
+// needs to be unique, not sequential.
+func (s *Store) InsertEmailCorrections(ctx context.Context, args []InsertEmailCorrectionParams) error {
+	if len(args) == 0 {
+		return nil
+	}
+	ids := localIDs(len(args))
+	ts := Now()
+	items := make([]map[string]types.AttributeValue, len(args))
+	for i, arg := range args {
+		id := ids[i]
+		items[i] = map[string]types.AttributeValue{
+			"PK":               sv("CORRECTION#" + arg.MessageID),
+			"SK":               sv(tsKey(ts, id)),
+			"id":               nv(id),
+			attrCreatedAt:      sv(ts),
+			attrAccountID:      nv(arg.AccountID),
+			attrMessageID:      sv(arg.MessageID),
+			"addedPrompts":     sv(arg.AddedPrompts),
+			"removedPrompts":   sv(arg.RemovedPrompts),
+			"currentPromptIds": sv(arg.CurrentPromptIds),
+			"note":             sv(arg.Note),
+		}
+	}
+	return s.batchPut(ctx, items)
 }
 
 // ============================================================
