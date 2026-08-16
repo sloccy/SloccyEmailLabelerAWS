@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 # Deletes SAM deployment artifacts that no live CloudFormation stack references.
 #
-# `sam deploy` uploads a content-hashed copy of each function's zip (~9 MiB x 4) plus
-# the packaged template on every deploy, and never removes the previous set — the
-# bucket grows without bound. Everything here is reproducible from git, so the only
-# copies worth keeping are the ones the deployed stacks still point at: CloudFormation
-# needs them to update or roll back a function, and nothing needs them after that.
+# `sam deploy` uploads a content-hashed copy of each function's zip (~8 MiB, deduped to
+# one object by the Makefile's -trimpath) plus the packaged template on every deploy, and
+# never removes the previous set — the bucket grows without bound. Everything here is
+# reproducible from git, so the only copies worth keeping are the ones the deployed stacks
+# still point at: CloudFormation needs them to update or roll back a function, and nothing
+# needs them after that.
 #
-# Deliberately not a lifecycle rule: an age-based Expiration can't tell a superseded
-# artifact from the one that's currently deployed, so it happily deletes a live zip
-# during any quiet stretch and strands the next failed deploy in UPDATE_ROLLBACK_FAILED.
-# Reachability is the correct criterion, so we compute it.
+# The SAM managed bucket has versioning ENABLED (SAM turns it on when it creates the
+# bucket). That makes the obvious implementation silently useless: list-objects-v2 shows
+# only current versions, and delete-objects without a VersionId writes a delete marker
+# instead of freeing anything. An earlier version of this script did exactly that — it
+# reported "nothing to prune" against a bucket holding 2x its live bytes in noncurrent
+# versions. So everything below works in (Key, VersionId) space, not key space.
+#
+# Content-hashed keys mean a key's contents never change, so any noncurrent version of a
+# referenced key is a byte-identical re-upload from an earlier deploy. Keeping just the
+# current version of each referenced key loses nothing.
+#
+# Deliberately not an age-based lifecycle rule: an Expiration can't tell a superseded
+# artifact from the one that's currently deployed, so it happily deletes a live zip during
+# any quiet stretch and strands the next failed deploy in UPDATE_ROLLBACK_FAILED.
+# Reachability is the correct criterion, so we compute it. (There *is* a
+# NoncurrentVersionExpiration rule on the bucket as a backstop for deploys where this
+# script doesn't run — that one is safe precisely because a version only becomes
+# noncurrent once something newer has replaced it.)
 #
 # Scans every stack in the region, not just this one, so a second SAM app sharing the
 # managed bucket doesn't get its artifacts pruned out from under it.
@@ -54,27 +69,52 @@ if [ -n "$stacks" ] && [ -z "$referenced" ]; then
   exit 1
 fi
 
-all=$(aws s3api list-objects-v2 --bucket "$BUCKET" --region "$REGION" \
-  --query 'Contents[].Key' --output text | tr '\t' '\n' | sed '/^$/d' | sort -u)
+ref_json=$(printf '%s\n' "$referenced" | jq -R -s -c 'split("\n") | map(select(length>0))')
+versions=$(aws s3api list-object-versions --bucket "$BUCKET" --region "$REGION" --output json)
 
-orphans=$(comm -23 <(echo "$all") <(echo "$referenced") || true)
+# Keep exactly one thing per referenced key: its current version. Everything else goes —
+# noncurrent versions of referenced keys (byte-identical re-uploads), every version of an
+# unreferenced key, and every delete marker (including the ones the old key-space
+# implementation left behind).
+keep=$(echo "$versions" | jq -c --argjson ref "$ref_json" \
+  '[ .Versions[]? | . as $v | select($v.IsLatest and (($ref | index($v.Key)) != null)) ]')
+doomed=$(echo "$versions" | jq -c --argjson ref "$ref_json" \
+  '[ ( .Versions[]? | . as $v
+       | select( ($v.IsLatest and (($ref | index($v.Key)) != null)) | not ) ),
+     ( .DeleteMarkers[]? ) ] | map({Key, VersionId})')
 
-if [ -z "$orphans" ]; then
-  echo "nothing to prune ($(echo "$all" | grep -c . ) objects, all referenced)"
+# Every referenced key must survive with a live version. If one doesn't, the bucket and
+# the deployed stacks disagree and deleting anything now would make it worse.
+missing=$(jq -rn --argjson ref "$ref_json" --argjson keep "$keep" \
+  '$ref - ($keep | map(.Key)) | .[]')
+if [ -n "$missing" ]; then
+  echo "refusing to prune: referenced artifact(s) have no current version in $BUCKET:" >&2
+  echo "$missing" | sed 's/^/  /' >&2
+  exit 1
+fi
+
+count=$(echo "$doomed" | jq 'length')
+freed=$(echo "$versions" | jq -r --argjson ref "$ref_json" \
+  '[ .Versions[]? | . as $v
+     | select( ($v.IsLatest and (($ref | index($v.Key)) != null)) | not ) | $v.Size ] | add // 0')
+
+if [ "$count" -eq 0 ]; then
+  echo "nothing to prune ($(echo "$keep" | jq 'length') live object(s), no stale versions)"
   exit 0
 fi
 
-count=$(echo "$orphans" | grep -c .)
 if [ "$DRY_RUN" = "1" ]; then
-  echo "would delete $count orphaned artifact(s) from $BUCKET:"
-  echo "$orphans" | sed 's/^/  /'
+  echo "would delete $count stale version(s)/marker(s) from $BUCKET, freeing $freed bytes:"
+  echo "$doomed" | jq -r '.[] | "  \(.Key) \(.VersionId)"'
   exit 0
 fi
 
-echo "$orphans" | jq -R -s -c '{Objects: (split("\n") | map(select(length>0) | {Key: .}))}' \
-  > /tmp/sam-prune-$$.json
-aws s3api delete-objects --bucket "$BUCKET" --region "$REGION" \
-  --delete "file:///tmp/sam-prune-$$.json" --output text >/dev/null
-rm -f /tmp/sam-prune-$$.json
+# delete-objects caps at 1000 keys per call.
+echo "$doomed" | jq -c '[range(0; length; 1000) as $i | .[$i:$i+1000]] | .[]' | while read -r batch; do
+  echo "$batch" | jq -c '{Objects: ., Quiet: true}' > "/tmp/sam-prune-$$.json"
+  aws s3api delete-objects --bucket "$BUCKET" --region "$REGION" \
+    --delete "file:///tmp/sam-prune-$$.json" --output text >/dev/null
+  rm -f "/tmp/sam-prune-$$.json"
+done
 
-echo "pruned $count orphaned artifact(s) from $BUCKET"
+echo "pruned $count stale version(s)/marker(s) from $BUCKET, freed $freed bytes"
