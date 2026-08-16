@@ -5,24 +5,28 @@ version = 0.1
 
 [default.deploy.parameters]
 stack_name = "ollamail"
-region = "us-east-2"
+region = "us-east-1"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 fail_on_empty_changeset = false
 parameter_overrides = [
-    "CredentialsSsmArn=arn:aws:ssm:us-east-2:508768431323:parameter/ollamail/credentials",
-    # Explicit (not just the template Default) because CloudFormation reuses a stack's
-    # last-deployed parameter value for anything omitted from an update — it was
-    # temporarily "false" during the us-east-1 migration and won't revert on its own.
-    "CreateBudget=true",
+    "CredentialsSsmArn=arn:aws:ssm:us-east-1:508768431323:parameter/ollamail/credentials",
+    # TEMP (us-east-2 -> us-east-1 migration): AWS Budgets is account-global, so the
+    # us-east-2 stack's "ollamail-monthly-5usd" budget blocks this stack from creating
+    # its own. Remove this override (reverting to the template default "true") once the
+    # us-east-2 stack is torn down, then redeploy to (re)create the budget here.
+    "CreateBudget=false",
     # Gmail push. Audience is an arbitrary constant we also set on the Pub/Sub
     # subscription (--push-auth-token-audience); it need not be the Function URL.
     "PubSubTopic=projects/gmail-auto-labeler-487804/topics/gmail-push",
     "PushOidcAudience=ollamail-gmail-push",
     "PushOidcServiceAccount=gmail-push-invoker@gmail-auto-labeler-487804.iam.gserviceaccount.com",
-    # Cloudflare Access in front of the Web UI (CloudFront + OAC fronting the AWS_IAM
-    # Function URL). See README for the Cloudflare-side CNAME + Access app setup.
-    "CfAccessTeamDomain=https://sloccy.cloudflareaccess.com",
-    "CfAccessAud=786e8401f074568d37458301bac91efce8d0e66611d202eb89be2f39fb4a4420",
+    # TEMP (us-east-2 -> us-east-1 migration): the CloudFront alias mailclass.sloccy.com
+    # is account-unique and still held by the us-east-2 stack's distribution, so this
+    # stack can't create its own until that one is torn down. Left empty for now, which
+    # also keeps the Web Function URL on AWS_IAM (fail-closed) during validation.
+    # Restore both and redeploy once us-east-2 is gone:
+    # "CfAccessTeamDomain=https://sloccy.cloudflareaccess.com",
+    # "CfAccessAud=786e8401f074568d37458301bac91efce8d0e66611d202eb89be2f39fb4a4420",
 ]

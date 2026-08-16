@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-REGION="${AWS_REGION:-us-east-2}"
+REGION="${AWS_REGION:-us-east-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 BUCKET=$(aws cloudformation describe-stacks \
