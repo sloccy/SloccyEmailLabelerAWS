@@ -200,7 +200,7 @@ func TestPushVerify(t *testing.T) {
 				h.verifier = newIDTokenVerifier(ctx, testIssuer, certsURL, tt.cfg.PushAudience)
 			}
 
-			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil)
 			if tt.authz != "" {
 				r.Header.Set("Authorization", tt.authz)
 			}
@@ -226,7 +226,7 @@ func TestPushVerify(t *testing.T) {
 // forgets to build one can't leave the public endpoint unguarded.
 func TestPushVerifyNilVerifierFailsClosed(t *testing.T) {
 	h := &pushHandler{cfg: &Config{PushAudience: testAudience, PushServiceAccount: testSA}}
-	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil)
 	r.Header.Set("Authorization", "Bearer whatever")
 
 	err := h.verify(context.Background(), r)

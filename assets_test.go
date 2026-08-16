@@ -23,7 +23,7 @@ func newStaticTestServer(t *testing.T) *server {
 
 func getStatic(t *testing.T, s *server, path, acceptEncoding string) *http.Response {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodGet, path, nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 	if acceptEncoding != "" {
 		r.Header.Set("Accept-Encoding", acceptEncoding)
 	}
