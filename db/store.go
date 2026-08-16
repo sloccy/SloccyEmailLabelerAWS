@@ -1479,6 +1479,74 @@ func (s *Store) GetHistoryLlmResponse(ctx context.Context, id int64) (string, er
 type HistoryPage struct {
 	Rows       []CategorizationHistory
 	NextCursor string
+
+	// Scanned is how many rows this page actually read out of DynamoDB, before any
+	// FilterExpression or Go-side text filter narrowed them down — i.e. the work done, not
+	// the work that paid off. The History UI budgets its infinite scroll against this rather
+	// than len(Rows): a sparse search matches almost nothing per page, so a matched-row
+	// budget barely advances and the walk runs unbounded, while a scanned-row budget always
+	// advances and caps the reads a single search session can issue.
+	Scanned int64
+}
+
+// historyMergeCut walks a merged, newest-first batch of history rows and cuts it into one
+// page plus the cursor to resume from. It exists as a standalone function because
+// Store.GetHistoryFiltered and FakeStore.GetHistoryFiltered have to agree on this exactly —
+// the cursor contract (no gaps, no repeats) is the whole correctness property the History
+// tab's infinite scroll rests on, and it used to be duplicated prose-for-prose in both.
+//
+// floorSK is the newest SK at which any account's Query was cut short by its Limit. It is
+// the depth past which the merged view is no longer complete: if account A read down to SK
+// 500 and account B down to SK 100, then rows between 100 and 500 exist for A but were never
+// fetched, so consuming B's rows below 500 would strip them out of the walk while advancing
+// the cursor past them — they could never be reached again. Stopping at the floor instead
+// costs only a re-read of rows this page fetched but didn't emit, which the next page
+// re-examines under the same filters and emits then.
+//
+// Every row examined advances lastConsumedSK, matched or not, so a filter that matches
+// nothing still moves the cursor forward instead of looping on the same rows forever.
+func historyMergeCut(all []CategorizationHistory, f HistoryFilter, pageSize int64, floorSK string) ([]CategorizationHistory, string) {
+	var rows []CategorizationHistory
+	lastConsumedSK := ""
+	stoppedEarly := false
+	for i, h := range all {
+		sk := tsKey(h.Timestamp, h.ID)
+		if floorSK != "" && sk < floorSK {
+			stoppedEarly = true
+			break
+		}
+		lastConsumedSK = sk
+		if f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)) {
+			continue
+		}
+		if f.SenderQ != "" && !strings.Contains(strings.ToLower(h.Sender), strings.ToLower(f.SenderQ)) {
+			continue
+		}
+		rows = append(rows, h)
+		if int64(len(rows)) >= pageSize {
+			stoppedEarly = i < len(all)-1
+			break
+		}
+	}
+
+	switch {
+	case stoppedEarly:
+		// More of `all` is still unexamined; resume from where the walk stopped.
+		return rows, lastConsumedSK
+	case lastConsumedSK == "":
+		// Nothing was examined at all — either there was no data below the cursor, or a
+		// DynamoDB-side FilterExpression dropped every fetched item before the merge. In the
+		// latter case floorSK is the only evidence that unread rows remain, and returning ""
+		// here would end pagination with data still below the cursor.
+		return rows, floorSK
+	case floorSK != "":
+		// All of `all` was consumed but some account's Query was truncated, so unread rows
+		// remain below. Every unread row is below floorSK, which is at or below
+		// lastConsumedSK, so resuming from the tighter lastConsumedSK skips nothing.
+		return rows, lastConsumedSK
+	default:
+		return rows, ""
+	}
 }
 
 // GetHistoryFiltered returns one page (f.Limit rows, or the codebase default of 50 if
@@ -1528,13 +1596,16 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 	}
 
 	var all []CategorizationHistory
-	// moreBeyondFetched is true if any account's Query was cut off by Limit rather than
-	// running out of items — i.e. that account's partition has more data past what was
-	// fetched here, so the overall result can't be "done" even if every fetched item gets
-	// consumed below.
-	moreBeyondFetched := false
+	// scanned counts every item DynamoDB read for this page, filtered out or not — see
+	// HistoryPage.Scanned.
+	var scanned int64
+	// floorSK is the newest SK at which any account's Query was cut off by Limit rather than
+	// running out of items. Non-empty means at least one partition has unread data past what
+	// was fetched here, and it doubles as the depth past which the merge is incomplete — see
+	// historyMergeCut, which both facts are handed to.
+	floorSK := ""
 	// One independent Query per account — fanned out rather than run serially, guarded by
-	// mu since all/moreBeyondFetched are shared across the goroutines.
+	// mu since all/scanned/floorSK are shared across the goroutines.
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, aid := range accountIDs {
@@ -1566,10 +1637,18 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 				}
 				items = append(items, h)
 			}
+			// LastEvaluatedKey is set exactly when the Query stopped on Limit (or a 1MB
+			// page) with items still below it; its SK is the last row this account
+			// actually read.
+			lastSK := ""
+			if sk, ok := out.LastEvaluatedKey["SK"].(*types.AttributeValueMemberS); ok {
+				lastSK = sk.Value
+			}
 			mu.Lock()
 			all = append(all, items...)
-			if out.LastEvaluatedKey != nil {
-				moreBeyondFetched = true
+			scanned += int64(out.ScannedCount)
+			if lastSK > floorSK {
+				floorSK = lastSK
 			}
 			mu.Unlock()
 		})
@@ -1585,35 +1664,10 @@ func (s *Store) GetHistoryFiltered(ctx context.Context, f HistoryFilter) (Histor
 		return all[i].ID > all[j].ID
 	})
 
-	// Walk the merge, applying the Go-only text filters, until pageSize matches or the
-	// merged list runs out. The cursor tracks the last item *examined* here (matched or
-	// not) — not the last matched row — so a resumed page picks up exactly where this one
-	// left off instead of skipping or repeating unexamined rows.
-	var filtered []CategorizationHistory
-	lastConsumedSK := ""
-	consumedAll := true
-	for i, h := range all {
-		if f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)) {
-			lastConsumedSK = tsKey(h.Timestamp, h.ID)
-			continue
-		}
-		if f.SenderQ != "" && !strings.Contains(strings.ToLower(h.Sender), strings.ToLower(f.SenderQ)) {
-			lastConsumedSK = tsKey(h.Timestamp, h.ID)
-			continue
-		}
-		filtered = append(filtered, h)
-		lastConsumedSK = tsKey(h.Timestamp, h.ID)
-		if int64(len(filtered)) >= pageSize {
-			consumedAll = i == len(all)-1
-			break
-		}
-	}
-
-	nextCursor := ""
-	if !consumedAll || moreBeyondFetched {
-		nextCursor = lastConsumedSK
-	}
-	return HistoryPage{Rows: filtered, NextCursor: nextCursor}, nil
+	// Walk the merge, applying the Go-only text filters — shared with FakeStore so the two
+	// can't drift on the cursor contract.
+	filtered, nextCursor := historyMergeCut(all, f, pageSize, floorSK)
+	return HistoryPage{Rows: filtered, NextCursor: nextCursor, Scanned: scanned}, nil
 }
 
 // TurnaroundSample is one LLM latency data point (one per processed email) used to build
