@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -107,18 +110,26 @@ func TestFmtdateStacked(t *testing.T) {
 	ts := time.Date(2024, 6, 1, 14, 5, 0, 0, time.UTC).In(loc)
 	input := ts.Format(tsLayout)
 
-	got := fmtdateStacked(input)
-	s := string(got)
-	if !strings.Contains(s, "<br>") {
-		t.Errorf("fmtdateStacked should contain <br>, got %q", s)
+	// parseTS reads the layout as UTC and converts to local, so compare against what it
+	// actually yields rather than against ts — the point here is the split, not the zone.
+	want, ok := parseTS(input)
+	if !ok {
+		t.Fatalf("parseTS(%q) failed", input)
 	}
-	if !strings.Contains(s, "text-muted") {
-		t.Errorf("fmtdateStacked should contain text-muted span, got %q", s)
+	got := fmtdateStacked(input)
+	if !got.OK {
+		t.Fatalf("fmtdateStacked(%q).OK = false, want true", input)
+	}
+	if got.Date != want.Format("2 Jan") {
+		t.Errorf("Date = %q, want %q", got.Date, want.Format("2 Jan"))
+	}
+	if got.Time != want.Format("15:04") {
+		t.Errorf("Time = %q, want %q", got.Time, want.Format("15:04"))
 	}
 
-	t.Run("invalid returns --", func(t *testing.T) {
-		if got := fmtdateStacked(""); got != template.HTML("--") {
-			t.Errorf("fmtdateStacked('') = %q, want '--'", got)
+	t.Run("invalid input is not OK", func(t *testing.T) {
+		if got := fmtdateStacked(""); got.OK {
+			t.Errorf("fmtdateStacked(\"\").OK = true, want false")
 		}
 	})
 }
@@ -257,5 +268,43 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 				t.Errorf("execute: %v", err)
 			}
 		})
+	}
+}
+
+// safeHTMLCallRe matches a safeHTML invocation and captures the first character of its
+// argument, which is enough to tell a template-file literal from anything evaluated.
+var safeHTMLCallRe = regexp.MustCompile(`\(safeHTML\s+(\S)`)
+
+// safeHTML hands a string to html/template as pre-trusted markup, bypassing escaping. It
+// is only sound while every call passes markup written literally in a template file: the
+// moment one passes a value assembled at runtime, whatever produced that value becomes an
+// XSS sink. That invariant lived in a comment; this test makes it fail the build instead.
+func TestSafeHTMLIsOnlyCalledWithLiterals(t *testing.T) {
+	var bad []string
+	err := fs.WalkDir(templateFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		b, readErr := templateFS.ReadFile(p)
+		if readErr != nil {
+			return readErr
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			for _, m := range safeHTMLCallRe.FindAllStringSubmatch(line, -1) {
+				if c := m[1]; c != "`" && c != `"` {
+					bad = append(bad, fmt.Sprintf("%s:%d: safeHTML applied to a non-literal", p, i+1))
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk templates: %v", err)
+	}
+	if len(bad) > 0 {
+		t.Errorf("safeHTML must only wrap literal markup:\n  %s", strings.Join(bad, "\n  "))
 	}
 }

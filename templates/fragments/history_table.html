@@ -5,7 +5,7 @@
       <input type="checkbox" class="form-check-input hist-select" data-aid="{{.AccountID}}" data-mid="{{.MessageID}}" aria-label="Select this email">
       {{end}}
     </td>
-    <td class="col-time">{{fmtdateStacked .Timestamp}}</td>
+    <td class="col-time">{{$d := fmtdateStacked .Timestamp}}{{if $d.OK}}{{$d.Date}}<br><span class="text-muted">{{$d.Time}}</span>{{else}}--{{end}}</td>
     <td class="col-account d-none d-md-table-cell" title="{{.AccountEmail}}">{{.AccountEmail}}</td>
     <td class="col-subject">{{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}</td>
     <td class="col-sender text-muted" title="{{.Sender}}">{{if .Sender}}{{.Sender}}{{else}}&mdash;{{end}}</td>
