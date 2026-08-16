@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -11,6 +12,12 @@ import (
 	"strings"
 	"testing"
 )
+
+// static/vendor is gitignored and materialized by scripts/vendor.sh, so it is present in
+// a deploy (sam build runs the Makefile) and in CI (the workflow vendors first) but not
+// necessarily in a bare checkout. These tests therefore derive what they expect from the
+// embedded FS rather than naming vendored files, so they assert the same invariants in
+// both cases instead of failing on an environment difference.
 
 // newStaticTestServer builds a server with only the routes registered, which is all the
 // /static/ handler needs — it reads from the embedded FS, not from the store or LLM.
@@ -32,23 +39,29 @@ func getStatic(t *testing.T, s *server, path, acceptEncoding string) *http.Respo
 	return w.Result()
 }
 
+// staticFile is an asset guaranteed to exist in every checkout, for the tests that just
+// need some asset to exercise the handler with.
+const staticFile = "app.js"
+
 func TestAssetURLIsContentAddressed(t *testing.T) {
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		t.Fatalf("sub: %v", err)
 	}
+	hashes := assetHashes()
+	if len(hashes) == 0 {
+		t.Fatal("no asset hashes built")
+	}
 
-	for _, name := range []string{"app.js", "style.css", "vendor/htmx.min.js"} {
+	for name := range hashes {
 		t.Run(name, func(t *testing.T) {
-			got := assetURL(name)
-
 			data, err := fs.ReadFile(sub, name)
 			if err != nil {
 				t.Fatalf("read %s: %v", name, err)
 			}
 			sum := sha256.Sum256(data)
 			want := "/static/" + hex.EncodeToString(sum[:])[:assetHashLen] + "/" + name
-			if got != want {
+			if got := assetURL(name); got != want {
 				t.Errorf("assetURL(%q) = %q, want %q", name, got, want)
 			}
 		})
@@ -70,9 +83,7 @@ func TestAssetHashesDifferPerFile(t *testing.T) {
 			t.Errorf("%s and %s share hash %q — distinct content must not collide", prev, path, h)
 		}
 		seen[h] = path
-	}
-	// .gz variants ride on their sibling's URL and must not get their own entry.
-	for path := range hashes {
+		// .gz variants ride on their sibling's URL and must not get their own entry.
 		if strings.HasSuffix(path, ".gz") {
 			t.Errorf("%s: pre-compressed variant should not be hashed separately", path)
 		}
@@ -86,12 +97,11 @@ func TestAssetURLUnknownPathFallsBack(t *testing.T) {
 }
 
 func TestIsAssetHash(t *testing.T) {
-	valid := strings.Repeat("a", assetHashLen)
 	for _, tc := range []struct {
 		in   string
 		want bool
 	}{
-		{valid, true},
+		{strings.Repeat("a", assetHashLen), true},
 		{"0123456789ab", true},
 		{"", false},
 		{"vendor", false},
@@ -110,7 +120,7 @@ func TestIsAssetHash(t *testing.T) {
 func TestStaticHashedURLIsImmutable(t *testing.T) {
 	s := newStaticTestServer(t)
 
-	resp := getStatic(t, s, assetURL("app.js"), "")
+	resp := getStatic(t, s, assetURL(staticFile), "")
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -120,7 +130,7 @@ func TestStaticHashedURLIsImmutable(t *testing.T) {
 		t.Errorf("Cache-Control = %q, want %q", got, assetImmutableCacheControl)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	want, _ := fs.ReadFile(staticFS, "static/app.js")
+	want, _ := fs.ReadFile(staticFS, "static/"+staticFile)
 	if string(body) != string(want) {
 		t.Errorf("body length %d, want %d", len(body), len(want))
 	}
@@ -129,7 +139,7 @@ func TestStaticHashedURLIsImmutable(t *testing.T) {
 func TestStaticUnhashedURLStaysUncached(t *testing.T) {
 	s := newStaticTestServer(t)
 
-	resp := getStatic(t, s, "/static/app.js", "")
+	resp := getStatic(t, s, "/static/"+staticFile, "")
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -144,7 +154,7 @@ func TestStaticUnhashedURLStaysUncached(t *testing.T) {
 // current bytes rather than a 404, and must not be told they're immutable.
 func TestStaticStaleHashServesCurrentBytesUncached(t *testing.T) {
 	s := newStaticTestServer(t)
-	stale := "/static/" + strings.Repeat("0", assetHashLen) + "/app.js"
+	stale := "/static/" + strings.Repeat("0", assetHashLen) + "/" + staticFile
 
 	resp := getStatic(t, s, stale, "")
 	defer func() { _ = resp.Body.Close() }()
@@ -156,19 +166,29 @@ func TestStaticStaleHashServesCurrentBytesUncached(t *testing.T) {
 		t.Errorf("Cache-Control = %q, want no-store for a stale hash", got)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	want, _ := fs.ReadFile(staticFS, "static/app.js")
+	want, _ := fs.ReadFile(staticFS, "static/"+staticFile)
 	if string(body) != string(want) {
 		t.Error("stale-hash request did not serve the current file")
 	}
 }
 
-// The pre-gzipped sibling must still be picked, and still be cacheable, through a
-// hashed URL — Vary is what keeps the edge from serving it to a client that can't
-// decode it.
+// The pre-gzipped sibling must still be picked, and still be cacheable, through a hashed
+// URL — Vary is what keeps the edge from serving it to a client that can't decode it.
+// Only vendored assets are pre-gzipped, so this is skipped when they aren't materialized.
 func TestStaticHashedURLServesGzipVariant(t *testing.T) {
-	s := newStaticTestServer(t)
+	var name string
+	for p := range assetHashes() {
+		if _, err := fs.Stat(staticFS, "static/"+p+".gz"); err == nil {
+			name = p
+			break
+		}
+	}
+	if name == "" {
+		t.Skip("no pre-gzipped assets embedded (run scripts/vendor.sh)")
+	}
 
-	resp := getStatic(t, s, assetURL("vendor/htmx.min.js"), "gzip")
+	s := newStaticTestServer(t)
+	resp := getStatic(t, s, assetURL(name), "gzip")
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -193,7 +213,7 @@ func TestStaticHashedURLServesGzipVariant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gunzip: %v", err)
 	}
-	want, _ := fs.ReadFile(staticFS, "static/vendor/htmx.min.js")
+	want, _ := fs.ReadFile(staticFS, "static/"+name)
 	if string(got) != string(want) {
 		t.Error("decompressed gzip variant does not match the plain file")
 	}
@@ -212,56 +232,51 @@ func TestStaticHashedURLUnknownFileIsNotFound(t *testing.T) {
 	}
 }
 
-// The whole scheme only pays off if the rendered page actually emits hashed URLs — an
-// unhashed /static/ reference left in a template is a silently uncacheable asset.
-func TestIndexRendersOnlyHashedAssetURLs(t *testing.T) {
-	tmpl, err := loadTemplates()
+// The scheme only pays off if templates actually go through {{asset}}. Checking the
+// template source rather than rendered output makes this independent of whether the
+// vendored files happen to be materialized: a literal "/static/… in a template is a
+// missed helper call either way, and would silently ship an uncacheable asset.
+func TestTemplatesReferenceAssetsThroughHelper(t *testing.T) {
+	var bad []string
+	err := fs.WalkDir(templateFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		b, readErr := templateFS.ReadFile(p)
+		if readErr != nil {
+			return readErr
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if strings.Contains(line, `"/static/`) {
+				bad = append(bad, fmt.Sprintf("%s:%d", p, i+1))
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("loadTemplates: %v", err)
+		t.Fatalf("walk templates: %v", err)
 	}
-	var sb strings.Builder
-	// index.html is rendered with nil data in registerRoutes.
-	if err := tmpl.ExecuteTemplate(&sb, "index.html", nil); err != nil {
-		t.Fatalf("ExecuteTemplate: %v", err)
-	}
-	html := sb.String()
-
-	for name, hash := range assetHashes() {
-		want := "/static/" + hash + "/" + name
-		if !strings.Contains(html, want) {
-			continue // not every asset has to be referenced by index.html
-		}
-		// If it is referenced, the unhashed form must not also appear.
-		if strings.Contains(html, `"/static/`+name+`"`) {
-			t.Errorf("%s appears both hashed and unhashed", name)
-		}
-	}
-
-	// Any remaining /static/ occurrence must carry a hash segment.
-	for rest := html; ; {
-		i := strings.Index(rest, "/static/")
-		if i < 0 {
-			break
-		}
-		rest = rest[i+len("/static/"):]
-		seg, _, _ := strings.Cut(rest, "/")
-		if !isAssetHash(seg) {
-			t.Errorf("unhashed static reference: /static/%s...", seg)
-		}
+	if len(bad) > 0 {
+		t.Errorf("templates must link assets via {{asset \"…\"}}, found literal /static/ at:\n  %s",
+			strings.Join(bad, "\n  "))
 	}
 }
 
-// Every asset the templates link must resolve, or a deploy ships a broken page.
-func TestTemplateAssetsAllResolve(t *testing.T) {
+// Every embedded asset must resolve through its hashed URL and be cacheable.
+func TestEmbeddedAssetsAllResolveHashed(t *testing.T) {
 	s := newStaticTestServer(t)
+	hashes := assetHashes()
+	if len(hashes) == 0 {
+		t.Fatal("no asset hashes built")
+	}
 
-	for _, name := range []string{
-		"favicon.png", "logo.webp", "style.css", "app.js",
-		"vendor/bootstrap.min.css", "vendor/bootstrap.bundle.min.js", "vendor/htmx.min.js",
-	} {
+	for name := range hashes {
 		t.Run(name, func(t *testing.T) {
 			url := assetURL(name)
-			if !strings.HasPrefix(url, "/static/") || url == "/static/"+name {
+			if url == "/static/"+name {
 				t.Fatalf("assetURL(%q) = %q, want a hashed URL", name, url)
 			}
 			resp := getStatic(t, s, url, "")

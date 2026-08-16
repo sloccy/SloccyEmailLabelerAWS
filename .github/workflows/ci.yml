@@ -19,6 +19,12 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      # static/vendor is gitignored and fetched at build time (the Makefile does this via
+      # sam build on deploy). Without it the binary embeds an incomplete asset set, so do
+      # it here too and test what actually ships.
+      - name: Vendor front-end deps
+        run: ./scripts/vendor.sh
+
       - name: Build
         run: go build ./...
 
