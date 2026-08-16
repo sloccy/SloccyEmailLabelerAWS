@@ -24,10 +24,13 @@ func tmplFuncs() template.FuncMap {
 	}
 }
 
-// safeHTML marks a string as pre-trusted HTML so html/template passes it through instead of
-// escaping it — used to hand a literal icon <svg> into the "empty_state" partial via dict,
-// same reasoning as fmtdateStacked's template.HTML return above. Only ever called with
-// hardcoded markup from these template files, never with request/user-controlled input.
+// safeHTML marks a string as pre-trusted HTML so html/template passes it through instead
+// of escaping it — used to hand a literal icon <svg> into the "empty_state" partial via
+// dict, which Go templates cannot do by name since {{template}} needs a literal.
+//
+// It is only sound while every call passes markup written literally in a template file;
+// a value assembled at runtime would make its producer an XSS sink. That is enforced by
+// TestSafeHTMLIsOnlyCalledWithLiterals rather than left to this comment.
 func safeHTML(s string) template.HTML {
 	return template.HTML(s) //nolint:gosec // G203: trusted, hardcoded template markup only
 }
@@ -64,14 +67,22 @@ func fmtdate(ts string) string {
 	return t.Format("2 Jan, 15:04")
 }
 
-func fmtdateStacked(ts string) template.HTML {
+// stackedDate is the two-line form of a timestamp, returned as data rather than as
+// pre-built markup so the template emits the <br>/<span> and html/template escapes the
+// values. Building the HTML here meant handing back a template.HTML that bypassed
+// escaping — safe for a formatted time, but a trust boundary with no reason to exist.
+type stackedDate struct {
+	Date string
+	Time string
+	OK   bool
+}
+
+func fmtdateStacked(ts string) stackedDate {
 	t, ok := parseTS(ts)
 	if !ok {
-		return template.HTML("--")
+		return stackedDate{}
 	}
-	date := t.Format("2 Jan")
-	timeStr := t.Format("15:04")
-	return template.HTML(date + `<br><span class="text-muted">` + timeStr + `</span>`) //nolint:gosec // G203: formatted from parsed time, no user input
+	return stackedDate{Date: t.Format("2 Jan"), Time: t.Format("15:04"), OK: true}
 }
 
 func fmtretention(days int64) string {

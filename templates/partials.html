@@ -72,7 +72,9 @@
 <div class="d-flex align-items-center justify-content-between py-2 border-bottom">
   <div>
     <span class="badge border border-primary text-primary font-monospace">{{.LabelName}}</span>
-    <span class="small text-muted ms-2">{{.Detail}}</span>
+    {{/* Detail is plain text; Emphasis, when set, is the one value rendered in bold.
+         Both go through normal escaping — callers must not pass pre-built markup. */}}
+    <span class="small text-muted ms-2">{{.Detail}}{{with .Emphasis}}<strong>{{.}}</strong>{{end}}</span>
   </div>
   <button class="btn btn-outline-danger btn-sm"
     hx-delete="{{.DeletePath}}"
