@@ -137,7 +137,7 @@ func TestFetchEmail(t *testing.T) {
 			name: "returns email field",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`{"email":"user@example.com","id":"12345"}`)) //nolint:errcheck,gosec
+				_, _ = w.Write([]byte(`{"email":"user@example.com","id":"12345"}`))
 			},
 			wantEmail: "user@example.com",
 		},
@@ -145,7 +145,7 @@ func TestFetchEmail(t *testing.T) {
 			name: "email field missing — returns empty string",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`{"id":"12345"}`)) //nolint:errcheck,gosec
+				_, _ = w.Write([]byte(`{"id":"12345"}`))
 			},
 			wantEmail: "",
 		},
@@ -153,7 +153,7 @@ func TestFetchEmail(t *testing.T) {
 			name: "non-JSON body returns decode error",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`not json`)) //nolint:errcheck,gosec
+				_, _ = w.Write([]byte(`not json`))
 			},
 			wantErr: true,
 		},

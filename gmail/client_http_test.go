@@ -20,9 +20,14 @@ func newTestClient(t *testing.T, srv *httptest.Server) *Client {
 	return &Client{http: &http.Client{}}
 }
 
+// writeJSON is used from test HTTP handlers, where the *testing.T is not in scope. A
+// marshal failure means the fixture itself is wrong, so fail loudly rather than serving
+// a truncated body and letting the assertion fail somewhere less obvious.
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v) //nolint:errchkjson
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		panic("writeJSON: " + err.Error())
+	}
 }
 
 // ============================================================

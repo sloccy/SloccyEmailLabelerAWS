@@ -45,7 +45,7 @@ func TestCleanup_NoRules(t *testing.T) {
 	})
 	// Paginate handler: return empty results.
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}, "nextPageToken": ""}) //nolint:errcheck,gosec
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}, "nextPageToken": ""})
 	})
 
 	svc := gmailServer(t, mux)
@@ -78,11 +78,11 @@ func TestCleanup_LabelRule_TrashesOldMessages(t *testing.T) {
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
 		// Return 2 old message IDs on first call; empty on subsequent calls.
 		if trashCalled.Load() == 0 {
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"messages": []map[string]string{{"id": "old1"}, {"id": "old2"}},
 			})
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}})
 		}
 	})
 	mux.HandleFunc("/messages/batchModify", func(w http.ResponseWriter, _ *http.Request) {
@@ -107,17 +107,21 @@ func TestCleanup_ExemptLabel_Skipped(t *testing.T) {
 	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "c@test.com"})
 
 	// Add a retention rule AND an exemption for the same label.
-	store.AddLabelRetention(t.Context(), db.AddLabelRetentionParams{ //nolint:errcheck,gosec
+	if err := store.AddLabelRetention(t.Context(), db.AddLabelRetentionParams{
 		AccountID: accID, LabelName: "newsletters", Days: 7,
-	})
-	store.AddLabelExemption(t.Context(), db.AddLabelExemptionParams{ //nolint:errcheck,gosec
+	}); err != nil {
+		t.Fatalf("AddLabelRetention: %v", err)
+	}
+	if err := store.AddLabelExemption(t.Context(), db.AddLabelExemptionParams{
 		AccountID: accID, LabelName: "newsletters",
-	})
+	}); err != nil {
+		t.Fatalf("AddLabelExemption: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("/messages should not be called for exempt label — cleanup should skip it")
-		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}})
 	})
 	mux.HandleFunc("/messages/batchModify", func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("batchModify should not be called for exempt label")
@@ -138,20 +142,22 @@ func TestCleanup_GlobalRetention(t *testing.T) {
 	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "d@test.com"})
 
 	// Set a global retention of 60 days.
-	store.SetGlobalRetention(t.Context(), db.SetGlobalRetentionParams{ //nolint:errcheck,gosec
+	if err := store.SetGlobalRetention(t.Context(), db.SetGlobalRetentionParams{
 		AccountID:  accID,
 		GlobalDays: sql.NullInt64{Int64: 60, Valid: true},
-	})
+	}); err != nil {
+		t.Fatalf("SetGlobalRetention: %v", err)
+	}
 
 	var trashCalled atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
 		if trashCalled.Load() == 0 {
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"messages": []map[string]string{{"id": "global1"}},
 			})
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}})
 		}
 	})
 	mux.HandleFunc("/messages/batchModify", func(w http.ResponseWriter, _ *http.Request) {
@@ -211,7 +217,7 @@ func TestCleanupPropagatesGlobalRetentionLookupFailure(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}})
 	})
 	svc := gmailServer(t, mux)
 
@@ -232,7 +238,7 @@ func TestCleanupTreatsMissingGlobalRuleAsSuccess(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{}})
 	})
 	svc := gmailServer(t, mux)
 

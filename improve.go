@@ -922,13 +922,20 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	bestConv := convs[bestIdx]
 	bestReplay := replays[bestIdx]
 
-	convJSON, _ := json.Marshal(bestConv) //nolint:errchkjson // []llm.ChatMessage cannot fail
+	convJSON, convErr := json.Marshal(bestConv)
 	// Recorded on every generate/regenerate round, so applying whichever round's
 	// suggestion the user actually accepts marks the examples that shaped *that* version —
 	// not stale keys from an earlier round if the corpus shifted in between (see this
 	// function's doc comment).
-	problemKeysJSON, _ := json.Marshal(problemExampleKeys(examples)) //nolint:errchkjson // []db.ResolvedExampleKey cannot fail
-	roundsJSON, _ := json.Marshal(rounds)                            //nolint:errchkjson // []db.SuggestionRoundSummary cannot fail
+	problemKeysJSON, keysErr := json.Marshal(problemExampleKeys(examples))
+	roundsJSON, roundsErr := json.Marshal(rounds)
+	// These are concrete slices of plain structs, so a failure means one of those types
+	// grew a field JSON can't encode. Bail rather than finalize the suggestion with a
+	// field silently empty, which would surface much later as a corrupt row.
+	if err := errors.Join(convErr, keysErr, roundsErr); err != nil {
+		slog.Error("marshal suggestion fields", "suggestion_id", sid, "err", err)
+		return
+	}
 	finalize := db.FinalizePromptSuggestionParams{
 		ID:                    sid,
 		SuggestedInstructions: bestSuggested,
@@ -941,7 +948,11 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		BestRound:             int64(bestN),
 	}
 	if replayOn {
-		failuresJSON, _ := json.Marshal(bestReplay.Failures) //nolint:errchkjson // []llm.ReplayFailure cannot fail
+		failuresJSON, failuresErr := json.Marshal(bestReplay.Failures)
+		if failuresErr != nil {
+			slog.Error("marshal replay failures", "suggestion_id", sid, "err", failuresErr)
+			return
+		}
 		finalize.ReplayModel = bestReplay.Model
 		finalize.ReplayTotal = int64(bestReplay.Total)
 		finalize.ReplayPassed = int64(bestReplay.Passed)
