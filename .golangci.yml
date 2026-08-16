@@ -67,13 +67,25 @@ linters:
           disabled: true
         - name: package-comments
           disabled: true
-    goconst:
-      ignore-tests: true
     gosec:
       excludes:
         - G120 # request body size limited globally via MaxBytesReader middleware
+    nolintlint:
+      # Every suppression must name the rule it silences and say why, so a reader can tell
+      # a considered exemption from a shrug — and so a directive that outlives the finding
+      # it was written for is obvious rather than inherited.
+      require-specific: true
+      require-explanation: true
     staticcheck:
       checks: ["all", "-QF1008", "-ST1000"]
+  exclusions:
+    rules:
+      # Test fixtures repeat literals on purpose: a shared constant for "pending" or a
+      # sample prompt would couple unrelated cases and hide what each one is asserting.
+      # (This was goconst's own ignore-tests until golangci-lint v2.11 dropped the key.)
+      - path: '_test\.go'
+        linters:
+          - goconst
 
 formatters:
   enable:
