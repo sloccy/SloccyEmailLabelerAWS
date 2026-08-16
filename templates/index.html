@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OllaMail</title>
-  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="icon" type="image/png" href="{{asset "favicon.png"}}">
   <!-- Vendored third-party assets — versions pinned in package.json (Dependabot-managed),
        fetched into static/vendor/ at build time by scripts/vendor.sh. No runtime CDN. -->
-  <link href="/static/vendor/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/vendor/bootstrap.bundle.min.js" defer></script>
-  <script src="/static/vendor/htmx.min.js" defer></script>
+  <link href="{{asset "vendor/bootstrap.min.css"}}" rel="stylesheet">
+  <link rel="stylesheet" href="{{asset "style.css"}}">
+  <script src="{{asset "vendor/bootstrap.bundle.min.js"}}" defer></script>
+  <script src="{{asset "vendor/htmx.min.js"}}" defer></script>
 </head>
 <body>
 <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>
@@ -18,7 +18,7 @@
 <div class="layout">
   <aside class="sidebar">
     <div class="sidebar-logo border-bottom mb-3 pb-3">
-      <img src="/static/logo.webp" alt="OllaMail">
+      <img src="{{asset "logo.webp"}}" alt="OllaMail">
     </div>
     <nav class="flex-grow-1">
       <ul class="nav-menu">
@@ -401,6 +401,6 @@
   </div>
 </div>
 
-<script src="/static/app.js" defer></script>
+<script src="{{asset "app.js"}}" defer></script>
 </body>
 </html>
