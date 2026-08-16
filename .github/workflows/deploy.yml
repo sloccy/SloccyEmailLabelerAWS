@@ -57,3 +57,8 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset
+
+      # Drops the artifacts the deploy just superseded. Runs only on success, so a
+      # failed deploy leaves the previous set intact for CloudFormation to roll back to.
+      - name: Prune superseded deploy artifacts
+        run: ./scripts/prune-sam-bucket.sh
