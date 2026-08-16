@@ -647,7 +647,7 @@ func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Reques
 	ctx := r.Context()
 	counts, err := s.store.CountExamplesByVerdict(ctx, id)
 	if err != nil {
-		slog.Error("count prompt examples", "prompt_id", id, "err", err)
+		slog.Error("count prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: the only request-derived value here is id, an int64 from pathInt — it cannot carry the newline a forged log line would need
 	}
 	var total int64
 	for _, n := range counts {
@@ -685,7 +685,7 @@ func (s *server) handlePromptExamples(w http.ResponseWriter, r *http.Request) {
 	for _, v := range db.VerdictOrder {
 		examples, err := s.store.ListExamplesByVerdict(ctx, id, v, promptExamplesPerVerdict+1)
 		if err != nil {
-			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err)
+			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err) //nolint:gosec // G706: id is an int64 from pathInt and v is a db.VerdictOrder constant — neither is attacker-controlled text
 			continue
 		}
 		if len(examples) == 0 {
@@ -710,7 +710,7 @@ func (s *server) handleClearPromptExamples(w http.ResponseWriter, r *http.Reques
 	id := pathInt(r, "id")
 	ctx := r.Context()
 	if err := s.store.DeleteExamplesForPrompt(ctx, id); err != nil {
-		slog.Error("clear prompt examples", "prompt_id", id, "err", err)
+		slog.Error("clear prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: the only request-derived value here is id, an int64 from pathInt — it cannot carry the newline a forged log line would need
 	}
 	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: 0}, "Examples cleared")
 }

@@ -25,11 +25,14 @@ func NewTestClient() *Client {
 		TokenType:    "Bearer",
 		Expiry:       time.Now().Add(time.Hour),
 	}
-	credJSON, _ := json.Marshal(fakeToken) //nolint:gosec,errchkjson
+	//nolint:gosec,errchkjson // G117: fakeToken's "secret" fields are the fixed dummy strings above, not real
+	// credentials; errchkjson: the only fallible field is the time.Time expiry, and a literal
+	// time.Now() cannot fail to marshal.
+	credJSON, _ := json.Marshal(fakeToken)
 	cfg := &oauth2.Config{
 		ClientID:     "test-client-id",
 		ClientSecret: "test-client-secret",
-		Endpoint: oauth2.Endpoint{ //nolint:gosec
+		Endpoint: oauth2.Endpoint{ //nolint:gosec // G101: a dead localhost token URL, so tests fail loudly rather than reaching Google
 			TokenURL: "http://localhost:0/token",
 		},
 	}
