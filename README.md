@@ -151,6 +151,15 @@ By default the app labels mail on a scheduled catch-up scan. To process mail **t
      --push-auth-service-account=<SA_EMAIL> \
      --push-auth-token-audience=<PushFunctionUrl>
    ```
+
+   > **Changing the endpoint later (e.g. a region migration): always re-pass all three
+   > flags.** `gcloud pubsub subscriptions update --push-endpoint=<new>` on its own
+   > replaces the entire `pushConfig` and silently drops `oidcToken`. Pub/Sub then POSTs
+   > with no `Authorization` header, `verify()` in `push.go` fails closed on every
+   > delivery, and mail stops being labeled while Pub/Sub retries in the background — the
+   > only symptom is a steady stream of `push auth rejected` / `missing bearer token` in
+   > the push function's log group. Confirm with `gcloud pubsub subscriptions describe
+   > gmail-push-sub` that `pushConfig.oidcToken` is still present afterwards.
 5. **Set the stack parameters** so the app registers watches and authenticates pushes. Add to `samconfig.toml` `parameter_overrides` (or pass on the CLI) and redeploy:
    ```
    PubSubTopic=projects/<PROJECT_ID>/topics/gmail-push
