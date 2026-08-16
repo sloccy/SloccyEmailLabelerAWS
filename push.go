@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/api/idtoken"
+	"github.com/coreos/go-oidc/v3/oidc"
 
 	"github.com/sloccy/ollamail-aws/db"
 	"github.com/sloccy/ollamail-aws/gmail"
@@ -31,6 +31,30 @@ type pushHandler struct {
 	llm   *llm.Client
 	auth  *gmail.Auth
 	cfg   *Config
+	// verifier checks the Pub/Sub OIDC token. Nil when PushAudience is unset, which
+	// verify treats as a misconfiguration and rejects; see the fail-closed note there.
+	verifier *oidc.IDTokenVerifier
+}
+
+// Google's OIDC issuer and JWKS endpoint for the ID tokens Pub/Sub attaches to push
+// requests. Pinned rather than discovered via oidc.NewProvider so startup doesn't
+// depend on a network round trip. go-oidc special-cases Google's scheme-less
+// "accounts.google.com" issuer variant internally, so both forms verify.
+const (
+	googleIssuer   = "https://accounts.google.com"
+	googleCertsURL = "https://www.googleapis.com/oauth2/v3/certs"
+)
+
+// newIDTokenVerifier builds a verifier for issuer, fetching signing keys from certsURL
+// and requiring audience. The returned verifier is meant to be built once and reused:
+// its RemoteKeySet caches the JWKS and refetches only on an unseen key id, so building
+// one per request would refetch Google's keys on every push.
+//
+// audience must be non-empty — go-oidc rejects an empty ClientID unless
+// SkipClientIDCheck is set, so a misconfigured audience fails closed rather than
+// silently accepting tokens minted for anyone else.
+func newIDTokenVerifier(ctx context.Context, issuer, certsURL, audience string) *oidc.IDTokenVerifier {
+	return oidc.NewVerifier(issuer, oidc.NewRemoteKeySet(ctx, certsURL), &oidc.Config{ClientID: audience})
 }
 
 // runPush serves the push webhook behind the Lambda Web Adapter (public Function URL).
@@ -42,6 +66,12 @@ func runPush(cfg Config) {
 	defer stop()
 
 	h := &pushHandler{store: store, llm: llmClient, auth: gmailAuth, cfg: &cfg}
+	// Built once here, not per request, so Google's JWKS is fetched and cached rather
+	// than refetched on every notification. Left nil when unconfigured; verify rejects.
+	if cfg.PushAudience != "" {
+		h.verifier = newIDTokenVerifier(ctx, googleIssuer, googleCertsURL, cfg.PushAudience)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /", h.handle)
 	// Health check for the adapter / manual probes.
@@ -147,7 +177,7 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 // our configured audience, and issued by the expected push service account. This is the
 // only thing guarding the public endpoint, so it fails closed on any misconfiguration.
 func (h *pushHandler) verify(ctx context.Context, r *http.Request) error {
-	if h.cfg.PushAudience == "" {
+	if h.cfg.PushAudience == "" || h.verifier == nil {
 		return errors.New("push audience not configured")
 	}
 	authz := r.Header.Get("Authorization")
@@ -155,14 +185,21 @@ func (h *pushHandler) verify(ctx context.Context, r *http.Request) error {
 	if !ok || token == "" {
 		return errors.New("missing bearer token")
 	}
-	payload, err := idtoken.Validate(ctx, token, h.cfg.PushAudience)
+	// Verify checks the Google signature, issuer, audience and expiry; the service
+	// account is a claim we narrow on ourselves afterwards.
+	idTok, err := h.verifier.Verify(ctx, token)
 	if err != nil {
 		return fmt.Errorf("invalid token: %w", err)
 	}
 	if h.cfg.PushServiceAccount != "" {
-		email, _ := payload.Claims["email"].(string)
-		if email != h.cfg.PushServiceAccount {
-			return fmt.Errorf("unexpected token issuer %q", email)
+		var claims struct {
+			Email string `json:"email"`
+		}
+		if err := idTok.Claims(&claims); err != nil {
+			return fmt.Errorf("invalid token claims: %w", err)
+		}
+		if claims.Email != h.cfg.PushServiceAccount {
+			return fmt.Errorf("unexpected token issuer %q", claims.Email)
 		}
 	}
 	return nil
