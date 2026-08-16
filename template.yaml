@@ -360,6 +360,24 @@ Resources:
           # except Host.
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
           OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          # Static assets carry a content hash in their path (assets.go), so a changed
+          # file is a changed URL and the edge can hold the old one indefinitely.
+          #
+          # CachingOptimized keys on path + normalized Accept-Encoding only — deliberately
+          # not on Cf-Access-Jwt-Assertion, since keying per-JWT would give every viewer a
+          # private copy and cache nothing in practice. AllViewerExceptHostHeader is kept
+          # so that a cache *miss* still forwards the Access JWT and the origin's
+          # middleware can authorize normally. The tradeoff is that once an asset is in
+          # the edge cache it is served without that check; see the security note in
+          # README — it covers only the embedded front-end files, never app data, which
+          # stays on the uncached DefaultCacheBehavior above.
+          - PathPattern: /static/*
+            TargetOriginId: WebFunctionUrlOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
 
   # ----------------------------------------------------------------
   # Scan function — invoked by EventBridge on a schedule

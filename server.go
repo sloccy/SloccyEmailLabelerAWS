@@ -177,14 +177,29 @@ func (g *gzipResponseWriter) Flush() {
 }
 
 func (s *server) registerRoutes() {
-	// Static (deliberately uncached — no cache-busting/versioned filenames exist yet,
-	// so an aggressive Cache-Control here means fixes deployed to app.js/style.css
-	// can take up to a day to reach returning users, behind CloudFront/Cloudflare too).
+	// Static. Templates link these via {{asset}}, which puts a content hash in the path
+	// (see assets.go), so a hashed URL names one immutable body and can be cached hard —
+	// by browsers and by the CloudFront /static/* behavior. Anything without a current
+	// hash still serves, but stays no-store: only the hash lets us promise immutability.
 	staticSub, _ := fs.Sub(staticFS, "static")
 	fileServer := http.StripPrefix("/static/", http.FileServer(http.FS(staticSub)))
 	s.mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
 		relPath := strings.TrimPrefix(r.URL.Path, "/static/")
+		cacheControl := "no-store"
+		// Strip a leading hash segment whether or not it's current. A stale one means a
+		// page rendered before the last deploy; serve it the fresh bytes uncached rather
+		// than 404, and let the next render pick up the new URL.
+		if seg, rest, ok := strings.Cut(relPath, "/"); ok && isAssetHash(seg) {
+			if _, err := fs.Stat(staticSub, rest); err == nil {
+				if assetHashes()[rest] == seg {
+					cacheControl = assetImmutableCacheControl
+				}
+				relPath = rest
+				r = r.Clone(r.Context())
+				r.URL.Path = "/static/" + rest
+			}
+		}
+		w.Header().Set("Cache-Control", cacheControl)
 		if strings.Contains(r.Header.Get(headerAcceptEncoding), encodingGzip) {
 			if f, err := staticSub.Open(relPath + ".gz"); err == nil {
 				defer func() { _ = f.Close() }()

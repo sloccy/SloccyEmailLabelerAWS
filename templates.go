@@ -20,6 +20,7 @@ func tmplFuncs() template.FuncMap {
 		"fmtretention":   fmtretention,
 		"dict":           dict,
 		"safeHTML":       safeHTML,
+		"asset":          assetURL,
 	}
 }
 
