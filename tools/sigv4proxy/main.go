@@ -97,5 +97,13 @@ func main() {
 	}
 
 	log.Printf("SigV4 proxy listening on http://%s  ->  %s", *listen, *target)
-	log.Fatal(http.ListenAndServe(*listen, http.HandlerFunc(proxy))) //nolint:gosec // local dev proxy, no timeouts needed
+	// ReadHeaderTimeout bounds how long a stalled client can hold a connection open
+	// before sending headers. Local dev tool or not, it costs one field to not be
+	// trivially tied up by a half-open connection.
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           http.HandlerFunc(proxy),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

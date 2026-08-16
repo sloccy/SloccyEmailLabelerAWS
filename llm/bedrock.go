@@ -761,7 +761,12 @@ func classifyPayload(email Email, prompts []Prompt, modelID, reasoningOverride s
 	// sizing of the expected answer.
 	maxTokens := int32(3000)
 	if n := len(prompts) * 12; n > 3000 {
-		maxTokens = int32(min(n, math.MaxInt32)) //nolint:gosec // bounded to int32 range by min()
+		// Clamp in int space first: the conversion below is then provably in range,
+		// rather than relying on a reader (or a linter) to follow min() through.
+		if n > math.MaxInt32 {
+			n = math.MaxInt32
+		}
+		maxTokens = int32(n)
 	}
 	msgs := []types.Message{userMessage(turn)}
 	inf := &types.InferenceConfiguration{

@@ -147,7 +147,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.Header.Get(headerAcceptEncoding), encodingGzip) {
 		w.Header().Set("Content-Encoding", encodingGzip)
 		w.Header().Set("Vary", headerAcceptEncoding)
-		gz := gzipPool.Get().(*gzip.Writer) //nolint:forcetypeassert // pool only contains *gzip.Writer
+		// sync.Pool.New only ever yields *gzip.Writer, but a checked assertion costs
+		// nothing and degrades to a fresh writer rather than panicking mid-response if
+		// anything ever Puts the wrong type back.
+		gz, ok := gzipPool.Get().(*gzip.Writer)
+		if !ok {
+			gz = gzip.NewWriter(io.Discard)
+		}
 		gz.Reset(w)
 		defer func() {
 			_ = gz.Close()
@@ -174,6 +180,27 @@ func (g *gzipResponseWriter) Flush() {
 	if f, ok := g.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// writeJSON encodes v as the response body, logging rather than returning a failure:
+// the status line and headers are already on the wire by this point, so there is no
+// way left to tell the client anything different.
+func writeJSON(w http.ResponseWriter, v any) {
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Warn("write json response", "err", err)
+	}
+}
+
+// writeSSEEvent writes one {type, text} frame to a Server-Sent Events stream. Same
+// reasoning as writeJSON on the error: mid-stream there is nothing to report it to.
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, typ, text string) {
+	b, err := json.Marshal(map[string]string{jsonKeyType: typ, jsonKeyText: text})
+	if err != nil {
+		slog.Warn("marshal sse event", "type", typ, "err", err)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
 }
 
 func (s *server) registerRoutes() {
@@ -510,8 +537,10 @@ func (s *server) handleCreatePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-create label in background for all matching accounts
-	go s.ensureLabelForAccounts(context.Background(), f.LabelName, f.AccountID) //nolint:gosec // G118: must outlive request
+	// Pre-create label in background for all matching accounts. WithoutCancel keeps the
+	// request's values while dropping its cancellation, so the work survives the response
+	// without silently inheriting a context that is about to be cancelled.
+	go s.ensureLabelForAccounts(context.WithoutCancel(r.Context()), f.LabelName, f.AccountID)
 
 	s.renderPromptsList(w, ctx, "", "Rule saved")
 }
@@ -539,7 +568,7 @@ func (s *server) handleUpdatePrompt(w http.ResponseWriter, r *http.Request) {
 		ID:             id,
 	})
 
-	go s.ensureLabelForAccounts(context.Background(), f.LabelName, f.AccountID) //nolint:gosec // G118: must outlive request
+	go s.ensureLabelForAccounts(context.WithoutCancel(r.Context()), f.LabelName, f.AccountID)
 
 	s.renderPromptsList(w, ctx, "", "Rule updated")
 }
@@ -1474,7 +1503,7 @@ func (s *server) handleExportPrompts(w http.ResponseWriter, r *http.Request) {
 	prompts, _ := s.store.ListPrompts(ctx)
 	w.Header().Set("Content-Disposition", "attachment; filename=prompts.json")
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(prompts) //nolint:musttag,errchkjson // sqlc-generated struct; HTTP write error is unrecoverable
+	writeJSON(w, prompts)
 }
 
 type configExport struct {
@@ -1525,7 +1554,7 @@ func (s *server) handleExportConfig(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", "attachment; filename=ollamail-config.json")
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(configExport{ //nolint:musttag,errchkjson // sqlc-generated struct; HTTP write error is unrecoverable
+	writeJSON(w, configExport{
 		Accounts:  safeAccounts,
 		Prompts:   prompts,
 		Settings:  settings,
@@ -1598,7 +1627,7 @@ func (s *server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"imported": imported}) //nolint:errchkjson // HTTP write error is unrecoverable
+	writeJSON(w, map[string]any{"imported": imported})
 }
 
 func (s *server) handleDownloadLogs(w http.ResponseWriter, r *http.Request) {
@@ -1647,20 +1676,14 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 	ch := s.llm.StreamGeneratePromptInstruction(r.Context(), description)
 	for chunk := range ch {
 		if chunk.Err != nil {
-			b, _ := json.Marshal(map[string]string{jsonKeyType: "error", jsonKeyText: chunk.Err.Error()}) //nolint:errchkjson // map[string]string cannot fail
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
+			writeSSEEvent(w, flusher, "error", chunk.Err.Error())
 			break
 		}
 		if chunk.Reasoning != "" {
-			b, _ := json.Marshal(map[string]string{jsonKeyType: "reasoning", jsonKeyText: chunk.Reasoning}) //nolint:errchkjson // map[string]string cannot fail
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
+			writeSSEEvent(w, flusher, "reasoning", chunk.Reasoning)
 		}
 		if chunk.Text != "" {
-			b, _ := json.Marshal(map[string]string{jsonKeyType: "content", jsonKeyText: chunk.Text}) //nolint:errchkjson // map[string]string cannot fail
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
+			writeSSEEvent(w, flusher, "content", chunk.Text)
 		}
 	}
 	_, _ = fmt.Fprintf(w, "data: {\"type\":\"done\"}\n\n")
@@ -1865,7 +1888,7 @@ func (s *server) handlePromptSuggestionTrace(w http.ResponseWriter, r *http.Requ
 	stalled, _ := s.store.IsSuggestionTraceStale(ctx, sg)
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(suggestionTraceResponse{ //nolint:errchkjson // struct fields are all plain types, cannot fail
+	writeJSON(w, suggestionTraceResponse{
 		Status:  sg.Status,
 		LastSeq: lastSeq,
 		Stalled: stalled,
@@ -2072,5 +2095,5 @@ func generateToken(n int) string {
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg}) //nolint:errchkjson // HTTP write error is unrecoverable
+	writeJSON(w, map[string]string{"error": msg})
 }

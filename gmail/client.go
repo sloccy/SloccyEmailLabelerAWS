@@ -3,6 +3,7 @@ package gmail
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -43,13 +44,29 @@ type retryTransport struct {
 	base http.RoundTripper
 }
 
+// retryJitter returns a uniform random duration in [0, limit). It uses crypto/rand
+// rather than math/rand — not because retry jitter needs unpredictability, but because
+// it runs at most twice per request, so there is no reason to carry a weak generator in
+// the binary for it. A failed read falls back to half the limit, which still spreads
+// retries rather than synchronising them.
+func retryJitter(limit time.Duration) time.Duration {
+	if limit <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
+	if err != nil {
+		return limit / 2
+	}
+	return time.Duration(n.Int64())
+}
+
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 	backoff := retryBaseBackoff
 	for attempt := range 3 {
 		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(backoff / 2))) //nolint:gosec // G404: crypto rand unnecessary for jitter
+			jitter := retryJitter(backoff / 2)
 			time.Sleep(backoff + jitter)
 			backoff *= 2
 			// Reset the request body so retries send the full payload.
