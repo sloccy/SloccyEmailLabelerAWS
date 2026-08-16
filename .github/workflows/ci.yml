@@ -42,8 +42,18 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        # v7 of the action supports golangci-lint v2 (our .golangci.yml is version "2").
-        # Pin to a v2 build compiled with Go >= our go.mod toolchain.
+        # Deliberately unpinned. gosec and staticcheck ship new rules for vulnerability
+        # classes that did not exist when any given release was cut, so tracking latest
+        # is the point of running them — a pin quietly opts out of every check added
+        # after it. The accepted cost is that an upstream release can turn this job red
+        # without a code change; that is a real finding to triage, not a build break to
+        # route around. Deploys are unaffected either way: deploy.yml runs its own test
+        # job and never depends on this workflow.
+        #
+        # The action itself stays pinned (@v9): that is third-party executable code
+        # running with repo credentials, where pinning is the security win, not the
+        # security cost. The two go in opposite directions on purpose. @v9 is also what
+        # supports golangci-lint v2, which .golangci.yml's `version: "2"` requires.
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          version: latest
