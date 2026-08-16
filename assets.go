@@ -40,18 +40,24 @@ func buildAssetHashes() map[string]string {
 	if err != nil {
 		return m
 	}
+	// Errors are discarded rather than surfaced: staticFS is an embed.FS, so a walk
+	// failure is not reachable at runtime, and if one ever were, the affected files
+	// simply go unhashed and assetURL falls back to their uncached /static/ URL.
 	_ = fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
 		// .gz files are pre-compressed variants served under their sibling's URL
 		// (registerRoutes picks them by Accept-Encoding), so they get no hash of their own.
-		if walkErr != nil || d.IsDir() || strings.HasSuffix(p, ".gz") {
-			return nil //nolint:nilerr // a missing or unreadable asset shouldn't stop the walk
-		}
-		data, readErr := fs.ReadFile(sub, p)
-		if readErr != nil {
+		if d.IsDir() || strings.HasSuffix(p, ".gz") {
 			return nil
 		}
-		sum := sha256.Sum256(data)
-		m[p] = hex.EncodeToString(sum[:])[:assetHashLen]
+		// An unreadable asset simply goes unhashed: assetURL falls back to the plain
+		// /static/ URL, which still serves, just uncached.
+		if data, readErr := fs.ReadFile(sub, p); readErr == nil {
+			sum := sha256.Sum256(data)
+			m[p] = hex.EncodeToString(sum[:])[:assetHashLen]
+		}
 		return nil
 	})
 	return m
