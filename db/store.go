@@ -107,6 +107,12 @@ type ssmAPI interface {
 // Store wraps a DynamoDB client. All methods are safe for concurrent use.
 var _ StoreIface = (*Store)(nil)
 
+// ErrNotFound reports that a lookup found no row, as opposed to failing. Callers that
+// treat absence as a normal outcome must match on this with errors.Is rather than
+// swallowing every error — otherwise a throttle, timeout or IAM denial from DynamoDB
+// is indistinguishable from "nothing configured", and the operation silently no-ops.
+var ErrNotFound = errors.New("not found")
+
 type Store struct {
 	ddb   *dynamodb.Client
 	table string
@@ -2094,7 +2100,7 @@ func (s *Store) GetAccountRetention(ctx context.Context, accountID int64) (Accou
 		return AccountRetention{}, err
 	}
 	if item == nil {
-		return AccountRetention{AccountID: accountID}, errors.New("not found")
+		return AccountRetention{AccountID: accountID}, ErrNotFound
 	}
 	return AccountRetention{
 		AccountID:  accountID,

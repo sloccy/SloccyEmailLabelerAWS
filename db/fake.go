@@ -390,7 +390,7 @@ func (s *FakeStore) GetAccountRetention(_ context.Context, accountID int64) (Acc
 	defer s.mu.Unlock()
 	r, ok := s.retention[accountID]
 	if !ok {
-		return AccountRetention{AccountID: accountID}, fmt.Errorf("no retention rule for account %d", accountID)
+		return AccountRetention{AccountID: accountID}, fmt.Errorf("no retention rule for account %d: %w", accountID, ErrNotFound)
 	}
 	return r, nil
 }

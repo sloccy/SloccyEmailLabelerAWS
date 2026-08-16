@@ -2,6 +2,8 @@ package retention
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 
@@ -72,8 +74,14 @@ func cleanup(ctx context.Context, store db.StoreIface, svc *gmailpkg.Client, acc
 
 	// Global retention rule
 	retention, err := store.GetAccountRetention(ctx, accountID)
+	if errors.Is(err, db.ErrNotFound) {
+		// No global rule for this account — label rules above were the whole job.
+		return nil
+	}
 	if err != nil {
-		return nil //nolint:nilerr // no global rule configured
+		// A real lookup failure. Returning nil here would silently skip global
+		// retention on any DynamoDB throttle or outage; Cleanup logs what we return.
+		return fmt.Errorf("get account retention: %w", err)
 	}
 	if !retention.GlobalDays.Valid {
 		return nil

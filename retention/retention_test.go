@@ -1,8 +1,10 @@
 package retention
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -182,5 +184,59 @@ func TestClampDays(t *testing.T) {
 		if got := clampDays(c.in); got != c.want {
 			t.Errorf("clampDays(%d) = %d, want %d", c.in, got, c.want)
 		}
+	}
+}
+
+// ============================================================
+// Global-retention lookup: absence vs failure
+// ============================================================
+
+// failingRetentionStore makes GetAccountRetention fail with something other than
+// db.ErrNotFound, so the tests below can tell "no global rule" apart from a real
+// lookup failure. Everything else is delegated to the real fake.
+type failingRetentionStore struct {
+	db.StoreIface
+	err error
+}
+
+func (s failingRetentionStore) GetAccountRetention(context.Context, int64) (db.AccountRetention, error) {
+	return db.AccountRetention{}, s.err
+}
+
+// A DynamoDB throttle or outage must not look like "nothing configured": swallowing it
+// would silently skip global retention, leaving mail that should have been trashed.
+func TestCleanupPropagatesGlobalRetentionLookupFailure(t *testing.T) {
+	store := newTestStore(t)
+	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "a@test.com"})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+	})
+	svc := gmailServer(t, mux)
+
+	wantErr := errors.New("ProvisionedThroughputExceededException")
+	err := cleanup(t.Context(), failingRetentionStore{StoreIface: store, err: wantErr}, svc, accID)
+	if err == nil {
+		t.Fatal("cleanup: want error for a failed retention lookup, got nil")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("cleanup: want error wrapping %v, got %v", wantErr, err)
+	}
+}
+
+// An account with no global rule is a normal outcome, not a failure.
+func TestCleanupTreatsMissingGlobalRuleAsSuccess(t *testing.T) {
+	store := newTestStore(t)
+	accID, _ := store.UpsertAccount(t.Context(), db.UpsertAccountParams{Email: "a@test.com"})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/messages", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"messages": []any{}}) //nolint:errcheck,gosec
+	})
+	svc := gmailServer(t, mux)
+
+	if err := cleanup(t.Context(), store, svc, accID); err != nil {
+		t.Fatalf("cleanup: want nil for an account with no global rule, got %v", err)
 	}
 }
