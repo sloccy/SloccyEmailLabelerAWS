@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -296,8 +295,16 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 	// earlier version of this fake did) doesn't reproduce that: it lets one call walk an
 	// unbounded number of items in-memory looking for pageSize matches, silently defeating
 	// the short/empty-page behavior a sparse filter produces against the real store.
-	all := make([]*CategorizationHistory, 0, int(pageSize)*len(accountIDs))
-	moreBeyondFetched := false
+	//
+	// The PromptID/Unmatched filters are applied here, *after* that per-account cap, because
+	// that is where the real store applies them: they go to DynamoDB as a FilterExpression,
+	// and a FilterExpression runs after Limit, not before. Applying them in the merge walk
+	// instead (as this fake used to) quietly makes a whole class of page unreachable in
+	// tests — the one where the filter drops every fetched item, leaving the merge empty
+	// while unread rows remain below.
+	all := make([]CategorizationHistory, 0, int(pageSize)*len(accountIDs))
+	var scanned int64
+	floorSK := ""
 	for _, aid := range accountIDs {
 		var acctRows []*CategorizationHistory
 		for _, h := range s.history {
@@ -314,43 +321,33 @@ func (s *FakeStore) GetHistoryFiltered(_ context.Context, f HistoryFilter) (Hist
 			acctRows = acctRows[cut:]
 		}
 		if int64(len(acctRows)) > pageSize {
-			moreBeyondFetched = true // this account's partition has more past what we took
+			// This account's partition has more past what we took; record how deep it read.
 			acctRows = acctRows[:pageSize]
+			last := acctRows[len(acctRows)-1]
+			if sk := tsKey(last.Timestamp, last.ID); sk > floorSK {
+				floorSK = sk
+			}
 		}
-		all = append(all, acctRows...)
+		scanned += int64(len(acctRows))
+		for _, h := range acctRows {
+			switch {
+			case f.Unmatched && h.PromptID != nil:
+				continue
+			case f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID):
+				continue
+			}
+			all = append(all, *h)
+		}
 	}
-	sort.Slice(all, byTSIDDesc(all))
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Timestamp != all[j].Timestamp {
+			return all[i].Timestamp > all[j].Timestamp
+		}
+		return all[i].ID > all[j].ID
+	})
 
-	// Walk the merge applying the (in the real store, Go-only) filters, same as
-	// Store.GetHistoryFiltered: the cursor tracks the last item *examined*, not the last
-	// matched, so a resumed page can't skip or repeat rows this call didn't get to.
-	var filtered []CategorizationHistory
-	lastConsumedSK := ""
-	consumedAll := true
-	for i, h := range all {
-		lastConsumedSK = tsKey(h.Timestamp, h.ID)
-		switch {
-		case f.Unmatched && h.PromptID != nil:
-			continue
-		case f.PromptID != nil && (h.PromptID == nil || *h.PromptID != *f.PromptID):
-			continue
-		case f.SubjectQ != "" && !strings.Contains(strings.ToLower(h.Subject), strings.ToLower(f.SubjectQ)):
-			continue
-		case f.SenderQ != "" && !strings.Contains(strings.ToLower(h.Sender), strings.ToLower(f.SenderQ)):
-			continue
-		}
-		filtered = append(filtered, *h)
-		if int64(len(filtered)) >= pageSize {
-			consumedAll = i == len(all)-1
-			break
-		}
-	}
-
-	nextCursor := ""
-	if !consumedAll || moreBeyondFetched {
-		nextCursor = lastConsumedSK
-	}
-	return HistoryPage{Rows: filtered, NextCursor: nextCursor}, nil
+	filtered, nextCursor := historyMergeCut(all, f, pageSize, floorSK)
+	return HistoryPage{Rows: filtered, NextCursor: nextCursor, Scanned: scanned}, nil
 }
 
 func (s *FakeStore) GetLabelRetention(_ context.Context, accountID int64) ([]LabelRetention, error) {

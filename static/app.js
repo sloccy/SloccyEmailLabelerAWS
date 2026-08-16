@@ -557,6 +557,29 @@ function _startSuggestionTrace(el) {
     stepsEl.appendChild(li);
   }
 
+  // appendText grows a streamed pane by adding a text node rather than doing
+  // `el.textContent += chunk`. That distinction is the whole fix for "the thinking pane
+  // jumps back to the top every 1.5s": reassigning textContent tears down the existing
+  // text node and builds a new one, and a scrollable box whose contents were just replaced
+  // resets scrollTop to 0. Appending leaves the existing node alone, so the scroll position
+  // survives — and it also drops the O(n^2) whole-string rebuild on every poll tick.
+  //
+  // followBottom keeps the pane pinned to the newest text only while the reader is already
+  // at the bottom; someone who scrolled up to re-read an earlier line stays where they put
+  // themselves. The 4px slack absorbs sub-pixel/zoom rounding in scrollHeight.
+  function appendText(el, text, followBottom) {
+    const atBottom = !followBottom || el.scrollHeight - el.scrollTop - el.clientHeight < 4;
+    el.appendChild(document.createTextNode(text));
+    if (followBottom && atBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  // While the "Thinking…" <details> is collapsed the pane has no layout, so every append
+  // above trivially counts as "at bottom" and scrollTop stays 0 — correct, but only until
+  // it's opened. Pinning on open covers the reader who expands it mid-stream.
+  thinkingEl?.closest('details')?.addEventListener('toggle', function() {
+    if (this.open) thinkingEl.scrollTop = thinkingEl.scrollHeight;
+  });
+
   function poll() {
     // The element (or the whole card) may have been removed from the DOM since the last
     // tick — "Back to list" clears #suggestion-detail-container's innerHTML directly, with
@@ -574,9 +597,9 @@ function _startSuggestionTrace(el) {
         (data.events || []).forEach(ev => {
           if (ev.kind === 'answer') {
             if (!answerStarted) { answerEl.textContent = ''; answerEl.classList.remove('text-muted', 'fst-italic'); answerStarted = true; }
-            answerEl.textContent += ev.text;
+            appendText(answerEl, ev.text, false); // grows the card, never its own scrollbox
           } else if (ev.kind === 'thinking' && thinkingEl) {
-            thinkingEl.textContent += ev.text;
+            appendText(thinkingEl, ev.text, true);
           } else {
             appendStep(ev.kind, ev.text);
           }

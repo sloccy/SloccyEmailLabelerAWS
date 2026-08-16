@@ -45,7 +45,11 @@
     </td>
   </tr>
 {{end}}
-{{if and (not .Rows) .FirstPage}}
+{{/* Only claim there's nothing here when the walk is actually over. A first page can come
+     back empty while the search still has history left to read — a sparse subject filter
+     matches nothing on most pages — and "No matching history found" above a live spinner
+     reads as a wrong answer rather than an in-progress one. */}}
+{{if and (not .Rows) .FirstPage (not .NextURL) (not .Truncated)}}
 <tr><td colspan="8">{{template "empty_state" (dict "Icon" (safeHTML `<svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="16" cy="16" r="12"/><path d="M16 10v6l4 3" stroke-linecap="round" stroke-linejoin="round"/></svg>`) "Text" "No matching history found.")}}</td></tr>
 {{end}}
 {{if .NextURL}}
@@ -53,8 +57,22 @@
   <td colspan="8" class="text-center py-3"><span class="spinner-border spinner-border-sm text-muted" aria-hidden="true"></span></td>
 </tr>
 {{end}}
+{{/* The row budget ran out with history still below the cursor. Unlike the sentinel above,
+     this is click-triggered rather than hx-trigger="intersect": getting here means a whole
+     budget's worth of rows was read without filling a page, so the next batch of reads waits
+     for the user to ask for it. hx-include mirrors the sentinel's so the current filters
+     ride along. */}}
 {{if .Truncated}}
 <tr><td colspan="8" class="text-center text-muted small py-3">
-  Showing the first {{.MaxLimit}} results &mdash; narrow your filters to see more.
+  <div class="mb-2">Searched the most recent {{.MaxLimit}} emails.</div>
+  {{if .MoreURL}}
+  <button type="button" class="btn btn-outline-secondary btn-sm"
+    hx-get="{{.MoreURL}}"
+    hx-target="closest tr"
+    hx-swap="outerHTML"
+    hx-include="#hist-filter-form">Search older history</button>
+  {{else}}
+  Narrow your filters to see more.
+  {{end}}
 </td></tr>
 {{end}}

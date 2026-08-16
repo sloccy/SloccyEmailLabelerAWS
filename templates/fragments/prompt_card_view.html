@@ -28,6 +28,19 @@
           </span>
         </div>
         <div class="small text-muted border-top pt-2 mt-2" style="line-height:1.625">{{.Instructions}}</div>
+        {{/* The example corpus, expandable in place. Lazy-loaded on first open (same
+             hx-trigger="toggle once" pattern as the LLM-response disclosure in
+             history_table.html) so a page full of rule cards doesn't fan out into a Query
+             per rule for a list nobody has opened. The count badge above stays the
+             at-a-glance number; this is the "which ones?" behind it. */}}
+        <details class="mt-2"
+          hx-get="/fragments/prompts/{{.ID}}/examples"
+          hx-trigger="toggle once"
+          hx-target="find .examples-content"
+          hx-swap="outerHTML">
+          <summary class="small text-muted" style="cursor:pointer">Examples</summary>
+          <div class="examples-content mt-2"><span class="spinner-border spinner-border-sm text-muted" role="status" aria-hidden="true"></span></div>
+        </details>
       </div>
       <div class="d-flex gap-2 flex-shrink-0 align-self-start">
         <button class="btn btn-outline-secondary btn-sm"

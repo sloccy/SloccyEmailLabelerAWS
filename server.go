@@ -266,6 +266,7 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("GET /fragments/prompts/{id}/edit", s.handleEditPrompt)
 	s.mux.HandleFunc("GET /fragments/prompts/{id}/view", s.handleViewPrompt)
 	s.mux.HandleFunc("GET /fragments/prompts/{id}/examples-count", s.handlePromptExamplesBadge)
+	s.mux.HandleFunc("GET /fragments/prompts/{id}/examples", s.handlePromptExamples)
 	s.mux.HandleFunc("POST /fragments/prompts/{id}/clear-examples", s.handleClearPromptExamples)
 	s.mux.HandleFunc("GET /fragments/settings", s.handleGetSettings)
 	s.mux.HandleFunc("PATCH /fragments/settings", s.handleUpdateSettings)
@@ -655,6 +656,52 @@ func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Reques
 	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: total}, "")
 }
 
+// promptExamplesPerVerdict bounds how many of each verdict's examples the expandable list on
+// a prompt card shows. Deliberately small: a long-lived rule accumulates thousands of
+// passively-confirmed positives (see db.PromptExample's doc comment), and the point of this
+// panel is "what has this rule actually learned lately", not a full corpus dump — which
+// would also be a much larger Query per expand against a 2-RCU table.
+const promptExamplesPerVerdict = 25
+
+// promptExamplesView feeds prompt_examples_list.html: one group per verdict, newest first.
+type promptExamplesView struct {
+	ID     int64
+	Groups []exampleGroup
+}
+
+// handlePromptExamples renders the read-only expansion of a prompt card's example corpus.
+// Lazy-loaded on the card's <details> opening (hx-trigger="toggle once") rather than with
+// the card itself, for the same reason handlePromptExamplesBadge is: this is three Query
+// calls, and the prompts list renders on every page load.
+//
+// Deliberately does not call CountExamplesByVerdict — the badge beside it already shows the
+// corpus total, and the count path paginates a whole partition per verdict. Instead each
+// verdict is fetched one row over the display cap, so a full group can say so without a
+// second round trip.
+func (s *server) handlePromptExamples(w http.ResponseWriter, r *http.Request) {
+	id := pathInt(r, "id")
+	ctx := r.Context()
+	view := promptExamplesView{ID: id}
+	for _, v := range db.VerdictOrder {
+		examples, err := s.store.ListExamplesByVerdict(ctx, id, v, promptExamplesPerVerdict+1)
+		if err != nil {
+			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err)
+			continue
+		}
+		if len(examples) == 0 {
+			continue
+		}
+		g := exampleGroup{Verdict: v, Label: verdictLabels[v]}
+		if len(examples) > promptExamplesPerVerdict {
+			g.More = true
+			examples = examples[:promptExamplesPerVerdict]
+		}
+		g.Examples = examples
+		view.Groups = append(view.Groups, g)
+	}
+	s.fragmentResponse(w, "prompt_examples_list.html", view, "")
+}
+
 // handleClearPromptExamples deletes a rule's entire example corpus — the escape hatch for
 // when the rule's intent has changed enough that its recorded history would mislead the
 // next AI prompt improvement round (see DeleteExamplesForPrompt's doc comment). Returns the
@@ -1019,6 +1066,14 @@ type historyTableView struct {
 	FirstPage bool
 	Truncated bool
 	MaxLimit  int // only meaningful when Truncated; shown in the terminal row's message
+
+	// MoreURL turns Truncated from a dead end into a "Search older history" button: the
+	// same resume URL the sentinel would have used, but with the row budget reset and
+	// triggered by a click instead of by scrolling into view. That distinction is the point
+	// — hitting the ceiling means this search has already read HistoryMaxLimit rows without
+	// filling a page, so the next batch of reads should be something the user asks for.
+	// Without it a search simply could not reach an email older than the ceiling.
+	MoreURL string
 }
 
 func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -1054,7 +1109,14 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	view := historyTableView{FirstPage: firstPage, MaxLimit: s.cfg.HistoryMaxLimit}
 	limit, ceilingHit := historyPageLimit(s.cfg.HistoryPageSize, s.cfg.HistoryMaxLimit, loaded)
 	if ceilingHit {
+		// Unreachable through the UI — the ceiling is now detected after a page is rendered
+		// (below), which hands back a MoreURL with loaded reset to 0 rather than a URL
+		// already past the budget. Kept for a hand-edited or stale link, and it offers the
+		// same continue button so that case isn't a dead end either.
 		view.Truncated = true
+		if cur := q.Get("cursor"); cur != "" {
+			view.MoreURL = historyNextURL(q, cur, 0)
+		}
 		s.fragmentResponse(w, "history_table.html", view, "")
 		return
 	}
@@ -1084,10 +1146,17 @@ func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	newLoaded := loaded + int64(len(page.Rows))
+	// The budget counts rows *scanned*, not rows matched. With no filters those are the same
+	// number, so plain browsing still stops at HistoryMaxLimit rows exactly as before; with
+	// a subject/sender search they diverge sharply, and counting matches would let a search
+	// that matches nothing scroll forever, one near-empty page of DynamoDB reads at a time.
+	newLoaded := loaded + page.Scanned
 	if page.NextCursor != "" {
 		if newLoaded >= int64(s.cfg.HistoryMaxLimit) {
 			view.Truncated = true
+			// loaded=0: the click starts a fresh budget from this cursor, so older matches
+			// stay reachable a batch at a time instead of being walled off.
+			view.MoreURL = historyNextURL(q, page.NextCursor, 0)
 		} else {
 			view.NextURL = historyNextURL(q, page.NextCursor, newLoaded)
 		}
@@ -1714,7 +1783,7 @@ type suggestionView struct {
 	// a rule's example corpus for every card in the list would be N*3 extra queries for
 	// nothing shown). ExampleGroups is the corpus the improver/replay actually used, in
 	// place of the single mishandled-email snapshot the pre-corpus UI showed.
-	ExampleGroups  []suggestionExampleGroup
+	ExampleGroups  []exampleGroup
 	ReplayModel    string
 	ReplayTotal    int64
 	ReplayPassed   int64
@@ -1729,12 +1798,27 @@ type suggestionView struct {
 	BestRound int64
 }
 
-// suggestionExampleGroup is one verdict's worth of a rule's example corpus, labeled for
-// display in prompt_suggestion_detail.html.
-type suggestionExampleGroup struct {
+// exampleGroup is one verdict's worth of a rule's example corpus, labeled for display.
+// Shared by prompt_suggestion_detail.html (the curated set the improver saw) and
+// prompt_examples_list.html (the newest rows of the live corpus, on the prompt card).
+type exampleGroup struct {
 	Verdict  string
 	Label    string
 	Examples []db.PromptExample
+
+	// More reports that the corpus holds further rows past Examples. Only the prompt-card
+	// list sets it — the suggestion detail view shows exactly what went into the improve
+	// call, so "there are more" would be meaningless there.
+	More bool
+}
+
+// verdictLabels turns a stored verdict into the phrasing both example views show. Written
+// from the rule's point of view rather than as the raw constant, since "false_negative"
+// reads backwards to anyone who hasn't internalized which side the rule is on.
+var verdictLabels = map[string]string{
+	db.VerdictFalseNegative:     "Missed it (should have matched)",
+	db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
+	db.VerdictConfirmedPositive: "Already correct (must keep matching)",
 }
 
 // toSuggestionView converts a stored suggestion + its prompt's name into the view shape
@@ -1771,11 +1855,6 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 	view := toSuggestionView(sg, promptName)
 
 	examples := selectExamplesForImprove(ctx, s.store, sg.PromptID)
-	labels := map[string]string{
-		db.VerdictFalseNegative:     "Missed it (should have matched)",
-		db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
-		db.VerdictConfirmedPositive: "Already correct (must keep matching)",
-	}
 	for _, v := range db.VerdictOrder {
 		var grouped []db.PromptExample
 		for _, ex := range examples {
@@ -1784,7 +1863,7 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 			}
 		}
 		if len(grouped) > 0 {
-			view.ExampleGroups = append(view.ExampleGroups, suggestionExampleGroup{Verdict: v, Label: labels[v], Examples: grouped})
+			view.ExampleGroups = append(view.ExampleGroups, exampleGroup{Verdict: v, Label: verdictLabels[v], Examples: grouped})
 		}
 	}
 

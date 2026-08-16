@@ -465,3 +465,27 @@ func TestHistoryNextURL(t *testing.T) {
 		t.Error("historyNextURL must not mutate its q argument")
 	}
 }
+
+// TestHistoryNextURL_MoreResetsBudget pins the one thing that makes a search able to reach
+// past HistoryMaxLimit: the "Search older history" button's URL keeps the cursor but resets
+// loaded to 0, so the click buys a fresh row budget from where the last one ran out. If it
+// carried the exhausted count forward instead, the next request would trip the ceiling
+// immediately and the button would do nothing.
+func TestHistoryNextURL_MoreResetsBudget(t *testing.T) {
+	q := url.Values{"subject": {"invoice"}, "loaded": {"500"}}
+
+	vals, err := url.Parse(historyNextURL(q, "2026-08-01 09:12:03#00000000000000000017", 0))
+	if err != nil {
+		t.Fatalf("unparseable URL: %v", err)
+	}
+	got := vals.Query()
+	if got.Get("loaded") != "0" {
+		t.Errorf("loaded = %q, want 0 — the continue button must start a fresh budget", got.Get("loaded"))
+	}
+	if got.Get("cursor") != "2026-08-01 09:12:03#00000000000000000017" {
+		t.Errorf("cursor = %q, want the resume point carried through", got.Get("cursor"))
+	}
+	if got.Get("subject") != "invoice" {
+		t.Errorf("subject = %q, want the search term preserved", got.Get("subject"))
+	}
+}

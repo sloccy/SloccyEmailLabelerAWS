@@ -235,7 +235,8 @@ Configuration is set via Lambda environment variables (see `template.yaml`).
 | `GMAIL_LOOKBACK_HOURS` | `24` | How far back to look for emails on each scan |
 | `EMAIL_BODY_TRUNCATION` | `3000` | Max characters of email body sent to the LLM |
 | `LOG_RETENTION_DAYS` | `30` | Days to keep processing log/history entries |
-| `HISTORY_MAX_LIMIT` | `500` | Maximum rows returned in history/log queries |
+| `HISTORY_MAX_LIMIT` | `500` | Rows the History tab will read per scroll session, counted as rows *scanned* — so a subject/sender search that matches nothing still spends the budget. On hitting it the table offers a "Search older history" button that resumes from the same point with a fresh budget, so older matches stay reachable a batch at a time |
+| `HISTORY_PAGE_SIZE` | `50` | Rows fetched per history request (one DynamoDB query per account, then merged newest-first) |
 | `CREDENTIALS_SSM_PARAM` | `/ollamail/credentials` | SSM SecureString holding the Google OAuth client JSON |
 | `MODE` | `web` | `web` (UI server), `scan` (EventBridge catch-up pass), or `push` (Pub/Sub webhook) |
 | `PUBSUB_TOPIC` | _(empty)_ | `projects/<proj>/topics/<name>`; enables Gmail `watch()` registration/renewal |

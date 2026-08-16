@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"html/template"
 	"io"
@@ -239,7 +240,7 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 			v := base
 			v.Status = "pending"
 			v.SuggestedInstructions = "Match promotional newsletters."
-			v.ExampleGroups = []suggestionExampleGroup{{Verdict: "false_negative", Label: "Missed it", Examples: []db.PromptExample{{Sender: "a@example.com", Subject: "s"}}}}
+			v.ExampleGroups = []exampleGroup{{Verdict: "false_negative", Label: "Missed it", Examples: []db.PromptExample{{Sender: "a@example.com", Subject: "s"}}}}
 			return v
 		}()},
 		{"pending with a multi-round trajectory", func() suggestionView {
@@ -266,6 +267,69 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if err := tmpl.ExecuteTemplate(io.Discard, "prompt_suggestion_detail.html", c.view); err != nil {
 				t.Errorf("execute: %v", err)
+			}
+		})
+	}
+}
+
+// TestPromptExamplesListTemplate_Renders exercises the read-only example expansion on a
+// prompt card. Beyond "does it execute", it asserts the two things the template has to get
+// right for the panel to be readable at all: the .examples-content class on the root (the
+// card's <details> targets it by class, and the swap replaces the element that carries it,
+// so losing it would break a re-open), and the "showing the newest N" note that only appears
+// when the handler saw more rows than it displays.
+func TestPromptExamplesListTemplate_Renders(t *testing.T) {
+	tmpl := mustLoadTemplates(t)
+
+	example := db.PromptExample{
+		CreatedAt: "2026-08-01 09:12:03", Sender: "a@example.com", Subject: "Weekly digest",
+		BodyExcerpt: "line one\nline two", Note: "not a newsletter", Source: db.ExampleSourceManual,
+	}
+
+	cases := []struct {
+		name         string
+		view         promptExamplesView
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:         "empty corpus explains itself",
+			view:         promptExamplesView{ID: 1},
+			wantContains: []string{"examples-content", "No examples recorded yet"},
+			wantAbsent:   []string{"Showing the newest"},
+		},
+		{
+			name: "populated group renders the example and its source",
+			view: promptExamplesView{ID: 1, Groups: []exampleGroup{
+				{Verdict: db.VerdictFalsePositive, Label: verdictLabels[db.VerdictFalsePositive], Examples: []db.PromptExample{example}},
+			}},
+			wantContains: []string{"examples-content", "Weekly digest", "a@example.com", "not a newsletter", "manual"},
+			wantAbsent:   []string{"Showing the newest"},
+		},
+		{
+			name: "a full group says there are more",
+			view: promptExamplesView{ID: 1, Groups: []exampleGroup{
+				{Verdict: db.VerdictConfirmedPositive, Label: verdictLabels[db.VerdictConfirmedPositive], Examples: []db.PromptExample{example}, More: true},
+			}},
+			wantContains: []string{"Showing the newest"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := tmpl.ExecuteTemplate(&buf, "prompt_examples_list.html", c.view); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			got := buf.String()
+			for _, want := range c.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q:\n%s", want, got)
+				}
+			}
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("output unexpectedly contains %q:\n%s", absent, got)
+				}
 			}
 		})
 	}

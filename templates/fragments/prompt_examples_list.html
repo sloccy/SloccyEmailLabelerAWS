@@ -1,0 +1,45 @@
+{{/* The read-only expansion of a prompt card's example corpus, lazy-loaded by the card's
+     <details> (prompt_card_view.html) and swapped in over the .examples-content placeholder
+     with outerHTML — so this fragment's root must keep that class for a re-open to still
+     find its target. Read-only on purpose: an example is a record of what actually happened
+     to a real email, and the way to change one is to recategorize that email again (which
+     appends a fresh row the newest-wins dedup then prefers), not to rewrite history here. */}}
+<div class="examples-content mt-2 d-flex flex-column gap-3">
+  {{range .Groups}}
+  <div>
+    <div class="small fw-semibold text-muted text-uppercase mb-1">
+      {{.Label}} &middot; {{len .Examples}}{{if .More}}+{{end}}
+    </div>
+    <ul class="list-unstyled small mb-0 d-flex flex-column gap-2">
+      {{range .Examples}}
+      <li class="border-start ps-2">
+        <div class="d-flex flex-wrap align-items-baseline gap-2">
+          <span class="font-monospace text-muted">{{fmtdate .CreatedAt}}</span>
+          {{if eq .Source "manual"}}
+            <span class="badge border border-primary text-primary">manual</span>
+          {{else if eq .Source "passive"}}
+            <span class="badge border text-secondary">passive</span>
+          {{end}}
+          {{if .ResolvedBySuggestionID}}<span class="badge border text-secondary">resolved</span>{{end}}
+        </div>
+        <div class="text-truncate" style="max-width:100%">
+          <span class="text-muted">{{if .Sender}}{{.Sender}}{{else}}&mdash;{{end}}</span>
+          &mdash; {{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}
+        </div>
+        {{with .Note}}<div class="fst-italic text-muted">{{.}}</div>{{end}}
+        {{with .BodyExcerpt}}
+        {{/* Not .pre-wrap: that class carries a 5rem min-height sized for the full
+             instruction boxes, which would dwarf a 400-rune excerpt in a list row. */}}
+        <div class="text-muted small mt-1" style="white-space:pre-wrap;word-break:break-word;max-height:6rem;overflow-y:auto">{{.}}</div>
+        {{end}}
+      </li>
+      {{end}}
+    </ul>
+    {{if .More}}
+    <div class="small text-muted mt-1">Showing the newest {{len .Examples}} &mdash; older ones are still stored and still feed prompt improvement.</div>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="small text-muted">No examples recorded yet. They accumulate as this rule matches email and as you recategorize.</div>
+  {{end}}
+</div>
