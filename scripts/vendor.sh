@@ -18,7 +18,11 @@ mkdir -p static/vendor
 
 fetch() { # $1=url $2=dest-name
   curl -fsSL "$1" -o "static/vendor/$2"
-  gzip -kf9 "static/vendor/$2"
+  # -n omits the mtime and original filename from the gzip header. Without it every
+  # run produces different bytes for identical input, and since go:embed bakes these
+  # into the binary, SAM's four per-function builds each yield a distinct artifact
+  # and upload their own ~9 MiB copy of the same program.
+  gzip -nkf9 "static/vendor/$2"
   echo "  vendor/$2 ($(wc -c <"static/vendor/$2") bytes)"
 }
 
