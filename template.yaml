@@ -446,10 +446,16 @@ Resources:
       # validation is on (the default), up to ~30 classify calls fanned out concurrently
       # (see llm.ReplayAgainstExamples) — each individually bounded well under a minute,
       # but Bedrock's adaptive retryer (newBedrockRetryer) can still stack up under
-      # throttling. 1024MB (vs. WebFunction's 128MB) gives that fan-out real CPU instead of
-      # the ~1/12 vCPU slice 128MB buys.
+      # throttling.
+      #
+      # 128MB, same as every other function here. This was 1024MB to buy vCPU for that
+      # fan-out (Lambda scales CPU with memory), but the fan-out is network-bound: the
+      # real compute happens inside Bedrock, and this process just waits on ~30 HTTP
+      # calls. Measured peak was 45MB of the 1024 provisioned, so the RAM was never the
+      # constraint either. If a round ever creeps toward the 900s cap, raising this back
+      # is the first knob — but the wall clock is Bedrock's latency, not ours.
       Timeout: 900
-      MemorySize: 1024
+      MemorySize: 128
       LoggingConfig:
         LogGroup: !Ref ImproveFunctionLogGroup
       Environment:
