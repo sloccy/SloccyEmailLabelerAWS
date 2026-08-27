@@ -135,6 +135,13 @@ type fakeConverseAPI struct {
 	streamErrs    []error
 	streamMidErrs []error
 	streamCalls   []*bedrockruntime.ConverseStreamInput
+
+	// streamReaders[i], if set, builds the i-th ConverseStream call's reader directly from
+	// the ctx that call received, instead of the pre-buffered channel streamEvents produces
+	// (built before ConverseStream ever sees ctx, so it can't react to cancellation). Used
+	// by the stall-guard tests below, which need the reader itself to notice ctx.Done() —
+	// exactly what a real Bedrock connection does when its context is cancelled.
+	streamReaders []func(ctx context.Context) bedrockruntime.ConverseStreamOutputReader
 }
 
 func (f *fakeConverseAPI) Converse(_ context.Context, params *bedrockruntime.ConverseInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
@@ -153,11 +160,16 @@ func (f *fakeConverseAPI) Converse(_ context.Context, params *bedrockruntime.Con
 	return &bedrockruntime.ConverseOutput{}, nil
 }
 
-func (f *fakeConverseAPI) ConverseStream(_ context.Context, params *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error) {
+func (f *fakeConverseAPI) ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamEventStream, error) {
 	i := len(f.streamCalls)
 	f.streamCalls = append(f.streamCalls, params)
 	if i < len(f.streamErrs) && f.streamErrs[i] != nil {
 		return nil, f.streamErrs[i]
+	}
+	if i < len(f.streamReaders) && f.streamReaders[i] != nil {
+		return bedrockruntime.NewConverseStreamEventStream(func(es *bedrockruntime.ConverseStreamEventStream) {
+			es.Reader = f.streamReaders[i](ctx)
+		}), nil
 	}
 	var events []types.ConverseStreamOutput
 	if i < len(f.streamEvents) {
@@ -192,6 +204,80 @@ func newFakeStreamReader(events []types.ConverseStreamOutput, err error) *fakeSt
 func (r *fakeStreamReader) Events() <-chan types.ConverseStreamOutput { return r.ch }
 func (r *fakeStreamReader) Close() error                              { return nil }
 func (r *fakeStreamReader) Err() error                                { return r.err }
+
+// ctxStreamReader is fakeStreamReader's ctx-aware counterpart: fakeStreamReader fills its
+// channel before ConverseStream is even called, so a stall-guard timeout — which cancels
+// the ctx the reader was given — has nothing to interrupt. ctxStreamReader instead feeds
+// its channel from a goroutine that watches ctx.Done(), the way a real Bedrock connection
+// is torn down when its context is cancelled. Built via delayedStreamReader/
+// silentStreamReader below rather than directly.
+type ctxStreamReader struct {
+	ch chan types.ConverseStreamOutput
+
+	mu  sync.Mutex
+	err error
+}
+
+func (r *ctxStreamReader) Events() <-chan types.ConverseStreamOutput { return r.ch }
+func (r *ctxStreamReader) Close() error                              { return nil }
+func (r *ctxStreamReader) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+func (r *ctxStreamReader) setErr(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.mu.Unlock()
+}
+
+// delayedStreamReader replays events one at a time, waiting delay between each, then
+// closes cleanly — the shape a stall-guard test needs to prove that a steady trickle of
+// deltas (each resetting the guard) keeps a call alive well past the guard's budget in
+// aggregate. If ctx is cancelled before every event is sent (a guard firing mid-stream),
+// the reader stops early and reports ctx's cancellation cause.
+func delayedStreamReader(events []types.ConverseStreamOutput, delay time.Duration) func(ctx context.Context) bedrockruntime.ConverseStreamOutputReader {
+	return func(ctx context.Context) bedrockruntime.ConverseStreamOutputReader {
+		ch := make(chan types.ConverseStreamOutput)
+		r := &ctxStreamReader{ch: ch}
+		go func() {
+			defer close(ch)
+			for _, e := range events {
+				select {
+				case <-ctx.Done():
+					r.setErr(context.Cause(ctx))
+					return
+				case <-time.After(delay):
+				}
+				select {
+				case ch <- e:
+				case <-ctx.Done():
+					r.setErr(context.Cause(ctx))
+					return
+				}
+			}
+		}()
+		return r
+	}
+}
+
+// silentStreamReader never sends a single event — simulating a call that produces no
+// output at all (the gap before a queued flex-tier request's first delta, or a fully
+// wedged connection) — until ctx is cancelled, at which point it reports ctx's
+// cancellation cause. It never closes on its own, the way a genuinely stalled connection
+// wouldn't either.
+func silentStreamReader() func(ctx context.Context) bedrockruntime.ConverseStreamOutputReader {
+	return func(ctx context.Context) bedrockruntime.ConverseStreamOutputReader {
+		ch := make(chan types.ConverseStreamOutput)
+		r := &ctxStreamReader{ch: ch}
+		go func() {
+			defer close(ch)
+			<-ctx.Done()
+			r.setErr(context.Cause(ctx))
+		}()
+		return r
+	}
+}
 
 // textDeltaEvent, reasoningDeltaEvent, and stopEvent build the ConverseStreamOutput union
 // members ImprovePromptInstructions/streamGenerate switch on, for streamEvents fixtures.
@@ -1328,5 +1414,134 @@ func TestNewBedrockRetryer_RetriesClockSkewAndThrottling(t *testing.T) {
 
 	if unrelated := (&smithy.GenericAPIError{Code: "ValidationException", Message: "bad input"}); r.IsErrorRetryable(unrelated) {
 		t.Errorf("IsErrorRetryable(ValidationException) = true, want false (not a transient error)")
+	}
+}
+
+// ---- ImprovePromptInstructions: stall guard ----
+//
+// improveStallTimeout used to bound the call's *total* time, which killed a real
+// suggestion 1s after its 54th consecutive reasoning delta — the model was actively
+// thinking the whole time, never stalled (see the trace: 54 "thinking" events, 0 "answer",
+// then "context deadline exceeded" at exactly 120.163s). These guard the fix: the timeout
+// now measures the gap since the last delta, reset on every one, so a call that keeps
+// producing output — however slowly in aggregate — is never killed.
+
+func testImproveRequest() ImproveRequest {
+	return ImproveRequest{
+		PromptName:           "newsletter",
+		LabelName:            "News",
+		OriginalInstructions: "matches newsletters",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "hello", Excerpt: "world"}},
+	}
+}
+
+// TestImprovePromptInstructions_StallGuardResetsOnEveryDelta is the actual regression: a
+// steady trickle of deltas, each arriving well inside the budget but summing to far more
+// than it, must not be killed — the budget bounds silence, not total call time.
+func TestImprovePromptInstructions_StallGuardResetsOnEveryDelta(t *testing.T) {
+	budget := 50 * time.Millisecond
+	delay := 10 * time.Millisecond // 20 deltas * 10ms = 200ms total, 4x the budget
+
+	events := make([]types.ConverseStreamOutput, 0, 22)
+	for range 20 {
+		events = append(events, reasoningDeltaEvent("thinking... "))
+	}
+	events = append(events, textDeltaEvent("Match newsletters."), stopEvent(types.StopReasonEndTurn))
+
+	fake := &fakeConverseAPI{streamReaders: []func(context.Context) bedrockruntime.ConverseStreamOutputReader{
+		delayedStreamReader(events, delay),
+	}}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", improveStall: budget}
+
+	suggestion, _, err := cl.ImprovePromptInstructions(context.Background(), testImproveRequest(), nil)
+	if err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v, want the steady trickle of deltas to keep resetting the guard", err)
+	}
+	if suggestion != "Match newsletters." {
+		t.Errorf("suggestion = %q, want %q", suggestion, "Match newsletters.")
+	}
+}
+
+// TestImprovePromptInstructions_StallGuardFiresOnGenuineSilence is the guard's other half:
+// a call that produces nothing at all must still be killed, and the error must identify
+// the stall rather than surface as a bare context.Canceled.
+func TestImprovePromptInstructions_StallGuardFiresOnGenuineSilence(t *testing.T) {
+	budget := 20 * time.Millisecond
+	fake := &fakeConverseAPI{streamReaders: []func(context.Context) bedrockruntime.ConverseStreamOutputReader{
+		silentStreamReader(),
+	}}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", improveStall: budget}
+
+	start := time.Now()
+	_, _, err := cl.ImprovePromptInstructions(context.Background(), testImproveRequest(), nil)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("ImprovePromptInstructions took %v to fail, want well under a second for a %v budget", elapsed, budget)
+	}
+	if !errors.Is(err, errImproveStalled) {
+		t.Errorf("err = %v, want it to wrap errImproveStalled", err)
+	}
+}
+
+// TestImprovePromptInstructions_ParentCancellationNotMaskedAsStall checks the guard
+// doesn't swallow a real caller-driven cancellation (e.g. the improve worker's own
+// deadline margin, improve.go's improveWorkerMargin) and misreport it as a stall — the two
+// need to stay distinguishable so a genuinely stalled call and a legitimately expired
+// round don't look the same in the logs or the suggestion's stored failure message.
+func TestImprovePromptInstructions_ParentCancellationNotMaskedAsStall(t *testing.T) {
+	budget := 5 * time.Second // long enough that only the parent cancellation below fires
+	fake := &fakeConverseAPI{streamReaders: []func(context.Context) bedrockruntime.ConverseStreamOutputReader{
+		silentStreamReader(),
+	}}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", improveStall: budget}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, _, err := cl.ImprovePromptInstructions(ctx, testImproveRequest(), nil)
+	if errors.Is(err, errImproveStalled) {
+		t.Errorf("err = %v, want the parent's cancellation, not errImproveStalled", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+}
+
+// TestImprovePromptInstructions_RetryGetsItsOwnFreshGuard checks the stall guard is
+// per-attempt, not shared across the ValidationException retry (stream(nil) below): the
+// first attempt's guard must not still be armed (or already fired) against the retry's
+// own stream.
+func TestImprovePromptInstructions_RetryGetsItsOwnFreshGuard(t *testing.T) {
+	budget := 30 * time.Millisecond
+	settings := &fixedSettings{key: SettingImproveReasoningEffort, val: ReasoningEffortOn}
+	fake := &fakeConverseAPI{
+		// First call is rejected before streaming starts (a real ValidationException
+		// arrives this way) — instant, well inside budget.
+		streamErrs: []error{&types.ValidationException{Message: aws.String("unknown field reasoning_config")}},
+		// The retry's own stream trickles deltas slower than a total-120s-style cap could
+		// tolerate in aggregate, but each gap is inside budget — only passes if the retry
+		// got a fresh, unfired guard rather than reusing (or inheriting the state of) the
+		// first attempt's.
+		streamReaders: []func(context.Context) bedrockruntime.ConverseStreamOutputReader{
+			nil, // first call uses streamErrs above instead
+			delayedStreamReader([]types.ConverseStreamOutput{
+				reasoningDeltaEvent("thinking... "), reasoningDeltaEvent("thinking more... "),
+				textDeltaEvent("Match newsletters."), stopEvent(types.StopReasonEndTurn),
+			}, budget/2),
+		},
+	}
+	cl := &Client{br: fake, defaultModel: "zai.glm-5", settings: settings, improveStall: budget}
+
+	suggestion, _, err := cl.ImprovePromptInstructions(context.Background(), testImproveRequest(), nil)
+	if err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v, want the retry (with its own fresh guard) to succeed", err)
+	}
+	if len(fake.streamCalls) != 2 {
+		t.Fatalf("expected 2 ConverseStream calls (initial + retry), got %d", len(fake.streamCalls))
+	}
+	if suggestion != "Match newsletters." {
+		t.Errorf("suggestion = %q, want %q", suggestion, "Match newsletters.")
 	}
 }

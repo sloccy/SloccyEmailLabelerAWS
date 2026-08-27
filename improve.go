@@ -180,6 +180,17 @@ func finalizeFailure(ctx context.Context, store *db.Store, sid int64, cause erro
 	})
 }
 
+// terminalWriteCtx returns the context a *terminal* status write must use — the round's
+// own ctx may already be past its deadline (that's often exactly why a terminal write is
+// happening now, e.g. a stalled improve call that ran the round out its whole budget), so
+// the write is detached from it and given its own small budget rather than inheriting an
+// already-expired one. Scoped to terminal writes only: mid-round trace narration
+// (tw.Event elsewhere) should keep using the round's own ctx, since a cancelled round has
+// no business continuing to narrate.
+func terminalWriteCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+}
+
 // writeFailure stamps a terminal 'failed' status directly, bypassing the normal
 // improveAndFinalizeSuggestion path — used when something has gone wrong badly enough
 // (a panic, a blown deadline, a missing prompt row) that the normal path can't be trusted
@@ -187,7 +198,7 @@ func finalizeFailure(ctx context.Context, store *db.Store, sid int64, cause erro
 // called), so the write uses a fresh bounded context detached from it rather than
 // inheriting an already-expired one.
 func (r *improveRunner) writeFailure(ctx context.Context, tw *traceWriter, suggestionID int64, cause error) {
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	writeCtx, cancel := terminalWriteCtx(ctx)
 	defer cancel()
 	// The trace's error event is emitted after the status write, same reasoning as
 	// improveAndFinalizeSuggestion's done event: the trace poll's terminal signal must mean
@@ -868,8 +879,14 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 			tw.Event(ctx, db.TraceKindError, round, llmErr.Error())
 			if len(rounds) == 0 {
 				// Round 1 failing is fatal — there's no earlier candidate to fall back on,
-				// same as the single-shot version of this function always did.
-				if err := finalizeFailure(ctx, r.store, sid, llmErr); err != nil {
+				// same as the single-shot version of this function always did. Detached,
+				// bounded write ctx (see terminalWriteCtx): a stalled improve call can run
+				// the round's own ctx out to its deadline before returning this error, and
+				// the terminal status write must still land even then.
+				writeCtx, cancel := terminalWriteCtx(ctx)
+				err := finalizeFailure(writeCtx, r.store, sid, llmErr)
+				cancel()
+				if err != nil {
 					slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
 				}
 				return
@@ -963,7 +980,13 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	// trace poll's completion signal (see the trace endpoint, server.go) tells the browser
 	// it's safe to re-fetch the suggestion card, and that's only true once the terminal
 	// status has been written, not merely decided.
-	if err := r.store.FinalizePromptSuggestion(ctx, finalize); err != nil {
+	// Detached, bounded write ctx (see terminalWriteCtx): the round's own ctx may already be
+	// at (or past) its deadline here — e.g. a stalled round that ran the full budget before
+	// improveLoopStop finally gave up — and the terminal status write must still land.
+	writeCtx, cancel := terminalWriteCtx(ctx)
+	err := r.store.FinalizePromptSuggestion(writeCtx, finalize)
+	cancel()
+	if err != nil {
 		slog.Error("finalize suggestion failed", "suggestion_id", sid, "err", err)
 		tw.Event(ctx, db.TraceKindError, int64(bestN), "saved the suggestion but failed to record its final status: "+err.Error())
 		return
