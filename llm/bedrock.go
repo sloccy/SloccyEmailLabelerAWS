@@ -38,13 +38,58 @@ import (
 // second, so only a 30s margin is reserved for it rather than a full minute.
 const bedrockHTTPTimeout = 14*time.Minute + 30*time.Second
 
-// improveCallTimeout bounds a single ImprovePromptInstructions call. Unlike classify
-// (many short calls, fine to let bedrockHTTPTimeout be the only cap) or a queued flex-tier
-// request (genuinely needs minutes), one improve call is a single short rule rewrite —
-// this is the real latency cap for it, well under bedrockHTTPTimeout, so a stuck call
-// fails fast enough for the improve worker's own deadline margin (see improveWorkerMargin,
-// improve.go) to still have room to write a terminal status.
-const improveCallTimeout = 120 * time.Second
+// improveStallTimeout bounds how long one improve call may go WITHOUT producing a delta —
+// answer text or a reasoning block. It is reset on every delta, so a model that is actively
+// thinking is never killed mid-trace; only a genuinely stalled stream is.
+//
+// This used to be a *total* cap of the same 120s, which killed a real run 1s after its 54th
+// consecutive reasoning delta: with reasoning on (MaxTokens 16384, see stream below) the
+// improver legitimately thinks for minutes before writing its one-line answer, so a total
+// cap measures the wrong thing entirely. Absolute ceilings still bound the call above this —
+// the worker's own deadline (900s Lambda minus improveWorkerMargin, see improve.go) and
+// bedrockHTTPTimeout on the underlying HTTP client.
+const improveStallTimeout = 120 * time.Second
+
+// errImproveStalled is the cancellation cause a stall guard uses, so a stalled stream
+// surfaces as a diagnostic message on the suggestion card (via finalizeFailure,
+// improve.go) rather than a bare "context canceled" from the SDK.
+var errImproveStalled = errors.New("stalled")
+
+// withStallGuard derives a context from parent that is cancelled if reset isn't called at
+// least once every budget — the pattern static/app.js's builder SSE already uses
+// client-side ("fires only after 2 min of inactivity, not 2 min total"), applied here to
+// the server-side stream instead. stop must be deferred by the caller to release the timer
+// regardless of how the call ends.
+//
+// The mutex guards timer.Reset against AfterFunc's callback running concurrently on its
+// own goroutine: a reset racing a fire must never un-cancel an already-stalled context, so
+// firing is treated as terminal — resetLocked below is a no-op once fired.
+func withStallGuard(parent context.Context, budget time.Duration) (ctx context.Context, reset, stop func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+
+	var mu sync.Mutex
+	fired := false
+	timer := time.AfterFunc(budget, func() {
+		mu.Lock()
+		fired = true
+		mu.Unlock()
+		cancel(fmt.Errorf("%w: no output for %s", errImproveStalled, budget))
+	})
+
+	reset = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if fired {
+			return
+		}
+		timer.Reset(budget)
+	}
+	stop = func() {
+		timer.Stop()
+		cancel(nil)
+	}
+	return ctx, reset, stop
+}
 
 // replayCallTimeout bounds a single classify call inside ReplayAgainstExamples. Replay
 // fans out one call per example (up to ~30) concurrently; without a per-call cap, one
@@ -228,6 +273,20 @@ type Client struct {
 
 	defaultModel string
 	settings     Settings
+
+	// improveStall overrides improveStallTimeout when non-zero — used by tests to avoid a
+	// real 120s wait. NewClient leaves this zero; improveStallBudget falls back to the
+	// package const, since a zero-value Client (as most tests in this package construct
+	// directly, bypassing NewClient) must not mean "stall immediately."
+	improveStall time.Duration
+}
+
+// improveStallBudget resolves the stall budget for one ImprovePromptInstructions call.
+func (c *Client) improveStallBudget() time.Duration {
+	if c.improveStall > 0 {
+		return c.improveStall
+	}
+	return improveStallTimeout
 }
 
 // DefaultModel is the fallback Bedrock model id used only when nothing else specifies
@@ -1168,12 +1227,6 @@ func formatAttempts(attempts []AttemptRef) string {
 type ImproveSink func(StreamChunk)
 
 func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveRequest, sink ImproveSink) (string, []ChatMessage, error) {
-	// See improveCallTimeout's doc comment: this is the real latency cap for one improve
-	// call, tighter than the blanket bedrockHTTPTimeout the underlying HTTP client also
-	// enforces.
-	ctx, cancel := context.WithTimeout(ctx, improveCallTimeout)
-	defer cancel()
-
 	model := c.resolveModel(ctx, SettingImproveModel)
 	var msgs []types.Message
 
@@ -1244,7 +1297,30 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		if f != nil {
 			maxTokens = 16384
 		}
-		es, streamErr := c.br.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+
+		// A per-attempt stall guard, not one shared across both the initial call and the
+		// ValidationException retry below (stream(nil)) — a guard shared across both would
+		// hand the retry a context this attempt had already cancelled. Reset on every delta
+		// (see the drain callbacks below) rather than bounding total call time: reasoning
+		// models legitimately think for minutes before writing their answer (see
+		// improveStallTimeout's doc comment), so only a genuine stall — no output at all —
+		// should abort the call.
+		stallCtx, resetStall, stopStall := withStallGuard(ctx, c.improveStallBudget())
+		defer stopStall()
+
+		// asStallErr maps err to the stall guard's own cause once it has fired — covering
+		// both a stall while the request is still being established (ConverseStream itself
+		// never returns) and a stall mid-drain (no delta arrives) — so either case surfaces
+		// as errImproveStalled instead of the SDK's bare wrapped context.Canceled.
+		asStallErr := func(err error) error {
+			if err != nil && errors.Is(context.Cause(stallCtx), errImproveStalled) {
+				slog.Warn("improve call stalled, no output within budget", "model", model, "effort", effort, "tier", tier, "budget", c.improveStallBudget())
+				return context.Cause(stallCtx)
+			}
+			return err
+		}
+
+		es, streamErr := c.br.ConverseStream(stallCtx, &bedrockruntime.ConverseStreamInput{
 			ModelId:  aws.String(model),
 			System:   sys,
 			Messages: msgs,
@@ -1257,7 +1333,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			RequestMetadata:              requestMetadataFor("improve"),
 		})
 		if streamErr != nil {
-			return "", "", false, streamErr
+			return "", "", false, asStallErr(streamErr)
 		}
 		defer func() { _ = es.Close() }()
 
@@ -1266,16 +1342,18 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			func(text string) error {
 				sb.WriteString(text)
 				emitted = true
+				resetStall()
 				emit(StreamChunk{Text: text})
 				return nil
 			},
 			func(reasoning string) error {
 				emitted = true
+				resetStall()
 				emit(StreamChunk{Reasoning: reasoning})
 				return nil
 			},
 		)
-		return sb.String(), stopReason, emitted, err
+		return sb.String(), stopReason, emitted, asStallErr(err)
 	}
 
 	answer, stopReason, emitted, err := stream(fields)

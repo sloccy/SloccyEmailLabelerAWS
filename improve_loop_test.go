@@ -217,3 +217,43 @@ func TestBuildReplayFeedbackTurn_OutOfRangeIndexSkippedNotPanicked(t *testing.T)
 		t.Errorf("expected the out-of-range failures to be skipped, not mapped to an unrelated example: %s", turn)
 	}
 }
+
+// ============================================================
+// terminalWriteCtx
+// ============================================================
+
+// TestTerminalWriteCtx_DetachedFromParentCancellation guards the reason this exists: a
+// terminal status write (finalizeFailure / FinalizePromptSuggestion) can be reached exactly
+// because the round's own ctx already expired or was cancelled — e.g. llm's stall guard
+// firing (see llm.errImproveStalled) after running the round's whole budget — so the write
+// itself must not inherit that cancellation, or it would fail before ever landing the
+// status the suggestion needs to leave "generating".
+func TestTerminalWriteCtx_DetachedFromParentCancellation(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	cancel() // simulate an already-expired/cancelled round ctx
+
+	writeCtx, writeCancel := terminalWriteCtx(parent)
+	defer writeCancel()
+
+	select {
+	case <-writeCtx.Done():
+		t.Fatal("terminalWriteCtx's context is already done — it inherited the parent's cancellation instead of detaching from it")
+	default:
+	}
+}
+
+// TestTerminalWriteCtx_HasABoundedDeadline checks the write still can't hang forever even
+// though it's detached from the parent — same reasoning writeFailure's doc comment already
+// gave for the 10s budget it used inline before this helper existed.
+func TestTerminalWriteCtx_HasABoundedDeadline(t *testing.T) {
+	writeCtx, cancel := terminalWriteCtx(context.Background())
+	defer cancel()
+
+	dl, ok := writeCtx.Deadline()
+	if !ok {
+		t.Fatal("terminalWriteCtx's context has no deadline — a terminal write must still be bounded")
+	}
+	if remaining := time.Until(dl); remaining <= 0 || remaining > 10*time.Second {
+		t.Errorf("terminalWriteCtx deadline = %v from now, want (0, 10s]", remaining)
+	}
+}
