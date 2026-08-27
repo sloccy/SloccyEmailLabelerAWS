@@ -213,12 +213,6 @@ func (s *FakeStore) BatchInsertProcessingResults(_ context.Context, r Processing
 		}
 		s.history = append(s.history, entry)
 	}
-	ts := Now()
-	for _, e := range r.Examples {
-		e.ID = s.nextID("examples")
-		e.CreatedAt = ts
-		s.examples = append(s.examples, &e)
-	}
 	if r.Confirm {
 		if s.processed[r.AccountID] == nil {
 			s.processed[r.AccountID] = make(map[string]time.Time)

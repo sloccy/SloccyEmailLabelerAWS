@@ -67,38 +67,60 @@ type promptCheckbox struct {
 	Checked bool
 }
 
-// singleRecategorizeVerdicts computes, for a single-email recategorization, which prompts
-// get a permanent example recorded and what verdict each gets. This mirrors the checkbox
-// state the user actually saw in recategorize_form.html: a rule left checked before and
-// after is a genuine affirmation (confirmed_positive) because the user looked at an
-// explicit checkbox for it and chose to leave it checked. A rule left unchecked before and
-// after says nothing — the user never affirmed or denied it — so it records nothing.
-// Compare bulkRecategorizeVerdict, whose table differs because a bulk "apply to all" /
-// "remove from all" action isn't a per-email review and can't imply the same affirmation.
-func singleRecategorizeVerdicts(currentIDs, requestedIDs map[int64]bool, addedIDs, removedIDs []int64) map[int64]string {
-	verdicts := make(map[int64]string, len(addedIDs)+len(removedIDs)+len(currentIDs))
-	for pid := range currentIDs {
-		if requestedIDs[pid] {
-			verdicts[pid] = db.VerdictConfirmedPositive
+// exampleVerdict is one rule's outcome for one reviewed email: which of the two buckets it
+// belongs in, and whether the user actually changed this rule's checkbox (a real correction)
+// versus left it as it was (a plain confirmation). See db.PromptExample.Missed.
+type exampleVerdict struct {
+	Verdict string
+	Missed  bool
+}
+
+// singleRecategorizeVerdicts computes, for a single-email recategorization, an
+// exampleVerdict for *every* active prompt on the account — not just the ones the user
+// touched. This mirrors the full checkbox state the user actually saw in
+// recategorize_form.html: every rule on that form got an explicit checked/unchecked
+// decision, so every rule's post-correction state is real signal, whether or not it
+// changed. Compare bulkVerdictsAndPlan, whose table only covers rules the user explicitly
+// pointed at, because a bulk "apply to all" / "remove from all" action isn't a per-email
+// review and doesn't put every rule in front of the user the way this form does.
+func singleRecategorizeVerdicts(allPromptIDs []int64, currentIDs, requestedIDs map[int64]bool) map[int64]exampleVerdict {
+	verdicts := make(map[int64]exampleVerdict, len(allPromptIDs))
+	for _, pid := range allPromptIDs {
+		was, is := currentIDs[pid], requestedIDs[pid]
+		v := exampleVerdict{Missed: was != is}
+		if is {
+			v.Verdict = db.VerdictConfirmedPositive
+		} else {
+			v.Verdict = db.VerdictConfirmedNegative
 		}
-	}
-	for _, pid := range addedIDs {
-		verdicts[pid] = db.VerdictFalseNegative
-	}
-	for _, pid := range removedIDs {
-		verdicts[pid] = db.VerdictFalsePositive
+		verdicts[pid] = v
 	}
 	return verdicts
 }
 
-// incrementVersionObservedFor updates each example's PromptVersion with what it actually
-// turned out to be — a false_positive/false_negative correction is one more piece of
-// production evidence against whatever rule text was live when the mismatched email came
-// in (see db.PromptVersion.ObservedFP/ObservedFN). confirmed_positive examples are skipped
-// by IncrementVersionObservedBy itself, not filtered here, so this can just iterate every
-// example unconditionally.
+// exampleTriggerKind maps one example's (Verdict, Missed) pair to the TriggerKind* value
+// IncrementVersionObservedBy expects, or "" for a plain affirmation (Missed == false) —
+// there's nothing to attribute to the version ledger when the rule already had it right.
+// A rule that should have matched and didn't (confirmed_positive, missed) is a false
+// negative; a rule that shouldn't have matched but did (confirmed_negative, missed) is a
+// false positive.
+func exampleTriggerKind(ex db.PromptExample) string {
+	if !ex.Missed {
+		return ""
+	}
+	if ex.Verdict == db.VerdictConfirmedPositive {
+		return db.TriggerKindFalseNegative
+	}
+	return db.TriggerKindFalsePositive
+}
+
+// incrementVersionObservedFor updates each Missed example's PromptVersion with what it
+// actually turned out to be — one more piece of production evidence against whatever rule
+// text was live when the mismatched email came in (see db.PromptVersion.ObservedFP/
+// ObservedFN). Plain affirmations (Missed == false) are skipped via exampleTriggerKind
+// returning "", not filtered here, so this can just iterate every example unconditionally.
 //
-// Examples sharing the same (promptID, versionID, verdict) — routine from the bulk
+// Examples sharing the same (promptID, versionID, kind) — routine from the bulk
 // recategorize path, where the same rule version is touched by many messages in one action
 // — are aggregated into a single ADD update for their combined count, rather than one
 // UpdateItem per example; a 50-email bulk action touching a handful of rules costs a
@@ -106,51 +128,55 @@ func singleRecategorizeVerdicts(currentIDs, requestedIDs map[int64]bool, addedID
 // (matches IncrementVersionObservedBy's own doc comment) — bookkeeping for a future improve
 // round must never be able to slow down or fail a correction the user is actively waiting on.
 func incrementVersionObservedFor(ctx context.Context, store versionObserver, examples []db.PromptExample) {
-	type versionVerdict struct {
+	type versionKind struct {
 		promptID, versionID int64
-		verdict             string
+		kind                string
 	}
-	counts := make(map[versionVerdict]int64, len(examples))
+	counts := make(map[versionKind]int64, len(examples))
 	for _, ex := range examples {
-		counts[versionVerdict{ex.PromptID, ex.PromptVersionID, ex.Verdict}]++
+		kind := exampleTriggerKind(ex)
+		if kind == "" {
+			continue
+		}
+		counts[versionKind{ex.PromptID, ex.PromptVersionID, kind}]++
 	}
 	for k, n := range counts {
-		store.IncrementVersionObservedBy(ctx, k.promptID, k.versionID, k.verdict, n)
+		store.IncrementVersionObservedBy(ctx, k.promptID, k.versionID, k.kind, n)
 	}
 }
 
 // versionObserver is the one method incrementVersionObservedFor needs — declared locally
 // so a test can supply a trivial fake without pulling in the rest of db.Store's surface.
 type versionObserver interface {
-	IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, verdict string, n int64)
+	IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, kind string, n int64)
 }
 
-// buildPromptExamples turns a promptID->verdict map into example rows ready for
+// buildPromptExamples turns a promptID->exampleVerdict map into example rows ready for
 // InsertPromptExamples. Every row from one recategorization shares the same email metadata
 // (account/message/sender/subject/excerpt/note) — they all describe the same underlying
-// correction, just from a different rule's point of view. promptByID stamps each example
+// review, just from a different rule's point of view. promptByID stamps each example
 // with the rule's CurrentVersionID — which text actually produced this verdict — so a
 // later improve round can attribute a recurring problem to the version that caused it (see
 // db.PromptExample.PromptVersionID/Recurred). A promptID missing from promptByID (shouldn't
 // happen — the caller builds it from the same prompts the verdict map was computed against)
 // just stamps 0, same as a pre-ledger example.
-func buildPromptExamples(accountID int64, messageID, sender, subject, excerpt, note string, verdicts map[int64]string, promptByID map[int64]db.Prompt) []db.PromptExample {
+func buildPromptExamples(accountID int64, messageID, sender, subject, excerpt, note string, verdicts map[int64]exampleVerdict, promptByID map[int64]db.Prompt) []db.PromptExample {
 	if len(verdicts) == 0 {
 		return nil
 	}
 	examples := make([]db.PromptExample, 0, len(verdicts))
-	for promptID, verdict := range verdicts {
+	for promptID, v := range verdicts {
 		examples = append(examples, db.PromptExample{
 			PromptID:        promptID,
 			AccountID:       accountID,
 			MessageID:       messageID,
-			Verdict:         verdict,
+			Verdict:         v.Verdict,
+			Missed:          v.Missed,
 			Sender:          sender,
 			Subject:         subject,
 			BodyExcerpt:     excerpt,
 			Note:            note,
 			PromptVersionID: promptByID[promptID].CurrentVersionID,
-			Source:          db.ExampleSourceManual,
 		})
 	}
 	return examples
@@ -220,8 +246,10 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	// Load all prompts for this account (to get labels + actions)
 	allPrompts, _ := s.store.ListActivePromptsForAccount(ctx, row.AccountID)
 	promptByID := make(map[int64]db.Prompt, len(allPrompts))
-	for _, p := range allPrompts {
+	allPromptIDs := make([]int64, len(allPrompts))
+	for i, p := range allPrompts {
 		promptByID[p.ID] = p
+		allPromptIDs[i] = p.ID
 	}
 
 	// Compute diffs. keptIDs (prompts requested and already current) is derived here
@@ -252,11 +280,11 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 
 	s.applyRecategorizeToGmail(ctx, svc, []string{row.MessageID}, promptByID, addedIDs, removedIDs)
 
-	// Record permanent examples for every rule this correction touched or affirmed — see
-	// singleRecategorizeVerdicts for the exact table. This is the corpus AI prompt
-	// improvement now draws from (selectExamplesForImprove, improve.go), instead of seeing only whatever
-	// single email triggered the current round.
-	verdicts := singleRecategorizeVerdicts(currentIDs, requested, addedIDs, removedIDs)
+	// Record a permanent example for every active rule on the account, not just the ones
+	// this correction touched — see singleRecategorizeVerdicts for the exact table. This is
+	// the corpus AI prompt improvement now draws from (selectExamplesForImprove,
+	// improve.go), instead of seeing only whatever single email triggered the current round.
+	verdicts := singleRecategorizeVerdicts(allPromptIDs, currentIDs, requested)
 	var msg gmail.Message
 	haveMsg := false
 	if svc != nil && (len(verdicts) > 0 || len(improveSet) > 0) {
@@ -321,6 +349,81 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		"refreshSuggestions":          "1",
 	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+}
+
+// handleConfirmCategorization is the "the labeling is already right" counterpart to
+// handleRecategorize: it records the message's current prompt-match state as a confirmed
+// example for every active rule on the account, without touching Gmail, history, or
+// suggestions. This is how a user builds up the improve corpus for emails that were
+// already labeled correctly — recategorizing them would be a no-op diff that (before this
+// handler existed) recorded nothing at all.
+func (s *server) handleConfirmCategorization(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	row, err := s.store.GetHistoryRow(ctx, id)
+	if err != nil {
+		http.Error(w, "history row not found", http.StatusNotFound)
+		return
+	}
+	s.confirmCategorization(ctx, row.AccountID, row.MessageID, row.Sender, row.Subject)
+	setHxTrigger(w, map[string]any{
+		triggerShowToast: map[string]any{toastKeyMessage: "Categorization confirmed", jsonKeyType: toastTypeSuccess},
+	})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+}
+
+// confirmCategorization records accountID/messageID's current prompt-match state as a
+// confirmed example for every active rule on the account — every currently-applied prompt
+// gets confirmed_positive, every other active prompt gets confirmed_negative, all with
+// Missed: false, since nothing here was actually corrected. Shared by the single (see
+// handleConfirmCategorization above) and bulk (recategorize_bulk.go) confirm handlers.
+// Unlike handleRecategorize, a failed message fetch doesn't cancel the write — sender/
+// subject from the history row are still useful signal even with an empty body excerpt,
+// matching the bulk recategorize path's own tolerance for a missing excerpt (see
+// fetchExcerptsBounded, recategorize_bulk.go).
+func (s *server) confirmCategorization(ctx context.Context, accountID int64, messageID, fallbackSender, fallbackSubject string) {
+	currentIDs, err := s.store.GetCurrentPromptIDsForMessage(ctx, accountID, messageID)
+	if err != nil {
+		currentIDs = map[int64]bool{}
+	}
+	allPrompts, _ := s.store.ListActivePromptsForAccount(ctx, accountID)
+	if len(allPrompts) == 0 {
+		return
+	}
+	promptByID := make(map[int64]db.Prompt, len(allPrompts))
+	allPromptIDs := make([]int64, len(allPrompts))
+	for i, p := range allPrompts {
+		promptByID[p.ID] = p
+		allPromptIDs[i] = p.ID
+	}
+	verdicts := singleRecategorizeVerdicts(allPromptIDs, currentIDs, currentIDs)
+
+	sender, subject, excerpt := fallbackSender, fallbackSubject, ""
+	account, gmailErr := s.store.GetAccount(ctx, accountID)
+	if gmailErr == nil && accountID != 0 {
+		if svc, err := s.gmailServiceFor(ctx, account); err == nil {
+			if m, err := gmail.FetchMessage(ctx, svc, messageID, 0); err == nil {
+				if m.Sender != "" {
+					sender = m.Sender
+				}
+				if m.Subject != "" {
+					subject = m.Subject
+				}
+				excerpt = gmail.CollapseExcerpt(m.Body, db.ExampleExcerptRunes)
+			} else {
+				slog.Error("confirm categorization: fetch message for examples", "err", err)
+			}
+		}
+	}
+
+	examples := buildPromptExamples(accountID, messageID, sender, subject, excerpt, "", verdicts, promptByID)
+	if err := s.store.InsertPromptExamples(ctx, examples); err != nil {
+		slog.Error("confirm categorization: insert prompt examples", "err", err)
+	}
+	incrementVersionObservedFor(ctx, s.store, examples)
 }
 
 // applyRecategorizeToGmail pushes an add/remove prompt diff to Gmail for messageIDs: it

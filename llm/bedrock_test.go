@@ -728,7 +728,7 @@ func TestBuildImproveUserTurn_EmptyCorpusStaysCoherent(t *testing.T) {
 	if !strings.Contains(turn, "Matches newsletters from SaaS products.") {
 		t.Errorf("missing current instructions: %q", turn)
 	}
-	for _, heading := range []string{"SHOULD MATCH", "SHOULD NOT MATCH", "ALREADY CORRECT", "USER NOTE"} {
+	for _, heading := range []string{"SHOULD MATCH", "SHOULD NOT MATCH", "USER NOTE"} {
 		if strings.Contains(turn, heading) {
 			t.Errorf("empty section heading %q should be omitted entirely, got: %q", heading, turn)
 		}
@@ -740,20 +740,21 @@ func TestBuildImproveUserTurn_RendersPopulatedSections(t *testing.T) {
 		PromptName:           "Newsletters",
 		LabelName:            "News",
 		OriginalInstructions: "Matches newsletters.",
-		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "Weekly digest", Excerpt: "top stories this week"}},
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "Weekly digest", Excerpt: "top stories this week", Missed: true}},
 		ShouldNotMatch:       []ExampleRef{{Sender: "b@example.com", Subject: "Your receipt", Excerpt: "payment confirmed"}},
-		AlreadyCorrect:       []ExampleRef{{Sender: "c@example.com", Subject: "Product update", Excerpt: "new features"}},
 		UserNote:             "these are spam, not receipts",
 	})
 	for _, want := range []string{
-		"SHOULD MATCH", "a@example.com", "Weekly digest",
+		"SHOULD MATCH", "[MISSED] a@example.com", "Weekly digest",
 		"SHOULD NOT MATCH", "b@example.com", "Your receipt",
-		"ALREADY CORRECT", "c@example.com", "Product update",
 		"USER NOTE: these are spam, not receipts",
 	} {
 		if !strings.Contains(turn, want) {
 			t.Errorf("expected user turn to contain %q, got: %q", want, turn)
 		}
+	}
+	if strings.Contains(turn, "[MISSED] b@example.com") {
+		t.Errorf("non-missed example must not be prefixed, got: %q", turn)
 	}
 }
 

@@ -172,8 +172,8 @@ func TestBuildReplayFeedbackTurn(t *testing.T) {
 	replay := llm.ReplayResult{
 		Total: 5, Passed: 3,
 		Failures: []llm.ReplayFailure{
-			{Verdict: db.VerdictFalsePositive, Got: true, ExampleIndex: 0},  // wrongly matched
-			{Verdict: db.VerdictFalseNegative, Got: false, ExampleIndex: 1}, // wrongly missed
+			{Verdict: db.VerdictConfirmedNegative, Got: true, ExampleIndex: 0},  // wrongly matched
+			{Verdict: db.VerdictConfirmedPositive, Got: false, ExampleIndex: 1}, // wrongly missed
 		},
 	}
 

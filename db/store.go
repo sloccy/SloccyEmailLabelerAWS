@@ -1300,42 +1300,43 @@ func (s *Store) ListPromptVersions(ctx context.Context, promptID int64, limit in
 }
 
 // IncrementVersionObserved adds one to a version's ObservedFP or ObservedFN count — called
-// when a recategorization records a false_positive/false_negative example, using the
-// version that was live at the time (db.PromptExample.PromptVersionID). This is what lets
-// a later improve round see not just how a version scored in the replay "lab" but how it
-// actually did once real mail started arriving against it. versionID == 0 (an example
-// written before the ledger existed, or against a prompt that predates it) is a silent
-// no-op, not an error — there's nothing to attribute it to. verdict must be
-// VerdictFalsePositive or VerdictFalseNegative; anything else (VerdictConfirmedPositive) is
-// also a no-op, since a confirmation isn't a problem to track here. Best-effort, same
-// reasoning MarkExamplesResolved's own doc comment gives: this is bookkeeping for a future
-// improve round, not the primary effect of recording a correction, so it must never be
-// able to block one.
-func (s *Store) IncrementVersionObserved(ctx context.Context, promptID, versionID int64, verdict string) {
-	s.IncrementVersionObservedBy(ctx, promptID, versionID, verdict, 1)
+// when a recategorization records a Missed example, using the version that was live at the
+// time (db.PromptExample.PromptVersionID). This is what lets a later improve round see not
+// just how a version scored in the replay "lab" but how it actually did once real mail
+// started arriving against it. versionID == 0 (an example written before the ledger
+// existed, or against a prompt that predates it) is a silent no-op, not an error — there's
+// nothing to attribute it to. kind must be TriggerKindFalsePositive or
+// TriggerKindFalseNegative; anything else is also a no-op. Best-effort, same reasoning
+// MarkExamplesResolved's own doc comment gives: this is bookkeeping for a future improve
+// round, not the primary effect of recording a correction, so it must never be able to
+// block one.
+func (s *Store) IncrementVersionObserved(ctx context.Context, promptID, versionID int64, kind string) {
+	s.IncrementVersionObservedBy(ctx, promptID, versionID, kind, 1)
 }
 
 // IncrementVersionObservedBy adds n (rather than a fixed 1) to the false_positive/
 // false_negative observed counter for one prompt version — lets a caller that's already
-// aggregated several examples sharing the same (promptID, versionID, verdict) issue one ADD
-// update for the total instead of one UpdateItem per example (see incrementVersionObservedFor,
-// recategorize.go, for the aggregating caller).
-func (s *Store) IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, verdict string, n int64) {
+// aggregated several Missed examples sharing the same (promptID, versionID, kind) issue one
+// ADD update for the total instead of one UpdateItem per example (see
+// incrementVersionObservedFor, recategorize.go, for the aggregating caller, which maps each
+// example's (Verdict, Missed) pair to the TriggerKind* value passed here — a plain
+// affirmation, Missed == false, never reaches this function at all).
+func (s *Store) IncrementVersionObservedBy(ctx context.Context, promptID, versionID int64, kind string, n int64) {
 	if versionID == 0 || n <= 0 {
 		return
 	}
 	var attr string
-	switch verdict {
-	case VerdictFalsePositive:
+	switch kind {
+	case TriggerKindFalsePositive:
 		attr = "observedFp"
-	case VerdictFalseNegative:
+	case TriggerKindFalseNegative:
 		attr = "observedFn"
 	default:
 		return
 	}
 	if err := s.updateItem(ctx, pkPromptVersion(promptID), padID(versionID),
 		"ADD "+attr+" :n", nil, map[string]types.AttributeValue{":n": nv(n)}); err != nil {
-		slog.Error("increment version observed", "prompt_id", promptID, "version_id", versionID, "verdict", verdict, "n", n, "err", err)
+		slog.Error("increment version observed", "prompt_id", promptID, "version_id", versionID, "kind", kind, "n", n, "err", err)
 	}
 }
 
@@ -2075,37 +2076,29 @@ func (s *Store) DeleteProcessedEmailsByAccount(ctx context.Context, accountID in
 }
 
 // ProcessingResults is one email's worth of DynamoDB writes for BatchInsertProcessingResults:
-// log lines, history entries, and (passively-confirmed) prompt examples, plus whether to
-// fold in the confirmed "PROC#" marker for MessageID. Confirm is explicit — processor's
-// LLM-error retry path needs to write logs/history without touching the claim (that
-// decision belongs to a separate ReleaseClaim call instead), which used to be expressed by
-// passing "" for MessageID rather than naming the intent directly.
+// log lines and history entries, plus whether to fold in the confirmed "PROC#" marker for
+// MessageID. Confirm is explicit — processor's LLM-error retry path needs to write
+// logs/history without touching the claim (that decision belongs to a separate ReleaseClaim
+// call instead), which used to be expressed by passing "" for MessageID rather than naming
+// the intent directly.
 type ProcessingResults struct {
 	Logs      []LogEntry
 	History   []HistoryEntry
-	Examples  []PromptExample
 	AccountID int64
 	MessageID string
 	Confirm   bool
 }
 
-// BatchInsertProcessingResults writes one email's worth of log lines, history entries, and
-// (passively-confirmed) prompt examples in a single batched write. IDs come from localIDs
-// for every entity here — a process-local, no-round-trip generator, not the atomic nextIDs
-// counter — since each entity's SK already carries a real timestamp for ordering, so the id
-// only needs to be unique, not globally sequential (see localID's doc comment). That's what
-// keeps this call to exactly one BatchWriteItem call per 25 items total, regardless of how
-// many of Logs/History/Examples are non-empty, instead of a counter round trip per entity.
-//
-// Examples is usually just the confirmed_positive rows for whichever prompts this email
-// matched (processor.processEmail) — every email a rule matches and the user never corrects
-// becomes evidence the rule is right about it. Folding them into this same call (rather than
-// a separate InsertPromptExamples call per email) is deliberate: it means passive
-// confirmation adds zero extra DynamoDB API calls per email, only more items in the same
-// existing batch.
+// BatchInsertProcessingResults writes one email's worth of log lines and history entries in
+// a single batched write. IDs come from localIDs for every entity here — a process-local,
+// no-round-trip generator, not the atomic nextIDs counter — since each entity's SK already
+// carries a real timestamp for ordering, so the id only needs to be unique, not globally
+// sequential (see localID's doc comment). That's what keeps this call to exactly one
+// BatchWriteItem call per 25 items total, regardless of how many of Logs/History are
+// non-empty, instead of a counter round trip per entity.
 func (s *Store) BatchInsertProcessingResults(ctx context.Context, r ProcessingResults) error {
 	ts := Now()
-	items := make([]map[string]types.AttributeValue, 0, len(r.Logs)+len(r.History)+len(r.Examples))
+	items := make([]map[string]types.AttributeValue, 0, len(r.Logs)+len(r.History))
 
 	if len(r.Logs) > 0 {
 		ids := localIDs(len(r.Logs))
@@ -2117,14 +2110,6 @@ func (s *Store) BatchInsertProcessingResults(ctx context.Context, r ProcessingRe
 		ids := localIDs(len(r.History))
 		for i, h := range r.History {
 			items = append(items, historyItem(ids[i], ts, h))
-		}
-	}
-	if len(r.Examples) > 0 {
-		ids := localIDs(len(r.Examples))
-		for i, e := range r.Examples {
-			e.ID = ids[i]
-			e.CreatedAt = ts
-			items = append(items, promptExampleItem(e))
 		}
 	}
 	if r.Confirm {
@@ -2381,14 +2366,13 @@ func (s *Store) InsertEmailCorrections(ctx context.Context, args []InsertEmailCo
 // Prompt examples
 // ============================================================
 //
-// Growth and retention: examples are written from two sources — the recategorize handlers
-// (any verdict, on manual correction) and processor.processEmail (confirmed_positive only,
-// on every ordinary classify match — see BatchInsertProcessingResults). Even at a heavy 200
-// matched-emails/day of passive confirmation, storage grows by roughly
-// 200 × 800B × 365 ≈ 58MB/year — still trivial against the 25GB free-tier allowance — and
-// read cost is unaffected by corpus size either way, since ListExamplesByVerdict is always
+// Growth and retention: examples are written from one source — a human reviewing an email
+// on the history page (recategorize or confirm, single or bulk; see
+// db/models.go's PromptExample doc comment). Write volume is bounded by review pace, not
+// scan volume, so storage growth is trivial against the 25GB free-tier allowance and read
+// cost is unaffected by corpus size either way, since ListExamplesByVerdict is always
 // Limit-bounded regardless of how much has accumulated. So there's still no TTL here — but
-// there IS now a daily active trim: prunePromptExamples (prune.go), run once per scheduled
+// there IS still a daily active trim: prunePromptExamples (prune.go), run once per scheduled
 // scan, deletes whatever a prompt's example-selection sampler (improve.go's sampleVerdict)
 // would never actually pick, via DeletePromptExamples below, keeping each verdict's corpus
 // bounded to roughly 2x the replay-validation cap instead of growing forever. The
@@ -2470,9 +2454,8 @@ func (s *Store) ListExamplesByVerdict(ctx context.Context, promptID int64, verdi
 // badges). Select: COUNT reads only key attributes, not full items; paginates like queryAll
 // since a single Query page caps at ~1MB and a long-lived rule could exceed that.
 func (s *Store) CountExamplesByVerdict(ctx context.Context, promptID int64) (map[string]int64, error) {
-	verdicts := []string{VerdictFalsePositive, VerdictFalseNegative, VerdictConfirmedPositive}
-	counts := make(map[string]int64, len(verdicts))
-	for _, v := range verdicts {
+	counts := make(map[string]int64, len(VerdictOrder))
+	for _, v := range VerdictOrder {
 		var total int64
 		var start map[string]types.AttributeValue
 		for {

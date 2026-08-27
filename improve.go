@@ -209,23 +209,15 @@ func (r *improveRunner) writeFailure(ctx context.Context, tw *traceWriter, sugge
 	tw.Event(writeCtx, db.TraceKindError, 0, cause.Error())
 }
 
-// rawLimitForVerdict bounds how many rows gatherRawExamples pulls per verdict before any
-// sampling happens. confirmed_positive gets a much wider window than the other two:
-// passive confirmation (processor.processEmail) writes one on every ordinary classify
-// match, not just on a manual correction, so it can grow far faster than
-// false_negative/false_positive — sampleExamples needs a wide enough raw pool to actually
-// find diverse manual/recurring rows before a wall of recent passive confirms would
-// otherwise fill the window on its own. Both limits are cheap regardless of corpus size:
-// ListExamplesByVerdict's cost is bounded by the Limit passed in, not by how large the
-// partition has grown.
-func rawLimitForVerdict(verdict string) int32 {
-	if verdict == db.VerdictConfirmedPositive {
-		return 200
-	}
-	return 60
-}
+// rawExampleLimit bounds how many rows gatherRawExamples pulls per verdict before any
+// sampling happens. Both verdicts share one limit now: every example comes from an explicit
+// human review (recategorize or confirm), so there's no passive write source that grows one
+// verdict faster than the other the way the old confirmed_positive-only auto-confirmation
+// did. Cheap regardless of corpus size either way: ListExamplesByVerdict's cost is bounded
+// by the Limit passed in, not by how large the partition has grown.
+const rawExampleLimit = 120
 
-// gatherRawExamples reads a rule's whole raw example window (see rawLimitForVerdict),
+// gatherRawExamples reads a rule's whole raw example window (see rawExampleLimit),
 // marks recurrences, drops resolved rows, and collapses the same message appearing under
 // more than one verdict down to its newest occurrence. This is the shared foundation
 // everything downstream samples from at whatever cap fits its purpose: selectExamplesForImprove
@@ -236,7 +228,7 @@ func rawLimitForVerdict(verdict string) int32 {
 func gatherRawExamples(ctx context.Context, store *db.Store, promptID int64) []db.PromptExample {
 	var all []db.PromptExample
 	for _, v := range db.VerdictOrder {
-		examples, err := store.ListExamplesByVerdict(ctx, promptID, v, rawLimitForVerdict(v))
+		examples, err := store.ListExamplesByVerdict(ctx, promptID, v, rawExampleLimit)
 		if err != nil {
 			slog.Error("gather raw examples", "prompt_id", promptID, "verdict", v, "err", err)
 			continue
@@ -344,15 +336,15 @@ func senderSubjectKey(sender, subject string) string {
 // sender+subject pairs in recency order" dedup, which converges on whichever few senders
 // happen to be freshest rather than actually spreading across what the corpus contains.
 // Independently per verdict, three priority tiers fill the budget in order (see
-// sampleVerdict): examples that recurred after a prior fix, then manually-reviewed
-// examples, then passively-confirmed ones — each of the latter two round-robinned across
-// sender+subject buckets rather than taken newest-first. See db.PromptExample.Source and
-// .Recurred for what feeds the tiering.
+// sampleVerdict): examples that recurred after a prior fix, then examples the rule actually
+// got wrong (Missed), then plain confirmations — each of the latter two round-robinned
+// across sender+subject buckets rather than taken newest-first. See
+// db.PromptExample.Missed/.Recurred for what feeds the tiering.
 func sampleExamples(examples []db.PromptExample, perVerdictCap int) []db.PromptExample {
 	if perVerdictCap <= 0 {
 		return nil
 	}
-	byVerdict := make(map[string][]db.PromptExample, 3)
+	byVerdict := make(map[string][]db.PromptExample, len(db.VerdictOrder))
 	for _, ex := range examples {
 		byVerdict[ex.Verdict] = append(byVerdict[ex.Verdict], ex)
 	}
@@ -376,18 +368,15 @@ func recurredBudget(perVerdictCap int) int {
 // sampleVerdict applies the three-tier policy (see sampleExamples) to one verdict's
 // candidates, which must already be newest-first (gatherRawExamples' contract).
 func sampleVerdict(candidates []db.PromptExample, verdictCap int) []db.PromptExample {
-	var recurred, manual, passive []db.PromptExample
+	var recurred, missed, confirmed []db.PromptExample
 	for _, ex := range candidates {
 		switch {
 		case ex.Recurred:
 			recurred = append(recurred, ex)
-		case ex.Source == db.ExampleSourceManual:
-			manual = append(manual, ex)
+		case ex.Missed:
+			missed = append(missed, ex)
 		default:
-			// Passive, or "" for a row written before Source tracking existed — treated the
-			// same as passive: neither carries the "a human explicitly reviewed this" signal
-			// manual does.
-			passive = append(passive, ex)
+			confirmed = append(confirmed, ex)
 		}
 	}
 
@@ -399,8 +388,8 @@ func sampleVerdict(candidates []db.PromptExample, verdictCap int) []db.PromptExa
 		}
 		out = append(out, ex)
 	}
-	out = append(out, roundRobinBySender(manual, verdictCap-len(out))...)
-	out = append(out, roundRobinBySender(passive, verdictCap-len(out))...)
+	out = append(out, roundRobinBySender(missed, verdictCap-len(out))...)
+	out = append(out, roundRobinBySender(confirmed, verdictCap-len(out))...)
 	return out
 }
 
@@ -569,17 +558,16 @@ func filterResolved(examples []db.PromptExample) []db.PromptExample {
 	return out
 }
 
-// problemExampleKeys picks out the false_negative/false_positive entries from examples —
-// the "problems" a suggestion built from them is meant to fix — and returns enough
-// per-example key info (db.ResolvedExampleKey) for Store.MarkExamplesResolved to find and
-// mark them once the suggestion is applied. confirmed_positive examples are never
-// included: they aren't problems to resolve, they're guardrails a rewrite shouldn't have
-// broken, and marking one resolved would just hide it from future improve rounds for no
-// reason.
+// problemExampleKeys picks out the Missed entries from examples — the "problems" a
+// suggestion built from them is meant to fix — and returns enough per-example key info
+// (db.ResolvedExampleKey) for Store.MarkExamplesResolved to find and mark them once the
+// suggestion is applied. Plain confirmations (Missed == false) are never included: they
+// aren't problems to resolve, they're guardrails a rewrite shouldn't have broken, and
+// marking one resolved would just hide it from future improve rounds for no reason.
 func problemExampleKeys(examples []db.PromptExample) []db.ResolvedExampleKey {
 	var keys []db.ResolvedExampleKey
 	for _, ex := range examples {
-		if ex.Verdict == db.VerdictConfirmedPositive {
+		if !ex.Missed {
 			continue
 		}
 		keys = append(keys, db.ResolvedExampleKey{
@@ -592,26 +580,26 @@ func problemExampleKeys(examples []db.PromptExample) []db.ResolvedExampleKey {
 	return keys
 }
 
-// improveRequestExamples groups a rule's example corpus into the three llm.ExampleRef
-// slices llm.ImproveRequest expects, keyed by each example's stored Verdict.
-func improveRequestExamples(examples []db.PromptExample) (shouldMatch, shouldNotMatch, alreadyCorrect []llm.ExampleRef) {
+// improveRequestExamples groups a rule's example corpus into the two llm.ExampleRef slices
+// llm.ImproveRequest expects, keyed by each example's stored Verdict, carrying Missed
+// through onto the ref so formatExampleRefs (llm/bedrock.go) can flag which ones the rule
+// actually got wrong.
+func improveRequestExamples(examples []db.PromptExample) (shouldMatch, shouldNotMatch []llm.ExampleRef) {
 	for _, ex := range examples {
-		ref := llm.ExampleRef{Sender: ex.Sender, Subject: ex.Subject, Excerpt: ex.BodyExcerpt, Recurred: ex.Recurred}
+		ref := llm.ExampleRef{Sender: ex.Sender, Subject: ex.Subject, Excerpt: ex.BodyExcerpt, Recurred: ex.Recurred, Missed: ex.Missed}
 		switch ex.Verdict {
-		case db.VerdictFalseNegative:
-			shouldMatch = append(shouldMatch, ref)
-		case db.VerdictFalsePositive:
-			shouldNotMatch = append(shouldNotMatch, ref)
 		case db.VerdictConfirmedPositive:
-			alreadyCorrect = append(alreadyCorrect, ref)
+			shouldMatch = append(shouldMatch, ref)
+		case db.VerdictConfirmedNegative:
+			shouldNotMatch = append(shouldNotMatch, ref)
 		}
 	}
-	return shouldMatch, shouldNotMatch, alreadyCorrect
+	return shouldMatch, shouldNotMatch
 }
 
 // replayExamplesFor converts a rule's example corpus into llm.ReplayExample values:
-// false_negative and confirmed_positive examples are expected to match the candidate rule,
-// false_positive examples are expected not to.
+// confirmed_positive examples are expected to match the candidate rule, confirmed_negative
+// examples are expected not to.
 func replayExamplesFor(examples []db.PromptExample) []llm.ReplayExample {
 	out := make([]llm.ReplayExample, len(examples))
 	for i, ex := range examples {
@@ -620,7 +608,7 @@ func replayExamplesFor(examples []db.PromptExample) []llm.ReplayExample {
 			Sender:  ex.Sender,
 			Subject: ex.Subject,
 			Excerpt: ex.BodyExcerpt,
-			Want:    ex.Verdict != db.VerdictFalsePositive,
+			Want:    ex.Verdict == db.VerdictConfirmedPositive,
 		}
 	}
 	return out
@@ -797,9 +785,9 @@ func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExampl
 
 // improveAndFinalizeSuggestion runs a bounded improve<->replay loop for a single
 // suggestion and writes the best-scoring round's result. Round 1 behaves exactly as the
-// single-shot version of this function always did: it rebuilds ShouldMatch/ShouldNotMatch/
-// AlreadyCorrect fresh from the prompt's *current* example corpus (including on a
-// regenerate round, where the pre-corpus version of this code instead replayed a
+// single-shot version of this function always did: it rebuilds ShouldMatch/ShouldNotMatch
+// fresh from the prompt's *current* example corpus (including on a regenerate round, where
+// the pre-corpus version of this code instead replayed a
 // conversation frozen around one snapshot email), calls the improver (a first round when
 // priorConv is empty and note carries the correction comment, a refinement round when
 // priorConv is non-empty and userComment carries the user's feedback on the previous
@@ -841,7 +829,7 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	// use it — no reason to pay for that if replay is off.
 	raw := gatherRawExamples(ctx, r.store, p.ID)
 	examples := sampleExamples(raw, improveCap)
-	shouldMatch, shouldNotMatch, alreadyCorrect := improveRequestExamples(examples)
+	shouldMatch, shouldNotMatch := improveRequestExamples(examples)
 	if !replayOn {
 		// No score to iterate on — same behavior as the pre-loop code, exactly one round.
 		maxRounds = 1
@@ -853,7 +841,7 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 
 	req := llm.ImproveRequest{
 		PromptName: p.Name, LabelName: p.LabelName, OriginalInstructions: originalInstructions,
-		ShouldMatch: shouldMatch, ShouldNotMatch: shouldNotMatch, AlreadyCorrect: alreadyCorrect,
+		ShouldMatch: shouldMatch, ShouldNotMatch: shouldNotMatch,
 		UserNote: note, PriorConversation: priorConv, UserComment: userComment,
 		PastAttempts: attemptsForPrompt(ctx, r.store, p),
 	}
@@ -996,14 +984,13 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 }
 
 // replayBaseline is the free baseline ReplayResult.Passed is compared against: how many of
-// the same examples the *original* rule already got right, derived from the verdict
-// recorded when each example was created rather than by re-running the original
-// instructions. false_negative and false_positive examples were misses by definition
-// (that's why they were recorded); confirmed_positive examples were hits.
+// the same examples the *original* rule already got right, derived from Missed rather than
+// by re-running the original instructions — a Missed example was a miss by definition
+// (that's why the user corrected it); a plain confirmation was a hit.
 func replayBaseline(examples []db.PromptExample) int64 {
 	var n int64
 	for _, ex := range examples {
-		if ex.Verdict == db.VerdictConfirmedPositive {
+		if !ex.Missed {
 			n++
 		}
 	}

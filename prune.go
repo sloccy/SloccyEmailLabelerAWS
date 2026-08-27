@@ -53,9 +53,9 @@ const pruneCapMultiplier = 2
 func prunePromptExamples(ctx context.Context, store *db.Store, prompts []db.Prompt) {
 	promptCap := pruneCapMultiplier * replayExampleCap(ctx, store)
 	for _, p := range prompts {
-		// CountExamplesByVerdict already counts all three verdicts in one call (3
+		// CountExamplesByVerdict already counts both verdicts in one call (2
 		// Select:COUNT queries) — call it once per prompt here rather than once per verdict
-		// inside pruneVerdict, which would repeat the same 3 queries 3x for nothing.
+		// inside pruneVerdict, which would repeat the same 2 queries 2x for nothing.
 		counts, err := store.CountExamplesByVerdict(ctx, p.ID)
 		if err != nil {
 			slog.Error("prune: count examples", "prompt_id", p.ID, "err", err)

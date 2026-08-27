@@ -165,19 +165,23 @@ type PromptVersion struct {
 const ExampleExcerptRunes = 400
 
 // PromptExample is a single labeled example: one rule's verdict on one email, kept
-// permanently so prompt improvement can be grounded in real history. Written from two
-// sources — a manual recategorization (any verdict), and passive confirmation on ordinary
-// classification (confirmed_positive only: every email a rule matches and the user never
-// corrects becomes evidence the rule is right about it; see processor.processEmail). Stored
-// under PK = EXAMPLE#<promptId>, SK = <verdict>#<ts>#<padID(id)> — the verdict prefix lets
-// ListExamplesByVerdict fetch a bounded, balanced sample (e.g. the newest N false positives)
-// without reading the rest of the partition, so cost stays flat as the corpus grows. IDs
-// from both write paths come from the same monotonically-ordered source (localID/localIDs,
-// not the atomic nextIDs counter — see db/store.go), which is what lets
-// gatherRawExamples' (improve.go) "newest verdict wins" dedup correctly drop a passively-confirmed
-// row once a later manual correction supersedes it. No TTL: see the "Growth and retention"
-// note in db/store.go's prompt-examples section for why unbounded retention stays cheap even
-// with passive confirmation's much higher write volume than manual correction alone.
+// permanently so prompt improvement can be grounded in real history. There is exactly one
+// write source now — a human reviewing an email on the history page, either recategorizing
+// it or explicitly confirming its current labeling is correct (see recategorize.go's
+// handleRecategorize/handleConfirmCategorization and recategorize_bulk.go's bulk
+// counterparts). Nothing is written automatically: earlier versions of this feature also
+// auto-recorded a confirmed_positive on every ordinary classification match nobody had
+// corrected yet ("passive confirmation"), which flooded the corpus faster than any human
+// could review it and made it impossible to curate. That path is gone; every row here now
+// reflects an explicit human judgment. Stored under PK = EXAMPLE#<promptId>,
+// SK = <verdict>#<ts>#<padID(id)> — the verdict prefix lets ListExamplesByVerdict fetch a
+// bounded, balanced sample without reading the rest of the partition, so cost stays flat as
+// the corpus grows. IDs come from a monotonically-ordered source (localID/localIDs, not the
+// atomic nextIDs counter — see db/store.go), which is what lets gatherRawExamples'
+// (improve.go) "newest verdict wins" dedup correctly drop a superseded row once a later
+// correction lands on the same message. No TTL: see the "Growth and retention" note in
+// db/store.go's prompt-examples section for why unbounded retention stays cheap — write
+// volume is bounded by human review pace, not by scan volume.
 type PromptExample struct {
 	ID          int64  `dynamodbav:"id"`
 	CreatedAt   string `dynamodbav:"createdAt"`
@@ -194,13 +198,13 @@ type PromptExample struct {
 	// ID once that suggestion — built from this example, among others — is applied: the
 	// rule text has now actually incorporated whatever this example was evidence of, so
 	// selectExamplesForImprove (improve.go) excludes it from future improve rounds.
-	// Only ever set on false_negative/false_positive rows; confirmed_positive examples
-	// aren't "problems" to resolve. If the fix didn't actually work, a later correction on
-	// the same email writes a fresh, unresolved row (examples are append-only) that the
-	// existing newest-wins dedup naturally surfaces — nothing here needs to be undone by
-	// hand. No omitempty: nil marshals as an explicit DynamoDB NULL, matching this
-	// codebase's established nullable-pointer convention (see the package doc comment
-	// above and CategorizationHistory.PromptID/PromptSuggestion.CorrectionID).
+	// Only ever set on Missed rows; a plain affirmation isn't a "problem" to resolve. If the
+	// fix didn't actually work, a later correction on the same email writes a fresh,
+	// unresolved row (examples are append-only) that the existing newest-wins dedup
+	// naturally surfaces — nothing here needs to be undone by hand. No omitempty: nil
+	// marshals as an explicit DynamoDB NULL, matching this codebase's established
+	// nullable-pointer convention (see the package doc comment above and
+	// CategorizationHistory.PromptID/PromptSuggestion.CorrectionID).
 	ResolvedBySuggestionID *int64 `dynamodbav:"resolvedBySuggestionId"`
 
 	// PromptVersionID is the Prompt.CurrentVersionID that was live when this example was
@@ -212,16 +216,18 @@ type PromptExample struct {
 	// keeps both cases reading as the same zero value.
 	PromptVersionID int64 `dynamodbav:"promptVersionId,omitempty"`
 
-	// Source is one of the ExampleSource* constants (db/consts.go): "manual" (a human
-	// reviewed this email during a recategorization and the verdict reflects their
-	// judgment) or "passive" (processor.processEmail auto-recorded a confirmed_positive on
-	// an ordinary match nobody has corrected — see this struct's package doc comment).
-	// omitempty, same reasoning as PromptVersionID: every row written before this field
-	// existed reads back as "", not a guessed value. sampleExamples (improve.go) prioritizes
-	// "manual" over "passive" when curating which examples the improver actually sees — a
-	// human's explicit confirmation is stronger signal than "nobody has complained yet,"
-	// especially for confirmed_positive, which passive confirmation writes on every match.
-	Source string `dynamodbav:"source,omitempty"`
+	// Missed is true when this example came from the user actually changing this rule's
+	// checkbox during a review — i.e. the rule got this email wrong and the user corrected
+	// it. False when the user reviewed the email and left the rule's box exactly as it
+	// was: still a real, explicit confirmation, just not evidence of a defect. This is what
+	// replaces the old false_negative/false_positive verdicts: Verdict says which side of
+	// the rule the email belongs on, Missed says whether the rule already agreed before the
+	// review. sampleExamples (improve.go) prioritizes Missed examples when curating which
+	// examples the improver actually sees — a case the rule got wrong is stronger evidence
+	// than one it already had right. omitempty so a row with nothing to say here (false)
+	// marshals the same as a pre-Missed row would have read back, matching this struct's
+	// other omitempty fields' reasoning.
+	Missed bool `dynamodbav:"missed,omitempty"`
 
 	// Recurred and RecurredFromVersion are computed at read time by markRecurrences
 	// (improve.go), never persisted (dynamodbav:"-"): true when an older, already-resolved

@@ -283,7 +283,7 @@ func TestPromptExamplesListTemplate_Renders(t *testing.T) {
 
 	example := db.PromptExample{
 		CreatedAt: "2026-08-01 09:12:03", Sender: "a@example.com", Subject: "Weekly digest",
-		BodyExcerpt: "line one\nline two", Note: "not a newsletter", Source: db.ExampleSourceManual,
+		BodyExcerpt: "line one\nline two", Note: "not a newsletter", Missed: true,
 	}
 
 	cases := []struct {
@@ -299,11 +299,11 @@ func TestPromptExamplesListTemplate_Renders(t *testing.T) {
 			wantAbsent:   []string{"Showing the newest"},
 		},
 		{
-			name: "populated group renders the example and its source",
+			name: "populated group renders the example and whether it was missed",
 			view: promptExamplesView{ID: 1, Groups: []exampleGroup{
-				{Verdict: db.VerdictFalsePositive, Label: verdictLabels[db.VerdictFalsePositive], Examples: []db.PromptExample{example}},
+				{Verdict: db.VerdictConfirmedNegative, Label: verdictLabels[db.VerdictConfirmedNegative], Examples: []db.PromptExample{example}},
 			}},
-			wantContains: []string{"examples-content", "Weekly digest", "a@example.com", "not a newsletter", "manual"},
+			wantContains: []string{"examples-content", "Weekly digest", "a@example.com", "not a newsletter", "missed"},
 			wantAbsent:   []string{"Showing the newest"},
 		},
 		{

@@ -494,6 +494,28 @@ function bulkRecategorizeOpen() {
   });
 }
 
+// bulkConfirmSelected records the current selection's already-correct labeling as confirmed
+// examples, no modal needed — unlike bulkRecategorizeOpen, there's nothing for the user to
+// review or choose, so this fires straight to the server (swap: 'none', same as the
+// single-row Confirm button) and clears the selection once the response's HX-Trigger toast
+// has been processed.
+function bulkConfirmSelected() {
+  const keys = bulkSelectedKeys();
+  if (keys.length === 0) return;
+  if (keys.length > BULK_RECATEGORIZE_MAX) {
+    toast(`Select at most ${BULK_RECATEGORIZE_MAX} emails at a time (${keys.length} selected).`, 'error');
+    return;
+  }
+  // htmx.ajax's values option accepts an array for a repeated field (each entry appended
+  // under the same key via FormData), matching the "selections" repeated-field encoding
+  // handleBulkConfirmCategorization expects from r.Form["selections"].
+  htmx.ajax('POST', '/fragments/history/bulk-confirm', {
+    values: { selections: keys }, swap: 'none'
+  }).then(() => {
+    bulkRecategorizeClearSelection();
+  });
+}
+
 // ---- Suggestions badge ----
 function _refreshSuggestionsBadge() {
   fetch('/fragments/prompt-suggestions')

@@ -494,21 +494,26 @@ type ExampleRef struct {
 	// can tell "first time seeing this" apart from "already tried once and failed," which
 	// calls for a bigger rewrite than a small wording tweak.
 	Recurred bool
+	// Missed marks an example the user actually corrected — the rule had this one wrong —
+	// as opposed to a plain confirmation the user left unchanged. Copied from
+	// db.PromptExample.Missed. formatExampleRefs renders it as a "[MISSED]" prefix so the
+	// improver can weigh a real defect more heavily than a case the rule already handled.
+	Missed bool
 }
 
 // ImproveRequest carries a rule and its labeled-example corpus into ImprovePromptInstructions,
 // grouped by verdict instead of the single mishandled email the pre-corpus version used:
-// ShouldMatch (false negatives — emails the rule missed), ShouldNotMatch (false positives —
-// emails the rule wrongly caught), and AlreadyCorrect (confirmed positives — emails the rule
-// must keep matching). Any slice may be empty, including all three for a rule with no
-// recorded corpus yet; the improve prompt is written to stay coherent in that case.
+// ShouldMatch (confirmed positives — emails this rule belongs on) and ShouldNotMatch
+// (confirmed negatives — emails it does not). Which of those the rule actually got wrong is
+// carried per-example by ExampleRef.Missed, not by a separate slice. Either slice may be
+// empty, including both for a rule with no recorded corpus yet; the improve prompt is
+// written to stay coherent in that case.
 type ImproveRequest struct {
 	PromptName           string
 	LabelName            string
 	OriginalInstructions string
 	ShouldMatch          []ExampleRef
 	ShouldNotMatch       []ExampleRef
-	AlreadyCorrect       []ExampleRef
 	UserNote             string
 	PriorConversation    []ChatMessage
 	UserComment          string
@@ -1100,21 +1105,25 @@ A small model with no reasoning applies this rule to one email at a time.
 It must be decidable from the email alone.`
 
 // formatExampleRefs renders a labeled-example group as "- sender | subject | excerpt" lines
-// for the improve user turn, one call per ImproveRequest slice (ShouldMatch/ShouldNotMatch/
-// AlreadyCorrect). Returns "" for an empty slice so buildImproveUserTurn can omit the
-// section entirely rather than print an empty heading — matters most for a brand-new rule
-// with no corpus yet, where the prompt otherwise still has to read coherently. A recurring
-// example (r.Recurred — see ExampleRef's doc comment) gets a "[RECURRED] " prefix: three
-// tokens, only on the lines that matter, rather than a whole extra section.
+// for the improve user turn, one call per ImproveRequest slice (ShouldMatch/ShouldNotMatch).
+// Returns "" for an empty slice so buildImproveUserTurn can omit the section entirely rather
+// than print an empty heading — matters most for a brand-new rule with no corpus yet, where
+// the prompt otherwise still has to read coherently. A recurring example (r.Recurred — see
+// ExampleRef's doc comment) gets a "[RECURRED] " prefix and a Missed one gets "[MISSED] "
+// (composed together when both apply): a few tokens, only on the lines that matter, rather
+// than a whole extra section.
 func formatExampleRefs(refs []ExampleRef) string {
 	if len(refs) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	for _, r := range refs {
-		prefix := ""
+		var prefix string
 		if r.Recurred {
-			prefix = "[RECURRED] "
+			prefix += "[RECURRED] "
+		}
+		if r.Missed {
+			prefix += "[MISSED] "
 		}
 		fmt.Fprintf(&sb, "- %s%s | %s | %s\n", prefix, r.Sender, r.Subject, r.Excerpt)
 	}
@@ -1133,24 +1142,20 @@ func buildImproveUserTurn(req ImproveRequest) string {
 
 	// Each clause of the closing instruction is only meaningful if its section was
 	// actually printed above — a brand-new rule with no corpus yet would otherwise get a
-	// closing line that references three example groups that don't exist ("every SHOULD
-	// MATCH matches" with no SHOULD MATCH section anywhere above it), which is confusing
-	// rather than merely redundant. goals collects only the clauses that apply.
+	// closing line that references example groups that don't exist ("every SHOULD MATCH
+	// matches" with no SHOULD MATCH section anywhere above it), which is confusing rather
+	// than merely redundant. goals collects only the clauses that apply.
 	var goals []string
 	var anyRecurred bool
 	if s := formatExampleRefs(req.ShouldMatch); s != "" {
-		fmt.Fprintf(&sb, "\nSHOULD MATCH (missed these):\n%s", s)
+		fmt.Fprintf(&sb, "\nSHOULD MATCH (this rule belongs on these; [MISSED] = the rule failed to match it):\n%s", s)
 		goals = append(goals, "every SHOULD MATCH matches")
 	}
 	if s := formatExampleRefs(req.ShouldNotMatch); s != "" {
-		fmt.Fprintf(&sb, "\nSHOULD NOT MATCH (wrongly caught these):\n%s", s)
+		fmt.Fprintf(&sb, "\nSHOULD NOT MATCH (this rule does not belong on these; [MISSED] = the rule wrongly matched it):\n%s", s)
 		goals = append(goals, "no SHOULD NOT MATCH matches")
 	}
-	if s := formatExampleRefs(req.AlreadyCorrect); s != "" {
-		fmt.Fprintf(&sb, "\nALREADY CORRECT (do not break these):\n%s", s)
-		goals = append(goals, "every ALREADY CORRECT still matches")
-	}
-	for _, refs := range [][]ExampleRef{req.ShouldMatch, req.ShouldNotMatch, req.AlreadyCorrect} {
+	for _, refs := range [][]ExampleRef{req.ShouldMatch, req.ShouldNotMatch} {
 		for _, r := range refs {
 			if r.Recurred {
 				anyRecurred = true

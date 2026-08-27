@@ -45,8 +45,8 @@ func TestParseExampleCap(t *testing.T) {
 func TestMarkRecurrences_SameMessageRecurs(t *testing.T) {
 	resolvedBy := int64(42)
 	examples := []db.PromptExample{
-		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive, ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 7},
-		{ID: 2, MessageID: "msg1", Verdict: db.VerdictFalsePositive}, // live, same message+verdict -> recurred
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative, ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 7},
+		{ID: 2, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative}, // live, same message+verdict -> recurred
 	}
 	got := markRecurrences(examples)
 
@@ -65,8 +65,8 @@ func TestMarkRecurrences_SameMessageRecurs(t *testing.T) {
 func TestMarkRecurrences_DifferentVerdictNotRecurred(t *testing.T) {
 	resolvedBy := int64(1)
 	examples := []db.PromptExample{
-		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive, ResolvedBySuggestionID: &resolvedBy},
-		{ID: 2, MessageID: "msg1", Verdict: db.VerdictFalseNegative}, // same message, different verdict
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative, ResolvedBySuggestionID: &resolvedBy},
+		{ID: 2, MessageID: "msg1", Verdict: db.VerdictConfirmedPositive}, // same message, different verdict
 	}
 	got := markRecurrences(examples)
 	if got[1].Recurred {
@@ -76,7 +76,7 @@ func TestMarkRecurrences_DifferentVerdictNotRecurred(t *testing.T) {
 
 func TestMarkRecurrences_NoResolvedHistoryNotRecurred(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive},
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative},
 	}
 	got := markRecurrences(examples)
 	if got[0].Recurred {
@@ -91,9 +91,9 @@ func TestMarkRecurrences_SenderSubjectFallback(t *testing.T) {
 	resolvedBy := int64(9)
 	examples := []db.PromptExample{
 		{ID: 1, MessageID: "msg-old", Sender: "Newsletter@Example.com", Subject: " Weekly Digest ",
-			Verdict: db.VerdictFalseNegative, ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 3},
+			Verdict: db.VerdictConfirmedPositive, ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 3},
 		{ID: 2, MessageID: "msg-new", Sender: "newsletter@example.com", Subject: "weekly digest",
-			Verdict: db.VerdictFalseNegative}, // different MessageID, same sender+subject case/whitespace-insensitive
+			Verdict: db.VerdictConfirmedPositive}, // different MessageID, same sender+subject case/whitespace-insensitive
 	}
 	got := markRecurrences(examples)
 	if !got[1].Recurred || got[1].RecurredFromVersion != 3 {
@@ -106,7 +106,7 @@ func TestMarkRecurrences_ResolvedRowsUnaffected(t *testing.T) {
 	// just confirms markRecurrences doesn't itself alter which rows are resolved/live.
 	resolvedBy := int64(1)
 	examples := []db.PromptExample{
-		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive, ResolvedBySuggestionID: &resolvedBy},
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative, ResolvedBySuggestionID: &resolvedBy},
 	}
 	got := markRecurrences(examples)
 	if len(got) != 1 || got[0].ResolvedBySuggestionID == nil {
@@ -224,12 +224,12 @@ func TestShouldPruneVerdict(t *testing.T) {
 // TestPruneKeepSet_LiveRankedLikeSelection checks the core "reverse of selection" property:
 // a recurred live example wins a keep slot over more recent, non-recurred live examples —
 // exactly the priority sampleVerdict already applies for selection (see
-// TestSampleExamples_RecurredPrioritizedOverManualAndPassive, recategorize_test.go), not
+// TestSampleExamples_RecurredPrioritizedOverMissedAndConfirmed, recategorize_test.go), not
 // re-tested in depth here.
 func TestPruneKeepSet_LiveRankedLikeSelection(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 3, MessageID: "m3", Sender: "c@example.com", Subject: "s3", Source: db.ExampleSourceManual},
-		{ID: 2, MessageID: "m2", Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
+		{ID: 3, MessageID: "m3", Sender: "c@example.com", Subject: "s3", Missed: true},
+		{ID: 2, MessageID: "m2", Sender: "b@example.com", Subject: "s2"},
 		{ID: 1, MessageID: "m1", Sender: "a@example.com", Subject: "s1", Recurred: true},
 	}
 	keep := pruneKeepSet(examples, 1)
@@ -274,8 +274,8 @@ func TestPruneKeepSet_ResolvedKeptByRecencyIndependentOfLive(t *testing.T) {
 func TestPruneKeepSet_ResolvedWithinCapPreservesRecurrenceDetection(t *testing.T) {
 	resolvedBy := int64(9)
 	examples := []db.PromptExample{
-		{ID: 2, MessageID: "msg1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s", ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 5},
-		{ID: 1, MessageID: "msg1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s"},
+		{ID: 2, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative, Sender: "a@example.com", Subject: "s", ResolvedBySuggestionID: &resolvedBy, PromptVersionID: 5},
+		{ID: 1, MessageID: "msg1", Verdict: db.VerdictConfirmedNegative, Sender: "a@example.com", Subject: "s"},
 	}
 	pruneKeepSet(examples, 10) // mutates examples in place via markRecurrences, same as gatherRawExamples does
 	var live db.PromptExample
