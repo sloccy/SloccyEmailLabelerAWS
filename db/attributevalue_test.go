@@ -418,7 +418,7 @@ func TestSuggestionRoundTrip_ReplayFieldsOmittedWhenZero(t *testing.T) {
 func TestPromptExampleRoundTrip(t *testing.T) {
 	want := PromptExample{
 		ID: 3, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, AccountID: 1,
-		MessageID: "msg1", Verdict: VerdictFalseNegative,
+		MessageID: "msg1", Verdict: VerdictConfirmedPositive, Missed: true,
 		Sender: "a@example.com", Subject: "Hello", BodyExcerpt: "excerpt text", Note: "note text",
 	}
 	item := promptExampleItem(want)
@@ -426,7 +426,7 @@ func TestPromptExampleRoundTrip(t *testing.T) {
 	if got, ok := item["PK"].(*types.AttributeValueMemberS); !ok || got.Value != "EXAMPLE#5" {
 		t.Errorf("PK = %v, want EXAMPLE#5", item["PK"])
 	}
-	wantSK := "false_negative#2026-07-01 12:00:00#00000000000000000003"
+	wantSK := "confirmed_positive#2026-07-01 12:00:00#00000000000000000003"
 	if got, ok := item["SK"].(*types.AttributeValueMemberS); !ok || got.Value != wantSK {
 		t.Errorf("SK = %v, want %q", item["SK"], wantSK)
 	}
@@ -440,10 +440,11 @@ func TestPromptExampleRoundTrip(t *testing.T) {
 // TestPromptExampleRoundTrip_SKVerdictPrefix checks the property ListExamplesByVerdict's
 // begins_with(SK, verdict+"#") query depends on: every verdict produces a distinctly
 // prefixed SK, so a query scoped to one verdict can never accidentally match another's items
-// (e.g. "false_negative#..." must not begin_with "false_positive#", and vice versa — a risk
-// specifically because those two strings share a long common prefix, "false_"+"n"/"p"...).
+// (e.g. "confirmed_positive#..." must not begin_with "confirmed_negative#", and vice versa —
+// a risk specifically because those two strings share a long common prefix,
+// "confirmed_"+"p"/"n"...).
 func TestPromptExampleRoundTrip_SKVerdictPrefix(t *testing.T) {
-	verdicts := []string{VerdictFalseNegative, VerdictFalsePositive, VerdictConfirmedPositive}
+	verdicts := VerdictOrder
 	for _, v := range verdicts {
 		e := PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: v}
 		item := promptExampleItem(e)
@@ -510,7 +511,7 @@ func TestPromptExampleRoundTrip_ResolvedBySuggestion(t *testing.T) {
 	sid := int64(7)
 	want := PromptExample{
 		ID: 3, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, AccountID: 1,
-		MessageID: "msg1", Verdict: VerdictFalsePositive,
+		MessageID: "msg1", Verdict: VerdictConfirmedNegative,
 		Sender: "a@example.com", Subject: "Hello", BodyExcerpt: "excerpt",
 		ResolvedBySuggestionID: &sid,
 	}
@@ -530,7 +531,7 @@ func TestPromptExampleRoundTrip_ResolvedBySuggestion(t *testing.T) {
 // not an omitted attribute — matching this codebase's established nullable-pointer
 // convention (see db/models.go's package doc comment).
 func TestPromptExampleRoundTrip_UnresolvedIsExplicitNull(t *testing.T) {
-	e := PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive}
+	e := PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedNegative}
 	item := promptExampleItem(e)
 	if _, ok := item["resolvedBySuggestionId"]; !ok {
 		t.Error("resolvedBySuggestionId attribute missing; want explicit NULL")
@@ -709,13 +710,12 @@ func TestPromptRoundTrip_CurrentVersionIDOmittedWhenZero(t *testing.T) {
 }
 
 // TestPromptExampleRoundTrip_PromptVersionID checks the field buildPromptExamples
-// (recategorize.go) and processor.processEmail's passive confirmation both stamp survives
-// the round trip, and that Recurred/RecurredFromVersion — computed at read time by
-// markRecurrences, never persisted (dynamodbav:"-") — are excluded from the wire format
-// entirely rather than round-tripping as false/0 by coincidence.
+// (recategorize.go) stamps survives the round trip, and that Recurred/RecurredFromVersion —
+// computed at read time by markRecurrences, never persisted (dynamodbav:"-") — are excluded
+// from the wire format entirely rather than round-tripping as false/0 by coincidence.
 func TestPromptExampleRoundTrip_PromptVersionID(t *testing.T) {
 	want := PromptExample{
-		ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalseNegative,
+		ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedPositive,
 		Sender: "a@example.com", Subject: "s", PromptVersionID: 12,
 	}
 	item := promptExampleItem(want)
@@ -729,20 +729,19 @@ func TestPromptExampleRoundTrip_PromptVersionID(t *testing.T) {
 }
 
 func TestPromptExampleRoundTrip_PromptVersionIDOmittedWhenZero(t *testing.T) {
-	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive})
+	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedNegative})
 	if _, ok := item["promptVersionId"]; ok {
 		t.Errorf("promptVersionId attribute present with zero value, want omitted")
 	}
 }
 
-// TestPromptExampleRoundTrip_Source checks the field buildPromptExamples
-// (recategorize.go, "manual") and processor.processEmail's passive confirmation
-// ("passive") stamp survives the round trip — sampleExamples (improve.go) prioritizes
-// "manual" over "passive"/empty when curating which examples the improver sees.
-func TestPromptExampleRoundTrip_Source(t *testing.T) {
+// TestPromptExampleRoundTrip_Missed checks the field buildPromptExamples (recategorize.go)
+// stamps survives the round trip — sampleExamples (improve.go) prioritizes Missed examples
+// when curating which examples the improver sees.
+func TestPromptExampleRoundTrip_Missed(t *testing.T) {
 	want := PromptExample{
 		ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedPositive,
-		Sender: "a@example.com", Subject: "s", Source: ExampleSourceManual,
+		Sender: "a@example.com", Subject: "s", Missed: true,
 	}
 	item := promptExampleItem(want)
 	got := itemToPromptExample(item)
@@ -751,17 +750,17 @@ func TestPromptExampleRoundTrip_Source(t *testing.T) {
 	}
 }
 
-// TestPromptExampleRoundTrip_SourceOmittedWhenEmpty checks a row written before Source
-// tracking existed reads back as "", not an error or a guessed value — every existing
-// example in the live table predates this field.
-func TestPromptExampleRoundTrip_SourceOmittedWhenEmpty(t *testing.T) {
-	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictFalsePositive})
-	if _, ok := item["source"]; ok {
-		t.Errorf("source attribute present with zero value, want omitted")
+// TestPromptExampleRoundTrip_MissedOmittedWhenFalse checks a plain confirmation (Missed ==
+// false, the common case) omits the attribute entirely rather than writing an explicit
+// false — matching this field's omitempty tag.
+func TestPromptExampleRoundTrip_MissedOmittedWhenFalse(t *testing.T) {
+	item := promptExampleItem(PromptExample{ID: 1, CreatedAt: "2026-07-01 12:00:00", PromptID: 5, Verdict: VerdictConfirmedNegative})
+	if _, ok := item["missed"]; ok {
+		t.Errorf("missed attribute present with zero value, want omitted")
 	}
 	got := itemToPromptExample(item)
-	if got.Source != "" {
-		t.Errorf("Source = %q, want empty for a pre-existing row", got.Source)
+	if got.Missed {
+		t.Errorf("Missed = %v, want false for a plain confirmation", got.Missed)
 	}
 }
 

@@ -277,8 +277,10 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("GET /fragments/history/{id}/llm-response", s.handleHistoryLlmResponse)
 	s.mux.HandleFunc("GET /fragments/history/{id}/recategorize", s.handleRecategorizeForm)
 	s.mux.HandleFunc("POST /fragments/history/{id}/recategorize", s.handleRecategorize)
+	s.mux.HandleFunc("POST /fragments/history/{id}/confirm", s.handleConfirmCategorization)
 	s.mux.HandleFunc("GET /fragments/history/bulk-recategorize", s.handleBulkRecategorizeForm)
 	s.mux.HandleFunc("POST /fragments/history/bulk-recategorize", s.handleBulkRecategorize)
+	s.mux.HandleFunc("POST /fragments/history/bulk-confirm", s.handleBulkConfirmCategorization)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions", s.handlePromptSuggestionsList)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}", s.handlePromptSuggestionDetail)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}/trace", s.handlePromptSuggestionTrace)
@@ -657,10 +659,10 @@ func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Reques
 }
 
 // promptExamplesPerVerdict bounds how many of each verdict's examples the expandable list on
-// a prompt card shows. Deliberately small: a long-lived rule accumulates thousands of
-// passively-confirmed positives (see db.PromptExample's doc comment), and the point of this
-// panel is "what has this rule actually learned lately", not a full corpus dump — which
-// would also be a much larger Query per expand against a 2-RCU table.
+// a prompt card shows. Deliberately small: a long-lived, actively-reviewed rule can still
+// accumulate a large corpus over time, and the point of this panel is "what has this rule
+// actually learned lately", not a full corpus dump — which would also be a much larger
+// Query per expand against a 2-RCU table.
 const promptExamplesPerVerdict = 25
 
 // promptExamplesView feeds prompt_examples_list.html: one group per verdict, newest first.
@@ -1813,12 +1815,10 @@ type exampleGroup struct {
 }
 
 // verdictLabels turns a stored verdict into the phrasing both example views show. Written
-// from the rule's point of view rather than as the raw constant, since "false_negative"
-// reads backwards to anyone who hasn't internalized which side the rule is on.
+// from the rule's point of view rather than as the raw constant.
 var verdictLabels = map[string]string{
-	db.VerdictFalseNegative:     "Missed it (should have matched)",
-	db.VerdictFalsePositive:     "Wrongly caught (should not have matched)",
-	db.VerdictConfirmedPositive: "Already correct (must keep matching)",
+	db.VerdictConfirmedPositive: "Should match (confirmed by you)",
+	db.VerdictConfirmedNegative: "Should not match (confirmed by you)",
 }
 
 // toSuggestionView converts a stored suggestion + its prompt's name into the view shape

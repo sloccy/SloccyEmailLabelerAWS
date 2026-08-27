@@ -15,11 +15,7 @@
       <li class="border-start ps-2">
         <div class="d-flex flex-wrap align-items-baseline gap-2">
           <span class="font-monospace text-muted">{{fmtdate .CreatedAt}}</span>
-          {{if eq .Source "manual"}}
-            <span class="badge border border-primary text-primary">manual</span>
-          {{else if eq .Source "passive"}}
-            <span class="badge border text-secondary">passive</span>
-          {{end}}
+          {{if .Missed}}<span class="badge border border-warning text-warning">missed</span>{{end}}
           {{if .ResolvedBySuggestionID}}<span class="badge border text-secondary">resolved</span>{{end}}
         </div>
         <div class="text-truncate" style="max-width:100%">
@@ -40,6 +36,6 @@
     {{end}}
   </div>
   {{else}}
-  <div class="small text-muted">No examples recorded yet. They accumulate as this rule matches email and as you recategorize.</div>
+  <div class="small text-muted">No examples recorded yet. They accumulate as you recategorize or confirm emails on the History page.</div>
   {{end}}
 </div>

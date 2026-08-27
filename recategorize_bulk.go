@@ -84,32 +84,34 @@ func parseBulkSelections(values []string) []bulkMessageKey {
 // records something" case — only rules the user explicitly pointed at this message's rule
 // set produce a verdict.
 //
-//	apply, not already applied  -> false_negative   (missed it)
+//	apply, not already applied  -> confirmed_positive, missed  (rule missed it)
 //	apply, already applied      -> confirmed_positive
-//	remove, already applied     -> false_positive   (wrongly caught)
-//	remove, not applied         -> (nothing)
+//	remove, already applied     -> confirmed_negative, missed  (rule wrongly caught it)
+//	remove, not applied         -> confirmed_negative
 //	no change                   -> (nothing)
-func bulkVerdictsAndPlan(current map[int64]bool, applyIDs, removeIDs []int64, promptByID map[int64]db.Prompt) (verdicts map[int64]string, keptIDs []int64, added []db.Prompt) {
+func bulkVerdictsAndPlan(current map[int64]bool, applyIDs, removeIDs []int64, promptByID map[int64]db.Prompt) (verdicts map[int64]exampleVerdict, keptIDs []int64, added []db.Prompt) {
+	applySet := idSet(applyIDs)
 	removeSet := idSet(removeIDs)
-	verdicts = make(map[int64]string)
+	verdicts = make(map[int64]exampleVerdict)
 
 	for _, pid := range applyIDs {
 		if removeSet[pid] {
 			continue // contradictory (apply and remove on the same rule); ignore defensively
 		}
 		if current[pid] {
-			verdicts[pid] = db.VerdictConfirmedPositive
+			verdicts[pid] = exampleVerdict{Verdict: db.VerdictConfirmedPositive}
 		} else {
-			verdicts[pid] = db.VerdictFalseNegative
+			verdicts[pid] = exampleVerdict{Verdict: db.VerdictConfirmedPositive, Missed: true}
 			if p, ok := promptByID[pid]; ok {
 				added = append(added, p)
 			}
 		}
 	}
 	for _, pid := range removeIDs {
-		if current[pid] {
-			verdicts[pid] = db.VerdictFalsePositive
+		if applySet[pid] {
+			continue // contradictory; same defensive ignore as the apply loop above
 		}
+		verdicts[pid] = exampleVerdict{Verdict: db.VerdictConfirmedNegative, Missed: current[pid]}
 	}
 	for pid := range current {
 		if !removeSet[pid] {
@@ -308,7 +310,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		// Verdicts + history plan per message (pure, from `state` — no further DB reads).
 		plans := make([]db.RewriteMessagePlan, 0, len(messageIDs))
 		var needExcerpt []string
-		perMessageVerdicts := make(map[string]map[int64]string, len(messageIDs))
+		perMessageVerdicts := make(map[string]map[int64]exampleVerdict, len(messageIDs))
 		for _, mid := range messageIDs {
 			st, ok := state[mid]
 			if !ok {
@@ -399,6 +401,96 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		triggerRefreshSuggestionBadge: "1",
 		"refreshHistory":              "1",
 		"refreshSuggestions":          "1",
+	})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+}
+
+// handleBulkConfirmCategorization is the bulk counterpart to handleConfirmCategorization —
+// records the current prompt-match state of every selected email as a confirmed example for
+// every active rule on its account, without touching Gmail, history, or suggestions. Shares
+// bulkRecategorizeMaxEmails and parseBulkSelections with the bulk recategorize handler
+// above; unlike it, there's no apply/remove action set to read, since confirm always means
+// "the current state is correct."
+func (s *server) handleBulkConfirmCategorization(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+
+	selections := parseBulkSelections(r.Form["selections"])
+	if len(selections) == 0 {
+		http.Error(w, "no emails selected", http.StatusBadRequest)
+		return
+	}
+	if len(selections) > bulkRecategorizeMaxEmails {
+		http.Error(w, fmt.Sprintf("too many emails selected (max %d)", bulkRecategorizeMaxEmails), http.StatusBadRequest)
+		return
+	}
+
+	byAccount := make(map[int64][]string, len(selections))
+	for _, sel := range selections {
+		byAccount[sel.AccountID] = append(byAccount[sel.AccountID], sel.MessageID)
+	}
+
+	excerptCtx, excerptCancel := context.WithTimeout(ctx, bulkExcerptBudget)
+	defer excerptCancel()
+
+	var allExamples []db.PromptExample
+
+	for accountID, messageIDs := range byAccount {
+		account, err := s.store.GetAccount(ctx, accountID)
+		if err != nil {
+			slog.Error("bulk confirm: get account", "account_id", accountID, "err", err)
+			continue
+		}
+		prompts, _ := s.store.ListActivePromptsForAccount(ctx, accountID)
+		if len(prompts) == 0 {
+			continue
+		}
+		promptByID := make(map[int64]db.Prompt, len(prompts))
+		allPromptIDs := make([]int64, len(prompts))
+		for i, p := range prompts {
+			promptByID[p.ID] = p
+			allPromptIDs[i] = p.ID
+		}
+
+		// One query for this account's current state across every selected message in it —
+		// same reasoning as handleBulkRecategorize (see GetHistoryStateForMessages' doc
+		// comment).
+		state, err := s.store.GetHistoryStateForMessages(ctx, accountID, messageIDs)
+		if err != nil {
+			slog.Error("bulk confirm: get history state", "account_id", accountID, "err", err)
+			continue
+		}
+
+		var excerpts map[string]string
+		if svc, err := s.gmailServiceFor(ctx, account); err == nil {
+			excerpts = fetchExcerptsBounded(excerptCtx, svc, messageIDs, s.cfg.ClassifyConcurrency)
+		} else {
+			slog.Error("bulk confirm: gmail service", "account_id", accountID, "err", err)
+		}
+
+		for _, mid := range messageIDs {
+			st, ok := state[mid]
+			if !ok {
+				continue
+			}
+			verdicts := singleRecategorizeVerdicts(allPromptIDs, st.CurrentPromptIDs, st.CurrentPromptIDs)
+			examples := buildPromptExamples(accountID, mid, st.Sender, st.Subject, excerpts[mid], "", verdicts, promptByID)
+			allExamples = append(allExamples, examples...)
+		}
+	}
+
+	if len(allExamples) > 0 {
+		if err := s.store.InsertPromptExamples(ctx, allExamples); err != nil {
+			slog.Error("bulk confirm: insert prompt examples", "err", err)
+		}
+		incrementVersionObservedFor(ctx, s.store, allExamples)
+	}
+
+	setHxTrigger(w, map[string]any{
+		triggerShowToast: map[string]any{toastKeyMessage: fmt.Sprintf("Confirmed %d emails", len(selections)), jsonKeyType: toastTypeSuccess},
 	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 }

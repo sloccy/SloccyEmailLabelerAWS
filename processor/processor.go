@@ -337,13 +337,11 @@ func processMessageIDs(ctx context.Context, store db.StoreIface, llmClient llm.C
 // serial writer in processMessageIDs instead of inline inside the classify goroutine.
 // release == true means "give up the claim taken before classification" (the LLM-error
 // retry case) rather than confirm it; llmDebug == nil means skip the (comparatively
-// large) LLM-debug write entirely. examples is the passive confirmed_positive rows for
-// whichever prompts this email matched — see processEmail.
+// large) LLM-debug write entirely.
 type writeJob struct {
 	accountID int64
 	logs      []db.LogEntry
 	history   []db.HistoryEntry
-	examples  []db.PromptExample
 	messageID string
 	release   bool
 	llmDebug  *db.AddLlmDebugParams
@@ -352,11 +350,11 @@ type writeJob struct {
 // applyWriteJob persists one writeJob. Errors are logged, not propagated — matching the
 // prior inline behavior where a DB write failure doesn't block or retry email processing.
 func applyWriteJob(ctx context.Context, store db.StoreIface, job writeJob) {
-	// Confirm: false on release — write the logs/history/examples collected so far, but
-	// never touch the "PROC#" marker via this call; that decision belongs solely to the
-	// ReleaseClaim call below.
+	// Confirm: false on release — write the logs/history collected so far, but never touch
+	// the "PROC#" marker via this call; that decision belongs solely to the ReleaseClaim
+	// call below.
 	if err := store.BatchInsertProcessingResults(ctx, db.ProcessingResults{
-		Logs: job.logs, History: job.history, Examples: job.examples,
+		Logs: job.logs, History: job.history,
 		AccountID: job.accountID, MessageID: job.messageID, Confirm: !job.release,
 	}); err != nil {
 		slog.Error("db write failed", "err", err)
@@ -419,7 +417,6 @@ func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modi
 	logs = append(logs, logger.entries...)
 
 	var history []db.HistoryEntry
-	var examples []db.PromptExample
 
 	if llmErr != nil {
 		logs = append(logs, db.LogEntry{Level: logWarning, Message: fmt.Sprintf("LLM error for %q: %v — will retry", msg.Subject, llmErr)})
@@ -427,11 +424,6 @@ func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modi
 		// message is immediately eligible for retry rather than waiting out the full lease.
 		return nil, nil, writeJob{accountID: bc.account.ID, logs: logs, messageID: msg.ID, release: true}
 	}
-
-	// Computed once and reused for every matched prompt below — msg.Body is already in
-	// memory from classification (gmailpkg.IterMessageDetails), so building this costs no
-	// extra Gmail API call, unlike the recategorize path's dedicated FetchMessage.
-	excerpt := gmailpkg.CollapseExcerpt(msg.Body, db.ExampleExcerptRunes)
 
 	var matched []string
 	stop := false
@@ -482,28 +474,6 @@ func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modi
 			LlmResponse:  classified.RawResponse,
 			DurationMs:   classified.LatencyMs,
 		})
-		// Passive confirmation: this rule matched and the user hasn't (yet) corrected it —
-		// treat it as evidence the rule is right about this email. Only for prompts that
-		// actually get a history row (the same "not shadowed by an earlier stop-processing
-		// rule" gate as above, since this whole block is skipped via `continue` otherwise);
-		// never a confirmed-negative for prompts that didn't match (see
-		// db.VerdictConfirmedPositive's doc comment on why that's a deliberate omission, not
-		// an oversight). A later manual correction for this same (rule, email) pair — should
-		// the user ever make one — supersedes this at read time via
-		// gatherRawExamples' newest-id-wins dedup (improve.go); see
-		// db.InsertPromptExamples' doc comment for why that dedup depends on every
-		// PromptExample write path sharing the same monotonically-ordered id source.
-		examples = append(examples, db.PromptExample{
-			PromptID:        p.ID,
-			AccountID:       bc.account.ID,
-			MessageID:       msg.ID,
-			Verdict:         db.VerdictConfirmedPositive,
-			Sender:          msg.Sender,
-			Subject:         msg.Subject,
-			BodyExcerpt:     excerpt,
-			PromptVersionID: p.CurrentVersionID,
-			Source:          db.ExampleSourcePassive,
-		})
 	}
 
 	// If no prompts matched, record a "no match" entry
@@ -550,7 +520,6 @@ func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modi
 		accountID: bc.account.ID,
 		logs:      logs,
 		history:   history,
-		examples:  examples,
 		messageID: msg.ID,
 		llmDebug:  llmDebug,
 	}

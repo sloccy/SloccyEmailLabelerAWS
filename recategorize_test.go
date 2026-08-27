@@ -10,43 +10,37 @@ import (
 )
 
 // TestSingleRecategorizeVerdicts locks in the single-email verdict table from the plan:
-// a rule left checked before and after is a genuine affirmation (confirmed_positive)
-// because the user saw an explicit checkbox and chose to leave it checked; a rule left
-// unchecked before and after records nothing, since the user never affirmed or denied it.
+// every active prompt gets a verdict, and Missed is set exactly when the box actually
+// changed (checked -> confirmed_positive, unchecked -> confirmed_negative either way).
 func TestSingleRecategorizeVerdicts(t *testing.T) {
 	// Prompt 1: newly checked (added).  Prompt 2: newly unchecked (removed).
 	// Prompt 3: left checked (kept).   Prompt 4: left unchecked (untouched).
+	allPromptIDs := []int64{1, 2, 3, 4}
 	currentIDs := map[int64]bool{2: true, 3: true}
 	requestedIDs := map[int64]bool{1: true, 3: true}
-	addedIDs := []int64{1}
-	removedIDs := []int64{2}
 
-	got := singleRecategorizeVerdicts(currentIDs, requestedIDs, addedIDs, removedIDs)
+	got := singleRecategorizeVerdicts(allPromptIDs, currentIDs, requestedIDs)
 
-	want := map[int64]string{
-		1: db.VerdictFalseNegative,
-		2: db.VerdictFalsePositive,
-		3: db.VerdictConfirmedPositive,
+	want := map[int64]exampleVerdict{
+		1: {Verdict: db.VerdictConfirmedPositive, Missed: true},
+		2: {Verdict: db.VerdictConfirmedNegative, Missed: true},
+		3: {Verdict: db.VerdictConfirmedPositive, Missed: false},
+		4: {Verdict: db.VerdictConfirmedNegative, Missed: false},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d verdicts, want %d: %+v", len(got), len(want), got)
 	}
 	for pid, wantVerdict := range want {
 		if got[pid] != wantVerdict {
-			t.Errorf("prompt %d: verdict = %q, want %q", pid, got[pid], wantVerdict)
+			t.Errorf("prompt %d: verdict = %+v, want %+v", pid, got[pid], wantVerdict)
 		}
-	}
-	if _, ok := got[4]; ok {
-		t.Errorf("prompt 4 (left unchecked) should record nothing, got %q", got[4])
 	}
 }
 
-func TestSingleRecategorizeVerdicts_NoChanges(t *testing.T) {
-	// Nothing added or removed, nothing kept-checked either (empty current/requested) —
-	// should record nothing at all, not zero-value verdicts.
-	got := singleRecategorizeVerdicts(map[int64]bool{}, map[int64]bool{}, nil, nil)
+func TestSingleRecategorizeVerdicts_NoPrompts(t *testing.T) {
+	got := singleRecategorizeVerdicts(nil, map[int64]bool{}, map[int64]bool{})
 	if len(got) != 0 {
-		t.Errorf("expected no verdicts, got %+v", got)
+		t.Errorf("expected no verdicts with no active prompts, got %+v", got)
 	}
 }
 
@@ -55,10 +49,10 @@ func TestSingleRecategorizeVerdicts_NoChanges(t *testing.T) {
 // remove produce a verdict, since a bulk action isn't a per-email review.
 func TestBulkVerdictsAndPlan(t *testing.T) {
 	promptByID := map[int64]db.Prompt{
-		1: {ID: 1, Name: "apply-missing"},  // apply, not already applied -> false_negative
+		1: {ID: 1, Name: "apply-missing"},  // apply, not already applied -> confirmed_positive, missed
 		2: {ID: 2, Name: "apply-present"},  // apply, already applied -> confirmed_positive
-		3: {ID: 3, Name: "remove-present"}, // remove, already applied -> false_positive
-		4: {ID: 4, Name: "remove-missing"}, // remove, not applied -> nothing
+		3: {ID: 3, Name: "remove-present"}, // remove, already applied -> confirmed_negative, missed
+		4: {ID: 4, Name: "remove-missing"}, // remove, not applied -> confirmed_negative
 		5: {ID: 5, Name: "untouched"},      // no change -> nothing
 	}
 	current := map[int64]bool{2: true, 3: true, 5: true}
@@ -67,23 +61,22 @@ func TestBulkVerdictsAndPlan(t *testing.T) {
 
 	verdicts, keptIDs, added := bulkVerdictsAndPlan(current, applyIDs, removeIDs, promptByID)
 
-	wantVerdicts := map[int64]string{
-		1: db.VerdictFalseNegative,
-		2: db.VerdictConfirmedPositive,
-		3: db.VerdictFalsePositive,
+	wantVerdicts := map[int64]exampleVerdict{
+		1: {Verdict: db.VerdictConfirmedPositive, Missed: true},
+		2: {Verdict: db.VerdictConfirmedPositive, Missed: false},
+		3: {Verdict: db.VerdictConfirmedNegative, Missed: true},
+		4: {Verdict: db.VerdictConfirmedNegative, Missed: false},
 	}
 	if len(verdicts) != len(wantVerdicts) {
 		t.Fatalf("got %d verdicts, want %d: %+v", len(verdicts), len(wantVerdicts), verdicts)
 	}
 	for pid, want := range wantVerdicts {
 		if verdicts[pid] != want {
-			t.Errorf("prompt %d: verdict = %q, want %q", pid, verdicts[pid], want)
+			t.Errorf("prompt %d: verdict = %+v, want %+v", pid, verdicts[pid], want)
 		}
 	}
-	for _, untouched := range []int64{4, 5} {
-		if _, ok := verdicts[untouched]; ok {
-			t.Errorf("prompt %d should record nothing, got %q", untouched, verdicts[untouched])
-		}
+	if _, ok := verdicts[5]; ok {
+		t.Errorf("prompt 5 (untouched) should record nothing, got %+v", verdicts[5])
 	}
 
 	// History plan: kept = current prompts not being removed (2, 5 — prompt 3 is removed).
@@ -107,7 +100,7 @@ func TestBulkVerdictsAndPlan_ApplyAndRemoveSameRuleIgnored(t *testing.T) {
 	promptByID := map[int64]db.Prompt{1: {ID: 1}}
 	verdicts, _, added := bulkVerdictsAndPlan(map[int64]bool{}, []int64{1}, []int64{1}, promptByID)
 	if _, ok := verdicts[1]; ok {
-		t.Errorf("contradictory apply+remove should record nothing, got %q", verdicts[1])
+		t.Errorf("contradictory apply+remove should record nothing, got %+v", verdicts[1])
 	}
 	if len(added) != 0 {
 		t.Errorf("contradictory apply+remove should not add a history row, got %+v", added)
@@ -115,7 +108,10 @@ func TestBulkVerdictsAndPlan_ApplyAndRemoveSameRuleIgnored(t *testing.T) {
 }
 
 func TestBuildPromptExamples(t *testing.T) {
-	verdicts := map[int64]string{5: db.VerdictFalseNegative, 7: db.VerdictConfirmedPositive}
+	verdicts := map[int64]exampleVerdict{
+		5: {Verdict: db.VerdictConfirmedPositive, Missed: true},
+		7: {Verdict: db.VerdictConfirmedPositive},
+	}
 	promptByID := map[int64]db.Prompt{
 		5: {ID: 5, CurrentVersionID: 42},
 		7: {ID: 7}, // no version yet — should stamp 0, not panic on a missing entry's zero value
@@ -132,11 +128,11 @@ func TestBuildPromptExamples(t *testing.T) {
 			t.Errorf("example metadata mismatch: %+v", ex)
 		}
 	}
-	if byPrompt[5].Verdict != db.VerdictFalseNegative {
-		t.Errorf("prompt 5 verdict = %q, want false_negative", byPrompt[5].Verdict)
+	if byPrompt[5].Verdict != db.VerdictConfirmedPositive || !byPrompt[5].Missed {
+		t.Errorf("prompt 5 = %+v, want confirmed_positive, Missed=true", byPrompt[5])
 	}
-	if byPrompt[7].Verdict != db.VerdictConfirmedPositive {
-		t.Errorf("prompt 7 verdict = %q, want confirmed_positive", byPrompt[7].Verdict)
+	if byPrompt[7].Verdict != db.VerdictConfirmedPositive || byPrompt[7].Missed {
+		t.Errorf("prompt 7 = %+v, want confirmed_positive, Missed=false", byPrompt[7])
 	}
 	if byPrompt[5].PromptVersionID != 42 {
 		t.Errorf("prompt 5 PromptVersionID = %d, want 42 (stamped from promptByID.CurrentVersionID)", byPrompt[5].PromptVersionID)
@@ -150,7 +146,7 @@ func TestBuildPromptExamples_MissingPromptFromMapStampsZero(t *testing.T) {
 	// Defensive: shouldn't happen (the caller builds promptByID from the same prompts the
 	// verdict map came from), but a promptID absent from the map must degrade to "no
 	// version," not panic on a missing map entry.
-	verdicts := map[int64]string{99: db.VerdictFalseNegative}
+	verdicts := map[int64]exampleVerdict{99: {Verdict: db.VerdictConfirmedPositive, Missed: true}}
 	got := buildPromptExamples(1, "msg1", "a", "b", "c", "d", verdicts, map[int64]db.Prompt{})
 	if len(got) != 1 || got[0].PromptVersionID != 0 {
 		t.Errorf("got %+v, want one example with PromptVersionID=0", got)
@@ -164,38 +160,36 @@ func TestBuildPromptExamples_EmptyVerdictsProducesNil(t *testing.T) {
 }
 
 // fakeVersionObserver records every IncrementVersionObservedBy call, keyed by
-// (promptID, versionID, verdict), for TestIncrementVersionObservedFor to assert against.
+// (promptID, versionID, kind), for TestIncrementVersionObservedFor to assert against.
 type fakeVersionObserver struct {
 	calls map[[3]any]int64
 }
 
-func (f *fakeVersionObserver) IncrementVersionObservedBy(_ context.Context, promptID, versionID int64, verdict string, n int64) {
+func (f *fakeVersionObserver) IncrementVersionObservedBy(_ context.Context, promptID, versionID int64, kind string, n int64) {
 	if f.calls == nil {
 		f.calls = map[[3]any]int64{}
 	}
-	f.calls[[3]any{promptID, versionID, verdict}] += n
+	f.calls[[3]any{promptID, versionID, kind}] += n
 }
 
 func TestIncrementVersionObservedFor(t *testing.T) {
-	// Deliberately includes a confirmed_positive example — IncrementVersionObservedBy
-	// itself (db/store.go) is responsible for skipping it, not this loop, so this test
-	// doubles as a check that the loop really does pass through every distinct key
-	// unconditionally. Also includes two examples sharing the same (promptID, versionID,
-	// verdict) — the case incrementVersionObservedFor's aggregation exists for — to confirm
-	// they collapse into one call carrying the combined count rather than two separate ones.
+	// Deliberately includes a plain confirmation (Missed: false) — exampleTriggerKind
+	// returns "" for it, and incrementVersionObservedFor must skip it rather than call
+	// through with an empty kind. Also includes two Missed examples sharing the same
+	// (promptID, versionID, kind) — the case incrementVersionObservedFor's aggregation
+	// exists for — to confirm they collapse into one call carrying the combined count.
 	examples := []db.PromptExample{
-		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictFalsePositive},
-		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictFalsePositive},
-		{PromptID: 2, PromptVersionID: 20, Verdict: db.VerdictFalseNegative},
-		{PromptID: 3, PromptVersionID: 30, Verdict: db.VerdictConfirmedPositive},
+		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictConfirmedNegative, Missed: true},
+		{PromptID: 1, PromptVersionID: 10, Verdict: db.VerdictConfirmedNegative, Missed: true},
+		{PromptID: 2, PromptVersionID: 20, Verdict: db.VerdictConfirmedPositive, Missed: true},
+		{PromptID: 3, PromptVersionID: 30, Verdict: db.VerdictConfirmedPositive, Missed: false},
 	}
 	f := &fakeVersionObserver{}
 	incrementVersionObservedFor(t.Context(), f, examples)
 
 	want := map[[3]any]int64{
-		{int64(1), int64(10), db.VerdictFalsePositive}:     2,
-		{int64(2), int64(20), db.VerdictFalseNegative}:     1,
-		{int64(3), int64(30), db.VerdictConfirmedPositive}: 1,
+		{int64(1), int64(10), db.TriggerKindFalsePositive}: 2,
+		{int64(2), int64(20), db.TriggerKindFalseNegative}: 1,
 	}
 	if len(f.calls) != len(want) {
 		t.Fatalf("expected %d distinct calls, got %d: %+v", len(want), len(f.calls), f.calls)
@@ -324,16 +318,16 @@ func TestRoundRobinBySender_RespectsBudget(t *testing.T) {
 }
 
 // ============================================================
-// sampleExamples (tiered: recurred > manual > passive, round-robin within tiers)
+// sampleExamples (tiered: recurred > missed > confirmed, round-robin within tiers)
 // ============================================================
 
-// TestSampleExamples_RecurredPrioritizedOverManualAndPassive checks Tier 1: a recurred
-// example wins a slot even when non-recurred manual/passive examples are newer.
-func TestSampleExamples_RecurredPrioritizedOverManualAndPassive(t *testing.T) {
+// TestSampleExamples_RecurredPrioritizedOverMissedAndConfirmed checks Tier 1: a recurred
+// example wins a slot even when non-recurred missed/confirmed examples are newer.
+func TestSampleExamples_RecurredPrioritizedOverMissedAndConfirmed(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 3, MessageID: "m3", Verdict: db.VerdictFalsePositive, Sender: "c@example.com", Subject: "s3", Source: db.ExampleSourceManual},
-		{ID: 2, MessageID: "m2", Verdict: db.VerdictFalsePositive, Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
-		{ID: 1, MessageID: "m1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "s1", Recurred: true},
+		{ID: 3, MessageID: "m3", Verdict: db.VerdictConfirmedNegative, Sender: "c@example.com", Subject: "s3", Missed: true},
+		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedNegative, Sender: "b@example.com", Subject: "s2"},
+		{ID: 1, MessageID: "m1", Verdict: db.VerdictConfirmedNegative, Sender: "a@example.com", Subject: "s1", Recurred: true},
 	}
 	got := sampleExamples(examples, 1)
 	if len(got) != 1 || got[0].MessageID != "m1" {
@@ -341,17 +335,17 @@ func TestSampleExamples_RecurredPrioritizedOverManualAndPassive(t *testing.T) {
 	}
 }
 
-// TestSampleExamples_ManualPrioritizedOverPassive checks Tier 2 vs Tier 3: with no
-// recurrence in play, a manually-reviewed example wins over a passively-confirmed one even
-// when the passive example is newer.
-func TestSampleExamples_ManualPrioritizedOverPassive(t *testing.T) {
+// TestSampleExamples_MissedPrioritizedOverConfirmed checks Tier 2 vs Tier 3: with no
+// recurrence in play, an example the rule got wrong wins over a plain confirmation even
+// when the confirmation is newer.
+func TestSampleExamples_MissedPrioritizedOverConfirmed(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedPositive, Sender: "b@example.com", Subject: "s2", Source: db.ExampleSourcePassive},
-		{ID: 1, MessageID: "m1", Verdict: db.VerdictConfirmedPositive, Sender: "a@example.com", Subject: "s1", Source: db.ExampleSourceManual},
+		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedPositive, Sender: "b@example.com", Subject: "s2"},
+		{ID: 1, MessageID: "m1", Verdict: db.VerdictConfirmedPositive, Sender: "a@example.com", Subject: "s1", Missed: true},
 	}
 	got := sampleExamples(examples, 1)
 	if len(got) != 1 || got[0].MessageID != "m1" {
-		t.Errorf("got %+v, want the manual example even though the passive one is newer", got)
+		t.Errorf("got %+v, want the missed example even though the confirmed one is newer", got)
 	}
 }
 
@@ -362,29 +356,29 @@ func TestSampleExamples_RecurredBudgetLeavesRoomForOtherTiers(t *testing.T) {
 	var examples []db.PromptExample
 	for i := int64(1); i <= 4; i++ {
 		examples = append(examples, db.PromptExample{
-			ID: i, MessageID: fmt.Sprintf("r%d", i), Verdict: db.VerdictFalsePositive,
+			ID: i, MessageID: fmt.Sprintf("r%d", i), Verdict: db.VerdictConfirmedNegative,
 			Sender: fmt.Sprintf("r%d@example.com", i), Subject: "s", Recurred: true,
 		})
 	}
 	examples = append(examples, db.PromptExample{
-		ID: 5, MessageID: "m", Verdict: db.VerdictFalsePositive, Sender: "manual@example.com", Subject: "s", Source: db.ExampleSourceManual,
+		ID: 5, MessageID: "m", Verdict: db.VerdictConfirmedNegative, Sender: "missed@example.com", Subject: "s", Missed: true,
 	})
 
 	got := sampleExamples(examples, 4) // recurredBudget(4) == 2
-	var recurredCount, manualCount int
+	var recurredCount, missedCount int
 	for _, ex := range got {
 		if ex.Recurred {
 			recurredCount++
 		}
-		if ex.Source == db.ExampleSourceManual {
-			manualCount++
+		if ex.Missed {
+			missedCount++
 		}
 	}
 	if recurredCount != 2 {
 		t.Errorf("recurredCount = %d, want 2 (capped at half the budget)", recurredCount)
 	}
-	if manualCount != 1 {
-		t.Errorf("manualCount = %d, want 1 (the manual example should fill the leftover budget)", manualCount)
+	if missedCount != 1 {
+		t.Errorf("missedCount = %d, want 1 (the missed example should fill the leftover budget)", missedCount)
 	}
 }
 
@@ -394,7 +388,7 @@ func TestSampleExamples_RecurredBudgetLeavesRoomForOtherTiers(t *testing.T) {
 func TestSampleExamples_IndependentPerVerdict(t *testing.T) {
 	examples := []db.PromptExample{
 		{ID: 2, MessageID: "m2", Verdict: db.VerdictConfirmedPositive, Sender: "a@example.com", Subject: "Your receipt"},
-		{ID: 1, MessageID: "m1", Verdict: db.VerdictFalsePositive, Sender: "a@example.com", Subject: "Your receipt"},
+		{ID: 1, MessageID: "m1", Verdict: db.VerdictConfirmedNegative, Sender: "a@example.com", Subject: "Your receipt"},
 	}
 	got := sampleExamples(examples, 10)
 	if len(got) != 2 {
@@ -403,7 +397,7 @@ func TestSampleExamples_IndependentPerVerdict(t *testing.T) {
 }
 
 func TestSampleExamples_ZeroCapReturnsNil(t *testing.T) {
-	if got := sampleExamples([]db.PromptExample{{Verdict: db.VerdictFalsePositive}}, 0); got != nil {
+	if got := sampleExamples([]db.PromptExample{{Verdict: db.VerdictConfirmedNegative}}, 0); got != nil {
 		t.Errorf("sampleExamples with cap 0 = %+v, want nil", got)
 	}
 }
@@ -415,8 +409,8 @@ func TestSampleExamples_ZeroCapReturnsNil(t *testing.T) {
 func TestFilterResolved(t *testing.T) {
 	resolvedBy := int64(42)
 	examples := []db.PromptExample{
-		{ID: 1, MessageID: "already-fixed", Verdict: db.VerdictFalsePositive, ResolvedBySuggestionID: &resolvedBy},
-		{ID: 2, MessageID: "still-live", Verdict: db.VerdictFalsePositive},
+		{ID: 1, MessageID: "already-fixed", Verdict: db.VerdictConfirmedNegative, Missed: true, ResolvedBySuggestionID: &resolvedBy},
+		{ID: 2, MessageID: "still-live", Verdict: db.VerdictConfirmedNegative, Missed: true},
 		{ID: 3, MessageID: "confirmed", Verdict: db.VerdictConfirmedPositive},
 	}
 	got := filterResolved(examples)
@@ -430,18 +424,17 @@ func TestFilterResolved(t *testing.T) {
 	}
 }
 
-// TestProblemExampleKeys checks problemExampleKeys only picks false_negative/
-// false_positive entries — confirmed_positive examples are guardrails, not problems, and
-// must never end up marked resolved.
+// TestProblemExampleKeys checks problemExampleKeys only picks Missed entries — a plain
+// confirmation is a guardrail, not a problem, and must never end up marked resolved.
 func TestProblemExampleKeys(t *testing.T) {
 	examples := []db.PromptExample{
-		{ID: 1, PromptID: 5, Verdict: db.VerdictFalseNegative, CreatedAt: "2026-07-01 12:00:00"},
-		{ID: 2, PromptID: 5, Verdict: db.VerdictFalsePositive, CreatedAt: "2026-07-01 12:00:01"},
+		{ID: 1, PromptID: 5, Verdict: db.VerdictConfirmedPositive, Missed: true, CreatedAt: "2026-07-01 12:00:00"},
+		{ID: 2, PromptID: 5, Verdict: db.VerdictConfirmedNegative, Missed: true, CreatedAt: "2026-07-01 12:00:01"},
 		{ID: 3, PromptID: 5, Verdict: db.VerdictConfirmedPositive, CreatedAt: "2026-07-01 12:00:02"},
 	}
 	got := problemExampleKeys(examples)
 	if len(got) != 2 {
-		t.Fatalf("got %d keys, want 2 (confirmed_positive excluded): %+v", len(got), got)
+		t.Fatalf("got %d keys, want 2 (plain confirmation excluded): %+v", len(got), got)
 	}
 	wantIDs := map[int64]bool{1: true, 2: true}
 	for _, k := range got {

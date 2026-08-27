@@ -35,13 +35,22 @@
       </div>
     </td>
     <td class="col-edit">
-      <button class="btn btn-outline-secondary btn-sm"
-        hx-get="/fragments/history/{{.ID}}/recategorize"
-        hx-target="#recategorize-modal-body"
-        hx-swap="innerHTML"
-        hx-on::after-request="new bootstrap.Modal(document.getElementById('recategorize-modal')).show()">
-        ✏ Recategorize
-      </button>
+      <div class="d-flex flex-column gap-1">
+        <button class="btn btn-outline-secondary btn-sm"
+          hx-get="/fragments/history/{{.ID}}/recategorize"
+          hx-target="#recategorize-modal-body"
+          hx-swap="innerHTML"
+          hx-on::after-request="new bootstrap.Modal(document.getElementById('recategorize-modal')).show()">
+          ✏ Recategorize
+        </button>
+        <button class="btn btn-outline-success btn-sm"
+          title="Record this email's current labeling as confirmed, for every rule"
+          hx-post="/fragments/history/{{.ID}}/confirm"
+          hx-swap="none"
+          hx-disabled-elt="this">
+          ✓ Confirm
+        </button>
+      </div>
     </td>
   </tr>
 {{end}}

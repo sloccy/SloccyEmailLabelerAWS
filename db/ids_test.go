@@ -71,8 +71,8 @@ func TestPkExample(t *testing.T) {
 // newest example first, which requires SK to sort lexicographically by timestamp within a
 // fixed verdict prefix.
 func TestExampleSK_SortsNewestFirstWithinVerdict(t *testing.T) {
-	older := exampleSK(VerdictFalsePositive, "2026-07-01 12:00:00", 1)
-	newer := exampleSK(VerdictFalsePositive, "2026-07-02 12:00:00", 2)
+	older := exampleSK(VerdictConfirmedNegative, "2026-07-01 12:00:00", 1)
+	newer := exampleSK(VerdictConfirmedNegative, "2026-07-02 12:00:00", 2)
 	if older >= newer {
 		t.Errorf("exampleSK ordering: older SK %q should sort before newer SK %q", older, newer)
 	}
