@@ -82,12 +82,14 @@ func parseBulkSelections(values []string) []bulkMessageKey {
 // different table: a bulk "apply to all" / "remove from all" action isn't a per-email
 // review, so unlike the single-email checkbox table, there is no "left unchanged, still
 // records something" case — only rules the user explicitly pointed at this message's rule
-// set produce a verdict.
+// set produce a verdict, and "remove" on a rule that wasn't even applied records nothing at
+// all, same reasoning as singleRecategorizeVerdicts' "still doesn't match" skip — see
+// db.VerdictConfirmedNegative's doc comment.
 //
 //	apply, not already applied  -> confirmed_positive, missed  (rule missed it)
 //	apply, already applied      -> confirmed_positive
 //	remove, already applied     -> confirmed_negative, missed  (rule wrongly caught it)
-//	remove, not applied         -> confirmed_negative
+//	remove, not applied         -> (nothing)
 //	no change                   -> (nothing)
 func bulkVerdictsAndPlan(current map[int64]bool, applyIDs, removeIDs []int64, promptByID map[int64]db.Prompt) (verdicts map[int64]exampleVerdict, keptIDs []int64, added []db.Prompt) {
 	applySet := idSet(applyIDs)
@@ -111,7 +113,10 @@ func bulkVerdictsAndPlan(current map[int64]bool, applyIDs, removeIDs []int64, pr
 		if applySet[pid] {
 			continue // contradictory; same defensive ignore as the apply loop above
 		}
-		verdicts[pid] = exampleVerdict{Verdict: db.VerdictConfirmedNegative, Missed: current[pid]}
+		if !current[pid] {
+			continue // wasn't applied; nothing was actually corrected here
+		}
+		verdicts[pid] = exampleVerdict{Verdict: db.VerdictConfirmedNegative, Missed: true}
 	}
 	for pid := range current {
 		if !removeSet[pid] {
@@ -406,11 +411,12 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleBulkConfirmCategorization is the bulk counterpart to handleConfirmCategorization —
-// records the current prompt-match state of every selected email as a confirmed example for
-// every active rule on its account, without touching Gmail, history, or suggestions. Shares
-// bulkRecategorizeMaxEmails and parseBulkSelections with the bulk recategorize handler
-// above; unlike it, there's no apply/remove action set to read, since confirm always means
-// "the current state is correct."
+// records a confirmed_positive example on every selected email for each of its
+// currently-applied rules (see confirmCategorization's doc comment for why every other
+// active rule gets nothing, not a confirmed_negative), without touching Gmail, history, or
+// suggestions. Shares bulkRecategorizeMaxEmails and parseBulkSelections with the bulk
+// recategorize handler above; unlike it, there's no apply/remove action set to read, since
+// confirm always means "the current state is correct."
 func (s *server) handleBulkConfirmCategorization(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if err := r.ParseForm(); err != nil {

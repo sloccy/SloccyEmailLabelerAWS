@@ -16,6 +16,13 @@ const (
 // anymore. That distinction is now carried by PromptExample.Missed instead of by which
 // bucket the row lands in (see db/models.go's doc comment on PromptExample), so a rule's
 // example corpus stays exactly two lists no matter how the row was produced.
+//
+// VerdictConfirmedNegative is deliberately never written for a rule that simply didn't
+// match and still doesn't — only for a rule the user actually unchecked (Missed: true, a
+// real "this was wrong" correction). Every active rule not involved in a given review would
+// otherwise pick up a negative example on every single email anyone reviews, burying the
+// rules that actually need attention in negatives nobody explicitly confirmed. See
+// singleRecategorizeVerdicts/bulkVerdictsAndPlan (recategorize.go/recategorize_bulk.go).
 const (
 	VerdictConfirmedPositive = "confirmed_positive"
 	VerdictConfirmedNegative = "confirmed_negative"

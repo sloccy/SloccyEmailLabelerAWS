@@ -76,17 +76,25 @@ type exampleVerdict struct {
 }
 
 // singleRecategorizeVerdicts computes, for a single-email recategorization, an
-// exampleVerdict for *every* active prompt on the account — not just the ones the user
-// touched. This mirrors the full checkbox state the user actually saw in
-// recategorize_form.html: every rule on that form got an explicit checked/unchecked
-// decision, so every rule's post-correction state is real signal, whether or not it
-// changed. Compare bulkVerdictsAndPlan, whose table only covers rules the user explicitly
-// pointed at, because a bulk "apply to all" / "remove from all" action isn't a per-email
-// review and doesn't put every rule in front of the user the way this form does.
+// exampleVerdict for every active prompt on the account that the post-correction state
+// actually has an opinion on. This mirrors the full checkbox state the user actually saw in
+// recategorize_form.html: a rule now checked is real signal (confirmed_positive, whether it
+// was already checked or the user just added it), and a rule the user just *unchecked* is
+// real signal too (confirmed_negative — a genuine "this was wrong" correction). A rule left
+// unchecked before and after gets nothing: recording every untouched rule as a negative on
+// every reviewed email would flood each rule's negative list with noise nobody actually
+// confirmed, just because the rule happened not to be involved in this particular review —
+// see db.VerdictConfirmedNegative's doc comment. Compare bulkVerdictsAndPlan, whose table
+// only covers rules the user explicitly pointed at, because a bulk "apply to all" / "remove
+// from all" action isn't a per-email review and doesn't put every rule in front of the user
+// the way this form does.
 func singleRecategorizeVerdicts(allPromptIDs []int64, currentIDs, requestedIDs map[int64]bool) map[int64]exampleVerdict {
 	verdicts := make(map[int64]exampleVerdict, len(allPromptIDs))
 	for _, pid := range allPromptIDs {
 		was, is := currentIDs[pid], requestedIDs[pid]
+		if !was && !is {
+			continue // still doesn't match; nothing was confirmed or corrected here
+		}
 		v := exampleVerdict{Missed: was != is}
 		if is {
 			v.Verdict = db.VerdictConfirmedPositive
@@ -280,8 +288,8 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 
 	s.applyRecategorizeToGmail(ctx, svc, []string{row.MessageID}, promptByID, addedIDs, removedIDs)
 
-	// Record a permanent example for every active rule on the account, not just the ones
-	// this correction touched — see singleRecategorizeVerdicts for the exact table. This is
+	// Record a permanent example for every rule this email now matches, or that the user
+	// just unmatched it from — see singleRecategorizeVerdicts for the exact table. This is
 	// the corpus AI prompt improvement now draws from (selectExamplesForImprove,
 	// improve.go), instead of seeing only whatever single email triggered the current round.
 	verdicts := singleRecategorizeVerdicts(allPromptIDs, currentIDs, requested)
@@ -376,14 +384,16 @@ func (s *server) handleConfirmCategorization(w http.ResponseWriter, r *http.Requ
 }
 
 // confirmCategorization records accountID/messageID's current prompt-match state as a
-// confirmed example for every active rule on the account — every currently-applied prompt
-// gets confirmed_positive, every other active prompt gets confirmed_negative, all with
-// Missed: false, since nothing here was actually corrected. Shared by the single (see
-// handleConfirmCategorization above) and bulk (recategorize_bulk.go) confirm handlers.
-// Unlike handleRecategorize, a failed message fetch doesn't cancel the write — sender/
-// subject from the history row are still useful signal even with an empty body excerpt,
-// matching the bulk recategorize path's own tolerance for a missing excerpt (see
-// fetchExcerptsBounded, recategorize_bulk.go).
+// confirmed_positive example for every currently-applied prompt — nothing is written for
+// the account's other active rules, since "this rule wasn't involved" isn't a confirmed
+// negative (see db.VerdictConfirmedNegative's doc comment on why that would just be noise on
+// every rule's negative list). Since currentIDs is passed as both the "before" and "after"
+// state, singleRecategorizeVerdicts' Missed computation is always false here, matching
+// "nothing was actually corrected." Shared by the single (see handleConfirmCategorization
+// above) and bulk (recategorize_bulk.go) confirm handlers. Unlike handleRecategorize, a
+// failed message fetch doesn't cancel the write — sender/subject from the history row are
+// still useful signal even with an empty body excerpt, matching the bulk recategorize
+// path's own tolerance for a missing excerpt (see fetchExcerptsBounded, recategorize_bulk.go).
 func (s *server) confirmCategorization(ctx context.Context, accountID int64, messageID, fallbackSender, fallbackSubject string) {
 	currentIDs, err := s.store.GetCurrentPromptIDsForMessage(ctx, accountID, messageID)
 	if err != nil {
