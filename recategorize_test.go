@@ -9,12 +9,14 @@ import (
 	"github.com/sloccy/ollamail-aws/db"
 )
 
-// TestSingleRecategorizeVerdicts locks in the single-email verdict table from the plan:
-// every active prompt gets a verdict, and Missed is set exactly when the box actually
-// changed (checked -> confirmed_positive, unchecked -> confirmed_negative either way).
+// TestSingleRecategorizeVerdicts locks in the single-email verdict table: a rule now
+// checked is confirmed_positive (Missed only if it wasn't checked before), a rule just
+// unchecked is confirmed_negative with Missed true (a real correction), and a rule that
+// still doesn't match records nothing at all — not a confirmed_negative — so an untouched
+// rule doesn't pick up negative noise on every review.
 func TestSingleRecategorizeVerdicts(t *testing.T) {
 	// Prompt 1: newly checked (added).  Prompt 2: newly unchecked (removed).
-	// Prompt 3: left checked (kept).   Prompt 4: left unchecked (untouched).
+	// Prompt 3: left checked (kept).   Prompt 4: left unchecked (untouched — no verdict).
 	allPromptIDs := []int64{1, 2, 3, 4}
 	currentIDs := map[int64]bool{2: true, 3: true}
 	requestedIDs := map[int64]bool{1: true, 3: true}
@@ -25,7 +27,6 @@ func TestSingleRecategorizeVerdicts(t *testing.T) {
 		1: {Verdict: db.VerdictConfirmedPositive, Missed: true},
 		2: {Verdict: db.VerdictConfirmedNegative, Missed: true},
 		3: {Verdict: db.VerdictConfirmedPositive, Missed: false},
-		4: {Verdict: db.VerdictConfirmedNegative, Missed: false},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d verdicts, want %d: %+v", len(got), len(want), got)
@@ -34,6 +35,9 @@ func TestSingleRecategorizeVerdicts(t *testing.T) {
 		if got[pid] != wantVerdict {
 			t.Errorf("prompt %d: verdict = %+v, want %+v", pid, got[pid], wantVerdict)
 		}
+	}
+	if _, ok := got[4]; ok {
+		t.Errorf("prompt 4 (still doesn't match) should record nothing, got %+v", got[4])
 	}
 }
 
@@ -44,15 +48,31 @@ func TestSingleRecategorizeVerdicts_NoPrompts(t *testing.T) {
 	}
 }
 
-// TestBulkVerdictsAndPlan locks in the bulk verdict table from the plan, which
-// deliberately differs from the single-email table: only rules explicitly set to apply/
-// remove produce a verdict, since a bulk action isn't a per-email review.
+// TestSingleRecategorizeVerdicts_ConfirmUnmatchedRecordsNothing exercises confirmCategorization's
+// use of this function (was == is for every prompt): a rule the email already doesn't match
+// stays silent rather than picking up a confirmed_negative every time any email is confirmed.
+func TestSingleRecategorizeVerdicts_ConfirmUnmatchedRecordsNothing(t *testing.T) {
+	same := map[int64]bool{1: true}
+	got := singleRecategorizeVerdicts([]int64{1, 2}, same, same)
+	want := map[int64]exampleVerdict{1: {Verdict: db.VerdictConfirmedPositive}}
+	if len(got) != len(want) || got[1] != want[1] {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, ok := got[2]; ok {
+		t.Errorf("prompt 2 (unmatched, unchanged) should record nothing, got %+v", got[2])
+	}
+}
+
+// TestBulkVerdictsAndPlan locks in the bulk verdict table, which deliberately differs from
+// the single-email table: only rules explicitly set to apply/remove produce a verdict, a
+// bulk action isn't a per-email review — and "remove" on a rule that wasn't even applied
+// records nothing at all, same as an untouched rule in the single-email table.
 func TestBulkVerdictsAndPlan(t *testing.T) {
 	promptByID := map[int64]db.Prompt{
 		1: {ID: 1, Name: "apply-missing"},  // apply, not already applied -> confirmed_positive, missed
 		2: {ID: 2, Name: "apply-present"},  // apply, already applied -> confirmed_positive
 		3: {ID: 3, Name: "remove-present"}, // remove, already applied -> confirmed_negative, missed
-		4: {ID: 4, Name: "remove-missing"}, // remove, not applied -> confirmed_negative
+		4: {ID: 4, Name: "remove-missing"}, // remove, not applied -> nothing
 		5: {ID: 5, Name: "untouched"},      // no change -> nothing
 	}
 	current := map[int64]bool{2: true, 3: true, 5: true}
@@ -65,7 +85,6 @@ func TestBulkVerdictsAndPlan(t *testing.T) {
 		1: {Verdict: db.VerdictConfirmedPositive, Missed: true},
 		2: {Verdict: db.VerdictConfirmedPositive, Missed: false},
 		3: {Verdict: db.VerdictConfirmedNegative, Missed: true},
-		4: {Verdict: db.VerdictConfirmedNegative, Missed: false},
 	}
 	if len(verdicts) != len(wantVerdicts) {
 		t.Fatalf("got %d verdicts, want %d: %+v", len(verdicts), len(wantVerdicts), verdicts)
@@ -75,8 +94,10 @@ func TestBulkVerdictsAndPlan(t *testing.T) {
 			t.Errorf("prompt %d: verdict = %+v, want %+v", pid, verdicts[pid], want)
 		}
 	}
-	if _, ok := verdicts[5]; ok {
-		t.Errorf("prompt 5 (untouched) should record nothing, got %+v", verdicts[5])
+	for _, untouched := range []int64{4, 5} {
+		if _, ok := verdicts[untouched]; ok {
+			t.Errorf("prompt %d should record nothing, got %+v", untouched, verdicts[untouched])
+		}
 	}
 
 	// History plan: kept = current prompts not being removed (2, 5 — prompt 3 is removed).

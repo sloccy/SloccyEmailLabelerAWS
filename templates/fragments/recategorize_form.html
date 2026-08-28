@@ -7,7 +7,7 @@
     <div class="fw-semibold text-truncate">{{if .Subject}}{{.Subject}}{{else}}(no subject){{end}}</div>
     <div class="small text-muted text-truncate">{{.Sender}}</div>
   </div>
-  <p class="small text-muted mb-3">Select which rules should apply to this email. Changes are applied to Gmail immediately. Applying records every rule's state here as a confirmed positive or negative example for AI prompt improvement — not just the ones you change. Check <em>Improve prompt</em> on any changed rule to have AI rewrite its instructions to prevent this misclassification in future scans.</p>
+  <p class="small text-muted mb-3">Select which rules should apply to this email. Changes are applied to Gmail immediately. Applying records this as a confirming or correcting example for AI prompt improvement, for every rule checked here or just unchecked. Check <em>Improve prompt</em> on any changed rule to have AI rewrite its instructions to prevent this misclassification in future scans.</p>
   <form id="recategorize-form"
     hx-post="/fragments/history/{{.HistoryID}}/recategorize"
     hx-swap="none"
