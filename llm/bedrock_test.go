@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -733,6 +734,30 @@ func TestBuildImproveUserTurn_EmptyCorpusStaysCoherent(t *testing.T) {
 			t.Errorf("empty section heading %q should be omitted entirely, got: %q", heading, turn)
 		}
 	}
+	if strings.Contains(turn, "SAMPLE") {
+		t.Errorf("the examples-are-a-sample framing line should be omitted with no examples at all, got: %q", turn)
+	}
+}
+
+// TestBuildImproveUserTurn_SampleFramingPresentWithExamples locks in the
+// generalization-over-enumeration fix: when any example section is populated, the user
+// turn must tell the model the examples are a sample it will be scored beyond, before it
+// ever lists them — see buildImproveUserTurn's doc comment.
+func TestBuildImproveUserTurn_SampleFramingPresentWithExamples(t *testing.T) {
+	turn := buildImproveUserTurn(ImproveRequest{
+		PromptName:           "Newsletters",
+		LabelName:            "News",
+		OriginalInstructions: "Matches newsletters.",
+		ShouldMatch:          []ExampleRef{{Sender: "a@example.com", Subject: "Weekly digest", Excerpt: "top stories"}},
+	})
+	if !strings.Contains(turn, "SAMPLE") {
+		t.Errorf("expected the sample-framing line when examples are present, got: %q", turn)
+	}
+	sampleIdx := strings.Index(turn, "SAMPLE")
+	matchIdx := strings.Index(turn, "SHOULD MATCH")
+	if sampleIdx < 0 || matchIdx < 0 || sampleIdx > matchIdx {
+		t.Errorf("expected the sample framing to appear before the example sections, got: %q", turn)
+	}
 }
 
 func TestBuildImproveUserTurn_RendersPopulatedSections(t *testing.T) {
@@ -1392,6 +1417,186 @@ func TestReplayAgainstExamples_ConcurrencyZeroIsUnbounded(t *testing.T) {
 			t.Errorf("maxInFlight = %d, want exactly 1 for concurrency: 1", fake.maxInFlight)
 		}
 	})
+}
+
+// TestReplayAgainstExamples_RetriesErroredOnce checks that an example whose first classify
+// call errors gets one retry before being counted against Errored — a transient throttle
+// shouldn't permanently shrink the sample. concurrency: 1 keeps both the initial fan-out
+// and the retry pass strictly ordered (sem size 1 forces submission order), so the fake's
+// canned outputs line up with call index by position: calls 0-2 are the initial pass over
+// examples 0/1/2 in order, call 3 is the lone retry for example 0.
+func TestReplayAgainstExamples_RetriesErroredOnce(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{
+			nil,                       // example 0, first attempt: errors
+			textOutput(`{"1": true}`), // example 1
+			textOutput(`{"1": true}`), // example 2
+			textOutput(`{"1": true}`), // example 0, retry: succeeds
+		},
+		errs: []error{errors.New("boom"), nil, nil, nil},
+	}
+	cl := &Client{br: fake, defaultModel: "m"}
+	examples := []ReplayExample{
+		{Verdict: "confirmed_positive", Sender: "a@example.com", Subject: "s0", Excerpt: "e0", Want: true},
+		{Verdict: "confirmed_positive", Sender: "b@example.com", Subject: "s1", Excerpt: "e1", Want: true},
+		{Verdict: "confirmed_positive", Sender: "c@example.com", Subject: "s2", Excerpt: "e2", Want: true},
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if len(fake.calls) != 4 {
+		t.Fatalf("expected 4 Converse calls (3 initial + 1 retry), got %d", len(fake.calls))
+	}
+	if res.Errored != 0 {
+		t.Errorf("Errored = %d, want 0 — the retry should have recovered the one transient failure", res.Errored)
+	}
+	if res.Total != 3 || res.Passed != 3 {
+		t.Errorf("Total/Passed = %d/%d, want 3/3 after the retry succeeds", res.Total, res.Passed)
+	}
+}
+
+// TestReplayAgainstExamples_StillErroredAfterRetry checks that an example that fails
+// twice (initial attempt + retry) is counted in Errored and excluded from Total/Passed —
+// the retry is a second chance, not a guarantee.
+func TestReplayAgainstExamples_StillErroredAfterRetry(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{nil, textOutput(`{"1": true}`), nil},
+		errs:    []error{errors.New("boom"), nil, errors.New("boom again")},
+	}
+	cl := &Client{br: fake, defaultModel: "m"}
+	examples := []ReplayExample{
+		{Verdict: "confirmed_positive", Sender: "a@example.com", Subject: "s0", Excerpt: "e0", Want: true},
+		{Verdict: "confirmed_positive", Sender: "b@example.com", Subject: "s1", Excerpt: "e1", Want: true},
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.Errored != 1 {
+		t.Errorf("Errored = %d, want 1", res.Errored)
+	}
+	if res.Total != 1 || res.Passed != 1 {
+		t.Errorf("Total/Passed = %d/%d, want 1/1", res.Total, res.Passed)
+	}
+}
+
+// TestReplayAgainstExamples_BaselineNeverExceedsTotal reproduces the "23/3" production bug
+// directly: a corpus where most classify calls error out (even after the retry pass) must
+// never report a Baseline larger than Total — the two have to share one denominator.
+func TestReplayAgainstExamples_BaselineNeverExceedsTotal(t *testing.T) {
+	fake := &fakeConverseAPI{
+		outputs: []*bedrockruntime.ConverseOutput{textOutput(`{"1": true}`)}, // only call 0 ever succeeds
+		errs:    []error{nil, errors.New("boom"), errors.New("boom"), errors.New("boom")},
+	}
+	cl := &Client{br: fake, defaultModel: "m"}
+	examples := make([]ReplayExample, 4)
+	for i := range examples {
+		examples[i] = ReplayExample{
+			Verdict: "confirmed_positive", Sender: fmt.Sprintf("s%d@example.com", i), Subject: "x", Excerpt: "y",
+			Want: true, WasCorrect: true,
+		}
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.Total != 1 {
+		t.Fatalf("Total = %d, want 1 (only one example ever classified successfully, even after retry)", res.Total)
+	}
+	if res.Errored != 3 {
+		t.Errorf("Errored = %d, want 3", res.Errored)
+	}
+	if res.Baseline > res.Total {
+		t.Errorf("Baseline (%d) > Total (%d) — this is exactly the production '23/3' bug: baseline must share Total's denominator", res.Baseline, res.Total)
+	}
+	if res.Baseline != 1 {
+		t.Errorf("Baseline = %d, want 1 (only the one scored example's WasCorrect counts)", res.Baseline)
+	}
+}
+
+// TestReplayAgainstExamples_HeldOutSplit checks that HeldOutTotal/HeldOutPassed count only
+// the subset of Total/Passed whose ReplayExample.HeldOut was true.
+func TestReplayAgainstExamples_HeldOutSplit(t *testing.T) {
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{
+		textOutput(`{"1": true}`),
+		textOutput(`{"1": false}`),
+		textOutput(`{"1": true}`),
+	}}
+	cl := &Client{br: fake, defaultModel: "m"}
+	examples := []ReplayExample{
+		{Verdict: "confirmed_positive", Sender: "a@example.com", Want: true, HeldOut: false}, // shown, passes
+		{Verdict: "confirmed_positive", Sender: "b@example.com", Want: true, HeldOut: true},  // held-out, fails
+		{Verdict: "confirmed_positive", Sender: "c@example.com", Want: true, HeldOut: true},  // held-out, passes
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.Total != 3 || res.Passed != 2 {
+		t.Fatalf("Total/Passed = %d/%d, want 3/2", res.Total, res.Passed)
+	}
+	if res.HeldOutTotal != 2 || res.HeldOutPassed != 1 {
+		t.Errorf("HeldOutTotal/HeldOutPassed = %d/%d, want 2/1", res.HeldOutTotal, res.HeldOutPassed)
+	}
+}
+
+// ============================================================
+// senderDomainLabel / CitesExamples
+// ============================================================
+
+func TestSenderDomainLabel(t *testing.T) {
+	cases := []struct{ sender, want string }{
+		{"notifications@github.com", "github"},
+		{`"GitHub" <notifications@github.com>`, "github"},
+		{"someone@gmail.com", ""}, // common free-mail provider excluded
+		{"no-at-sign", ""},        // not an email address at all
+		{"a@ab.com", ""},          // label too short to be a meaningful token
+		{"Team <updates@stripe.com>", "stripe"},
+	}
+	for _, c := range cases {
+		if got := senderDomainLabel(c.sender); got != c.want {
+			t.Errorf("senderDomainLabel(%q) = %q, want %q", c.sender, got, c.want)
+		}
+	}
+}
+
+func TestCitesExamples(t *testing.T) {
+	examples := []ReplayExample{
+		{Sender: "notifications@github.com"},
+		{Sender: "receipts@stripe.com"},
+	}
+	t.Run("catches a brand lifted from an example's sender", func(t *testing.T) {
+		hits := CitesExamples("Email is from GitHub about a pull request", examples)
+		if len(hits) != 1 || hits[0] != "github" {
+			t.Errorf("hits = %v, want [github]", hits)
+		}
+	})
+	t.Run("does not fire on a generic category word", func(t *testing.T) {
+		hits := CitesExamples("A payment receipt or invoice confirmation email", examples)
+		if len(hits) != 0 {
+			t.Errorf("hits = %v, want none", hits)
+		}
+	})
+	t.Run("no examples means nothing to check against", func(t *testing.T) {
+		if hits := CitesExamples("anything at all", nil); hits != nil {
+			t.Errorf("hits = %v, want nil", hits)
+		}
+	})
+}
+
+// ============================================================
+// Prompt shape: no numeric word-count target
+// ============================================================
+
+// wordCountTargetRe matches the shape of a numeric length ceiling like "60 words" or
+// "at most 40 words" — what this codebase used to put in both generate/improve system
+// prompts and, per this repo's project memory, is exactly what small models fixate on and
+// pad short answers up to rather than treating as a ceiling.
+var wordCountTargetRe = regexp.MustCompile(`\d+[\s-]*words?\b`)
+
+func TestGenerateAndImprovePrompts_NoWordCountTarget(t *testing.T) {
+	prompts := map[string]string{
+		"generateSystemPrompt": generateSystemPrompt,
+		"improveSystemPrompt":  improveSystemPrompt,
+	}
+	for name, p := range prompts {
+		if m := wordCountTargetRe.FindString(p); m != "" {
+			t.Errorf("%s still states a numeric word-count target (%q) — this is the fixation bug being fixed", name, m)
+		}
+	}
 }
 
 // TestNewBedrockRetryer_RetriesClockSkewAndThrottling checks that the retryer built by

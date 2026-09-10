@@ -2619,7 +2619,8 @@ func (s *Store) ListPromptSuggestions(ctx context.Context) ([]PromptSuggestion, 
 func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePromptSuggestionParams) error {
 	return s.updateItem(ctx, "SUGGESTION", padID(arg.ID),
 		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua, "+
-			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayFailures = :rf, "+
+			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayErrored = :re, "+
+			"replayHeldOutTotal = :rhot, replayHeldOutPassed = :rhop, replayFailures = :rf, "+
 			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br",
 		map[string]string{"#s": attrStatus},
 		map[string]types.AttributeValue{
@@ -2632,6 +2633,9 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			":rt":         nv(arg.ReplayTotal),
 			":rp":         nv(arg.ReplayPassed),
 			":rb":         nv(arg.ReplayBaseline),
+			":re":         nv(arg.ReplayErrored),
+			":rhot":       nv(arg.ReplayHeldOutTotal),
+			":rhop":       nv(arg.ReplayHeldOutPassed),
 			":rf":         sv(arg.ReplayFailures),
 			":pk":         sv(arg.ProblemExampleKeys),
 			":rj":         sv(arg.RoundsJSON),
@@ -3096,11 +3100,14 @@ type FinalizePromptSuggestionParams struct {
 	// Replay validation fields — always set (possibly zero-value when replay didn't run,
 	// e.g. improve_replay disabled or the improve call itself failed). See
 	// PromptSuggestion's doc comment in db/models.go.
-	ReplayModel    string
-	ReplayTotal    int64
-	ReplayPassed   int64
-	ReplayBaseline int64
-	ReplayFailures string
+	ReplayModel         string
+	ReplayTotal         int64
+	ReplayPassed        int64
+	ReplayBaseline      int64
+	ReplayErrored       int64
+	ReplayHeldOutTotal  int64
+	ReplayHeldOutPassed int64
+	ReplayFailures      string
 
 	// ProblemExampleKeys is a JSON-encoded []ResolvedExampleKey — see PromptSuggestion's
 	// doc comment in db/models.go. Empty ("") on a failed improve call, since nothing was

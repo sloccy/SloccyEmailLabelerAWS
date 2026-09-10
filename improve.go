@@ -293,15 +293,34 @@ func improveExampleCap(ctx context.Context, store *db.Store) int {
 }
 
 // replayExampleCap resolves llm.SettingReplayExampleCap — how many examples per verdict
-// ReplayAgainstExamples scores a candidate rule against (see improveAndFinalizeSuggestion).
-// Deliberately independent of and larger than improveExampleCap (see
-// SettingReplayExampleCap's doc comment, llm/bedrock.go).
+// ReplayAgainstExamples scores a candidate rule against. improveAndFinalizeSuggestion
+// doesn't call this directly (it resolves the same setting from its own batched
+// loadSettings map instead, to avoid a second GetSetting round trip in the hot round
+// loop) — this free-function form exists for prune.go's prunePromptExamples, a once-daily
+// scheduled call with no batched settings map of its own to read from.
 func replayExampleCap(ctx context.Context, store *db.Store) int {
 	v, err := store.GetSetting(ctx, llm.SettingReplayExampleCap)
 	if err != nil || v == "" {
 		return llm.ReplayExampleCapDefault
 	}
 	return parseExampleCap(v, llm.ReplayExampleCapDefault, llm.ReplayExampleCapMax)
+}
+
+// parseReplayConcurrency is the pure parsing/clamping core for llm.SettingReplayConcurrency
+// — how many classify calls ReplayAgainstExamples runs at once (see
+// llm.ReplayConcurrencyDefault's doc comment for why this must be bounded, not
+// 0/unbounded). Unset, unparsable, or non-positive falls back to the default; there's no
+// separate cap constant the way the example caps have one — an operator setting this by
+// hand is trusted the same way SettingClassifyModel is. Takes the raw setting value
+// directly (mirroring parseExampleCap/parseImproveMaxRounds) so improveAndFinalizeSuggestion
+// can resolve it from the one batched loadSettings map instead of its own GetSetting round
+// trip.
+func parseReplayConcurrency(raw string) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return llm.ReplayConcurrencyDefault
+	}
+	return n
 }
 
 // selectExamplesForImprove curates the small, token-bounded example set the improve prompt
@@ -599,8 +618,17 @@ func improveRequestExamples(examples []db.PromptExample) (shouldMatch, shouldNot
 
 // replayExamplesFor converts a rule's example corpus into llm.ReplayExample values:
 // confirmed_positive examples are expected to match the candidate rule, confirmed_negative
-// examples are expected not to.
-func replayExamplesFor(examples []db.PromptExample) []llm.ReplayExample {
+// examples are expected not to. shown is the (much smaller) example set the improve prompt
+// itself was built from (selectExamplesForImprove/improveRequestExamples) — any example in
+// examples whose MessageID also appears in shown is marked HeldOut=false; everything else
+// is HeldOut=true, i.e. an example the model rewriting the rule never saw. See
+// ReplayExample.HeldOut's doc comment (llm/bedrock.go) for why that split is what lets
+// selectBestRound penalize a rewrite that merely enumerates the examples it was shown.
+func replayExamplesFor(examples []db.PromptExample, shown []db.PromptExample) []llm.ReplayExample {
+	shownIDs := make(map[string]bool, len(shown))
+	for _, ex := range shown {
+		shownIDs[ex.MessageID] = true
+	}
 	out := make([]llm.ReplayExample, len(examples))
 	for i, ex := range examples {
 		out[i] = llm.ReplayExample{
@@ -609,6 +637,13 @@ func replayExamplesFor(examples []db.PromptExample) []llm.ReplayExample {
 			Subject: ex.Subject,
 			Excerpt: ex.BodyExcerpt,
 			Want:    ex.Verdict == db.VerdictConfirmedPositive,
+			HeldOut: !shownIDs[ex.MessageID],
+			// WasCorrect is the inverse of Missed, not of Verdict — see
+			// llm.ReplayExample.WasCorrect's doc comment. A confirmed_negative example the
+			// rule already correctly left unmatched is just as much "already correct" as a
+			// confirmed_positive one it already matched; Missed is what actually says
+			// whether the rule agreed with this verdict before the review that produced it.
+			WasCorrect: !ex.Missed,
 		}
 	}
 	return out
@@ -672,16 +707,85 @@ func parseImproveMaxRounds(raw string) int {
 	return n
 }
 
-// selectBestRound returns the index into rounds of the best-scoring round: strictly
-// higher Passed wins; a tie keeps the earlier round, since it's closer to the user's
-// original scope and later rounds tend to drift wider chasing a handful of edge cases.
-// Returns -1 for an empty slice. Used both to pick the round improveAndFinalizeSuggestion
-// finalizes and, inline in its loop, to answer "did the round I just ran actually improve
-// on what came before?" (see improveLoopStop) — one comparison rule, not two.
-func selectBestRound(rounds []db.SuggestionRoundSummary) int {
+// minReplayCoverage is the minimum fraction of a round's submitted replay examples that
+// must actually have been scored (Total / (Total+Errored)) before that score is trusted
+// for anything — calling improveLoopStop's "perfect score" branch, or letting
+// selectBestRound rank a round on its pass rate rather than falling back to a tie-break. A
+// literal 3/3 out of 26 submitted examples is not a perfect score, it's an outage: the
+// unbounded classify fan-out this codebase used to run (see ReplayConcurrencyDefault,
+// llm/bedrock.go) could time out most of a round's corpus at once and still read as a
+// flawless result. 0.6 is a floor, not a target — chosen so an isolated handful of
+// throttled calls doesn't discard an otherwise-good round, while a batch that mostly
+// failed reliably falls below it.
+const minReplayCoverage = 0.6
+
+// hasAdequateCoverage reports whether scored/submitted clears minReplayCoverage.
+// submitted == 0 (nothing was even attempted) is never adequate, regardless of the
+// threshold — there's no score to have coverage of.
+func hasAdequateCoverage(scored, submitted int64) bool {
+	if submitted <= 0 {
+		return false
+	}
+	return float64(scored)/float64(submitted) >= minReplayCoverage
+}
+
+// passRate is passed/total as a float, or -1 for a zero total — so "no evidence at all"
+// always compares as worse than any real rate instead of reading identically to a 0% one.
+func passRate(passed, total int64) float64 {
+	if total <= 0 {
+		return -1
+	}
+	return float64(passed) / float64(total)
+}
+
+// roundBetter reports whether a is strictly better than b, under selectBestRound's
+// ordering. heldOutSubmitted is passed through unchanged from selectBestRound.
+func roundBetter(a, b db.SuggestionRoundSummary, heldOutSubmitted int64) bool {
+	aCov := hasAdequateCoverage(a.Total, a.Total+a.Errored)
+	bCov := hasAdequateCoverage(b.Total, b.Total+b.Errored)
+	if aCov != bCov {
+		return aCov
+	}
+
+	var aRate, bRate float64
+	if aCov && bCov && heldOutSubmitted > 0 &&
+		hasAdequateCoverage(a.HeldOutTotal, heldOutSubmitted) && hasAdequateCoverage(b.HeldOutTotal, heldOutSubmitted) {
+		aRate, bRate = passRate(a.HeldOutPassed, a.HeldOutTotal), passRate(b.HeldOutPassed, b.HeldOutTotal)
+	} else {
+		aRate, bRate = passRate(a.Passed, a.Total), passRate(b.Passed, b.Total)
+	}
+	if aRate != bRate {
+		return aRate > bRate
+	}
+
+	if len(a.Candidate) != len(b.Candidate) {
+		// Shorter wins: concision now has to earn a win through the score instead of
+		// being asked for in the prompt and ignored (see improveSystemPrompt,
+		// llm/bedrock.go, and this repo's word-count-fixation fix).
+		return len(a.Candidate) < len(b.Candidate)
+	}
+	return false // fully tied: keep the earlier round (caller only replaces on strict >)
+}
+
+// selectBestRound returns the index into rounds of the best-scoring round. Used both to
+// pick the round improveAndFinalizeSuggestion finalizes and, inline in its loop, to answer
+// "did the round I just ran actually improve on what came before?" (see improveLoopStop) —
+// one comparison rule (roundBetter), not two.
+//
+// heldOutSubmitted is how many of the corpus's replay examples the improve prompt never
+// saw (llm.ReplayExample.HeldOut) — fixed for the whole suggestion, since the corpus
+// itself doesn't change round to round, only the candidate text does. See roundBetter for
+// the exact comparison order: adequate coverage beats inadequate, then held-out pass rate
+// (when both rounds have adequate held-out coverage) else overall pass rate, then shorter
+// candidate, then earlier round. If no round has adequate coverage, every comparison falls
+// through to the pass-rate/length/order tie-breaks on whatever was scored — the caller is
+// expected to surface a trace note in that case (see improveAndFinalizeSuggestion).
+//
+// Returns -1 for an empty slice.
+func selectBestRound(rounds []db.SuggestionRoundSummary, heldOutSubmitted int64) int {
 	best := -1
 	for i, rd := range rounds {
-		if best == -1 || rd.Passed > rounds[best].Passed {
+		if best == -1 || roundBetter(rd, rounds[best], heldOutSubmitted) {
 			best = i
 		}
 	}
@@ -702,7 +806,13 @@ func improveLoopStop(n, maxRounds int, replayOn bool, replay llm.ReplayResult, i
 	if !replayOn {
 		return true, ""
 	}
-	if replay.Total > 0 && replay.Passed == replay.Total {
+	// hasAdequateCoverage guards this: a literal Passed==Total is meaningless when most of
+	// the corpus errored out (see minReplayCoverage's doc comment) — without this guard a
+	// round that only managed to classify 3 of 26 submitted examples and got all 3 right
+	// would end the loop on an "outage that happened to agree with itself," not a validated
+	// rewrite.
+	if replay.Total > 0 && replay.Passed == replay.Total &&
+		hasAdequateCoverage(int64(replay.Total), int64(replay.Total+replay.Errored)) {
 		return true, "perfect score, stopping"
 	}
 	if n >= maxRounds {
@@ -751,9 +861,24 @@ func hasTimeForAnotherRound(ctx context.Context, lastRound time.Duration) bool {
 // in line with this repo's recent token-compression commits (05b44f0, df611fe) — only the
 // failures are shown, not a restatement of the whole corpus, since PriorConversation
 // already carries that from the first turn.
-func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExample) string {
+//
+// candidate is the round's own rewrite text (the thing being critiqued), checked via
+// llm.CitesExamples against replayLLMExamples for a lifted sender domain/brand — a
+// generalization failure the score alone doesn't surface (a rewrite that names "github.com"
+// can still score well if the corpus happens to be mostly GitHub mail). Purely advisory:
+// prepended to the feedback when it fires, never blocks or lowers the score.
+func buildReplayFeedbackTurn(candidate string, replay llm.ReplayResult, examples []db.PromptExample, replayLLMExamples []llm.ReplayExample) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "VALIDATION: your last rewrite scored %d/%d on the real classifier.\n", replay.Passed, replay.Total)
+
+	if hits := llm.CitesExamples(candidate, replayLLMExamples); len(hits) > 0 {
+		fmt.Fprintf(&sb, "Your last rewrite named %s from the examples' senders. Replace it with the property those emails share, not the name itself.\n\n", strings.Join(hits, ", "))
+	}
+
+	fmt.Fprintf(&sb, "VALIDATION: your last rewrite scored %d/%d on the real classifier", replay.Passed, replay.Total)
+	if replay.HeldOutTotal > 0 {
+		fmt.Fprintf(&sb, " (%d/%d of those were emails you weren't shown)", replay.HeldOutPassed, replay.HeldOutTotal)
+	}
+	sb.WriteString(".\n")
 
 	var wronglyMatched, wronglyMissed []llm.ReplayFailure
 	for _, f := range replay.Failures {
@@ -779,7 +904,7 @@ func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExampl
 	writeGroup("STILL WRONGLY CAUGHT (must not match)", wronglyMatched)
 	writeGroup("STILL MISSED (must match)", wronglyMissed)
 
-	fmt.Fprintf(&sb, "\nRewrite again to fix these without breaking the %d it already gets right. Same constraints.", replay.Passed)
+	fmt.Fprintf(&sb, "\nRewrite again to fix these without breaking the %d it already gets right. Prefer the shortest rewrite that does. Same constraints.", replay.Passed)
 	return sb.String()
 }
 
@@ -811,7 +936,7 @@ func buildReplayFeedbackTurn(replay llm.ReplayResult, examples []db.PromptExampl
 // can't drift between the two call sites — see this file's package doc comment.
 func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *traceWriter, sid int64, p db.Prompt, originalInstructions string, priorConv []llm.ChatMessage, note, userComment string) {
 	// One settings Query for the whole round, resolved with the same pure parsers
-	// improveExampleCap/replayExampleCap/parseImproveMaxRounds use — instead of the four
+	// parseExampleCap/parseImproveMaxRounds/parseReplayConcurrency use — instead of five
 	// independent GetSetting round trips (one per setting) this used to make every round.
 	settings := loadSettings(ctx, r.store)
 	improveCap := parseExampleCap(settings[llm.SettingImproveExampleCap], llm.ImproveExampleCapDefault, llm.ImproveExampleCapMax)
@@ -821,6 +946,7 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	// extra classify calls replay costs.
 	replayOn := settingOr(settings, llm.SettingImproveReplay, "1") == "1"
 	maxRounds := parseImproveMaxRounds(settings[llm.SettingImproveMaxRounds])
+	replayConc := parseReplayConcurrency(settings[llm.SettingReplayConcurrency])
 
 	// One raw fetch, sampled twice at different caps — see gatherRawExamples' doc comment
 	// on why this avoids re-querying the corpus twice in one round. examples (small,
@@ -834,9 +960,23 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		// No score to iterate on — same behavior as the pre-loop code, exactly one round.
 		maxRounds = 1
 	}
+	// replayLLMExamples is built once, outside the round loop: the corpus itself (which
+	// examples, and which of them were shown to the improve prompt) doesn't change round
+	// to round, only the candidate text being scored against it does. HeldOut is set by
+	// comparing against examples (the improve prompt's own set) — see replayExamplesFor.
 	var replayExamples []db.PromptExample
+	var replayLLMExamples []llm.ReplayExample
+	var heldOutSubmitted int64
+	var concurrency int
 	if replayOn {
 		replayExamples = sampleExamples(raw, replayCap)
+		replayLLMExamples = replayExamplesFor(replayExamples, examples)
+		for _, ex := range replayLLMExamples {
+			if ex.HeldOut {
+				heldOutSubmitted++
+			}
+		}
+		concurrency = replayConc
 	}
 
 	req := llm.ImproveRequest{
@@ -847,8 +987,8 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	}
 
 	// rounds, candidates, convs, and replays are parallel slices, one entry per completed
-	// round — kept separate from db.SuggestionRoundSummary (which only needs N/Candidate/
-	// Passed/Total for persistence) because the full conversation and replay failures for
+	// round — kept separate from db.SuggestionRoundSummary (which only needs a handful of
+	// scalar fields for persistence) because the full conversation and replay failures for
 	// every round would be wasteful to carry in what gets JSON-marshaled onto the
 	// suggestion row; only the winning round's need to survive past this function.
 	var rounds []db.SuggestionRoundSummary
@@ -887,28 +1027,31 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		var replay llm.ReplayResult
 		if replayOn {
 			tw.Event(ctx, db.TraceKindReplayStart, round, "")
-			// concurrency 0: unbounded fan-out. This used to pass cfg.ClassifyConcurrency
-			// (default 6) because the goroutine it ran in shared WebFunction's 128MB/30s
-			// budget with live HTTP requests; running inside ImproveFunction's own
-			// 1024MB/900s invocation, there's no such budget to protect, and
-			// ReplayAgainstExamples' own concurrency<=0 handling (llm/bedrock.go) skips
-			// the semaphore entirely — Bedrock's adaptive retryer (newBedrockRetryer)
-			// already provides the real backpressure. A bounded round budget (maxRounds)
-			// is what keeps this fan-out from multiplying unboundedly, not a concurrency
-			// limit here.
-			replay = r.llm.ReplayAgainstExamples(ctx, r.store, suggested, replayExamplesFor(replayExamples), 0)
-			tw.Event(ctx, db.TraceKindReplayDone, round, fmt.Sprintf("%d/%d", replay.Passed, replay.Total))
+			// Bounded fan-out (replayConcurrency, SettingReplayConcurrency) — see
+			// ReplayConcurrencyDefault's doc comment (llm/bedrock.go) for why an
+			// unbounded fan-out here is what used to collapse most of a round's corpus to
+			// "excluded from score" under Bedrock throttling: every call's timeout clock
+			// started at once, so throttling took the whole batch out together.
+			replay = r.llm.ReplayAgainstExamples(ctx, r.store, suggested, replayLLMExamples, concurrency)
+			tw.Event(ctx, db.TraceKindReplayDone, round, fmt.Sprintf("%d/%d (held-out %d/%d, %d errored)", replay.Passed, replay.Total, replay.HeldOutPassed, replay.HeldOutTotal, replay.Errored))
+			if hits := llm.CitesExamples(suggested, replayLLMExamples); len(hits) > 0 {
+				tw.Event(ctx, db.TraceKindNote, round, fmt.Sprintf("this rewrite names %s from the examples' senders instead of generalizing", strings.Join(hits, ", ")))
+			}
 		}
-		rounds = append(rounds, db.SuggestionRoundSummary{N: n, Candidate: suggested, Passed: int64(replay.Passed), Total: int64(replay.Total)})
+		rounds = append(rounds, db.SuggestionRoundSummary{
+			N: n, Candidate: suggested,
+			Passed: int64(replay.Passed), Total: int64(replay.Total), Errored: int64(replay.Errored),
+			HeldOutTotal: int64(replay.HeldOutTotal), HeldOutPassed: int64(replay.HeldOutPassed),
+		})
 		candidates = append(candidates, suggested)
 		convs = append(convs, conv)
 		replays = append(replays, replay)
 
 		// "Improved" means round n is the best seen across every round up to and
-		// including it — reusing selectBestRound's own comparison rule (strict >, ties
-		// favor earlier) rather than duplicating it, so there's exactly one definition of
-		// "better" for both the stop decision and the final pick after the loop ends.
-		improved := selectBestRound(rounds) == len(rounds)-1
+		// including it — reusing selectBestRound's own comparison rule (roundBetter)
+		// rather than duplicating it, so there's exactly one definition of "better" for
+		// both the stop decision and the final pick after the loop ends.
+		improved := selectBestRound(rounds, heldOutSubmitted) == len(rounds)-1
 		timeRemains := hasTimeForAnotherRound(ctx, time.Since(roundStart))
 		if stop, reason := improveLoopStop(n, maxRounds, replayOn, replay, improved, timeRemains); stop {
 			if reason != "" {
@@ -918,10 +1061,10 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		}
 
 		req.PriorConversation = conv
-		req.UserComment = buildReplayFeedbackTurn(replay, replayExamples)
+		req.UserComment = buildReplayFeedbackTurn(suggested, replay, replayExamples, replayLLMExamples)
 	}
 
-	bestIdx := selectBestRound(rounds)
+	bestIdx := selectBestRound(rounds, heldOutSubmitted)
 	bestN := rounds[bestIdx].N
 	bestSuggested := candidates[bestIdx]
 	bestConv := convs[bestIdx]
@@ -961,8 +1104,14 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		finalize.ReplayModel = bestReplay.Model
 		finalize.ReplayTotal = int64(bestReplay.Total)
 		finalize.ReplayPassed = int64(bestReplay.Passed)
-		finalize.ReplayBaseline = replayBaseline(replayExamples)
+		finalize.ReplayBaseline = int64(bestReplay.Baseline)
+		finalize.ReplayErrored = int64(bestReplay.Errored)
+		finalize.ReplayHeldOutTotal = int64(bestReplay.HeldOutTotal)
+		finalize.ReplayHeldOutPassed = int64(bestReplay.HeldOutPassed)
 		finalize.ReplayFailures = string(failuresJSON)
+		if !hasAdequateCoverage(finalize.ReplayTotal, finalize.ReplayTotal+finalize.ReplayErrored) {
+			tw.Event(ctx, db.TraceKindNote, int64(bestN), fmt.Sprintf("only %d of %d submitted examples were actually scored — this score is not reliable", finalize.ReplayTotal, finalize.ReplayTotal+finalize.ReplayErrored))
+		}
 	}
 	// The done event is emitted only after FinalizePromptSuggestion actually lands — the
 	// trace poll's completion signal (see the trace endpoint, server.go) tells the browser
@@ -980,21 +1129,7 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		return
 	}
 	tw.Event(ctx, db.TraceKindDone, int64(bestN), "")
-	slog.Info("improve suggestion ready", "suggestion_id", sid, "prompt_id", p.ID, "rounds_run", len(rounds), "best_round", bestN, "replay_total", finalize.ReplayTotal, "replay_passed", finalize.ReplayPassed)
-}
-
-// replayBaseline is the free baseline ReplayResult.Passed is compared against: how many of
-// the same examples the *original* rule already got right, derived from Missed rather than
-// by re-running the original instructions — a Missed example was a miss by definition
-// (that's why the user corrected it); a plain confirmation was a hit.
-func replayBaseline(examples []db.PromptExample) int64 {
-	var n int64
-	for _, ex := range examples {
-		if !ex.Missed {
-			n++
-		}
-	}
-	return n
+	slog.Info("improve suggestion ready", "suggestion_id", sid, "prompt_id", p.ID, "rounds_run", len(rounds), "best_round", bestN, "replay_total", finalize.ReplayTotal, "replay_passed", finalize.ReplayPassed, "replay_errored", finalize.ReplayErrored)
 }
 
 // ============================================================

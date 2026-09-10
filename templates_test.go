@@ -255,6 +255,20 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 			}
 			return v
 		}()},
+		{"pending with held-out score and classifier errors", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ReplayTotal, v.ReplayPassed, v.ReplayBaseline = 10, 8, 6
+			v.ReplayHeldOutTotal, v.ReplayHeldOutPassed = 4, 3
+			v.ReplayErrored = 2
+			v.Rounds = []db.SuggestionRoundSummary{
+				{N: 1, Candidate: "Match newsletters.", Passed: 5, Total: 8, Errored: 4, HeldOutTotal: 3, HeldOutPassed: 2},
+				{N: 2, Candidate: "Match promotional newsletters.", Passed: 8, Total: 10, Errored: 2, HeldOutTotal: 4, HeldOutPassed: 3},
+			}
+			v.BestRound = 2
+			return v
+		}()},
 		{"failed: renders the error text and retry form", func() suggestionView {
 			v := base
 			v.Status = "failed"
