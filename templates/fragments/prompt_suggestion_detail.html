@@ -42,6 +42,12 @@
     <span class="fw-semibold">Validation:</span>
     {{.ReplayPassed}}/{{.ReplayTotal}} correct
     <span class="text-muted">({{.ReplayBaseline}}/{{.ReplayTotal}} at time of correction)</span>
+    {{if gt .ReplayHeldOutTotal 0}}
+    <span class="text-muted">&middot; {{.ReplayHeldOutPassed}}/{{.ReplayHeldOutTotal}} on emails it wasn't shown</span>
+    {{end}}
+    {{if gt .ReplayErrored 0}}
+    <span class="text-muted">&middot; {{.ReplayErrored}} not scored (classifier errors)</span>
+    {{end}}
     <span class="text-muted">&middot; replayed on {{.ReplayModel}}</span>
     {{if .ReplayFailures}}
     <details class="mt-1">
@@ -66,7 +72,7 @@
       {{range .Rounds}}
       <li class="mb-1{{if eq .N $.BestRound}} fw-semibold{{end}}">
         Round {{.N}}{{if eq .N $.BestRound}} (applied){{end}}:
-        {{if gt .Total 0}}{{.Passed}}/{{.Total}} correct &mdash; {{end}}<span class="text-muted">{{.Candidate}}</span>
+        {{if gt .Total 0}}{{.Passed}}/{{.Total}} correct{{if gt .HeldOutTotal 0}} ({{.HeldOutPassed}}/{{.HeldOutTotal}} held-out){{end}}{{if gt .Errored 0}}, {{.Errored}} not scored{{end}} &mdash; {{end}}<span class="text-muted">{{.Candidate}}</span>
       </li>
       {{end}}
     </ul>

@@ -271,14 +271,27 @@ type PromptSuggestion struct {
 	// classify model (never the improve model — see llm.ReplayAgainstExamples) against
 	// the example corpus used to generate the suggestion. ReplayTotal == 0 means replay
 	// hasn't run (older items, or improve_replay disabled) — the UI renders the block
-	// only when ReplayTotal > 0. ReplayBaseline is derived for free from the stored
-	// verdicts at correction time (false_negative/false_positive = miss, confirmed_positive
-	// = hit), not by re-running the original rule.
+	// only when ReplayTotal > 0. ReplayBaseline shares ReplayTotal's exact denominator —
+	// it's the original rule's hit count over only the examples that were actually scored
+	// (llm.ReplayResult.Baseline), not a count over the whole submitted corpus regardless
+	// of which calls errored; the two used to have different denominators, which is how a
+	// suggestion could render a baseline larger than its own total.
 	ReplayModel    string `dynamodbav:"replayModel,omitempty"`
 	ReplayTotal    int64  `dynamodbav:"replayTotal,omitempty"`
 	ReplayPassed   int64  `dynamodbav:"replayPassed,omitempty"`
 	ReplayBaseline int64  `dynamodbav:"replayBaseline,omitempty"`
-	ReplayFailures string `dynamodbav:"replayFailures,omitempty"` // JSON []ReplayFailure
+	// ReplayErrored is how many of the submitted corpus's classify calls failed (throttled,
+	// timed out) and were excluded from ReplayTotal/ReplayPassed/ReplayBaseline — shown so
+	// a low-coverage score reads as "N not scored," not as a perfect or near-perfect result.
+	ReplayErrored int64 `dynamodbav:"replayErrored,omitempty"`
+	// ReplayHeldOutTotal/ReplayHeldOutPassed are the subset of ReplayTotal/ReplayPassed
+	// whose examples were NOT shown to the improve call that produced this suggestion (see
+	// llm.ReplayExample.HeldOut) — the score a candidate is actually ranked on when there's
+	// enough of it (selectBestRound, improve.go), since it can't be satisfied by enumerating
+	// the examples the model saw.
+	ReplayHeldOutTotal  int64  `dynamodbav:"replayHeldOutTotal,omitempty"`
+	ReplayHeldOutPassed int64  `dynamodbav:"replayHeldOutPassed,omitempty"`
+	ReplayFailures      string `dynamodbav:"replayFailures,omitempty"` // JSON []ReplayFailure
 
 	// ProblemExampleKeys is a JSON-encoded []ResolvedExampleKey identifying the
 	// false_negative/false_positive PromptExample rows this suggestion (in its current,
@@ -313,6 +326,14 @@ type SuggestionRoundSummary struct {
 	Candidate string `json:"candidate"`
 	Passed    int64  `json:"passed"`
 	Total     int64  `json:"total"`
+	// Errored/HeldOutTotal/HeldOutPassed mirror llm.ReplayResult's fields of the same
+	// purpose — see that type's doc comment (llm/bedrock.go). Carried per round (not just
+	// on the winning round, like PromptSuggestion's top-level Replay* fields) so
+	// selectBestRound (improve.go) can compare rounds on coverage and held-out rate, and so
+	// the Attempts UI can show why a round with a high raw Passed still lost.
+	Errored       int64 `json:"errored,omitempty"`
+	HeldOutTotal  int64 `json:"heldOutTotal,omitempty"`
+	HeldOutPassed int64 `json:"heldOutPassed,omitempty"`
 }
 
 type Setting struct {

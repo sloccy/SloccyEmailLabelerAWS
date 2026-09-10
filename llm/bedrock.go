@@ -91,10 +91,29 @@ func withStallGuard(parent context.Context, budget time.Duration) (ctx context.C
 	return ctx, reset, stop
 }
 
-// replayCallTimeout bounds a single classify call inside ReplayAgainstExamples. Replay
-// fans out one call per example (up to ~30) concurrently; without a per-call cap, one
-// stuck call would hold up the whole batch until bedrockHTTPTimeout, not just itself.
-const replayCallTimeout = 90 * time.Second
+// replayCallTimeout bounds a single classify call inside ReplayAgainstExamples, so one
+// stuck call can't hold up the whole batch until bedrockHTTPTimeout. Tier-dependent: a
+// flex-tier request is genuinely queued at lower priority and can take minutes to return
+// (see bedrockHTTPTimeout's own comment), so the standard-tier cap would fail every flex
+// replay call under normal queueing delay, not just a stuck one.
+//
+// Deliberately generous rather than tight: replay runs in the background (its own
+// improve-worker Lambda invocation, not a live HTTP request), so there's no user staring
+// at a spinner waiting on any one call — a slow-but-eventually-correct classify call is
+// worth waiting for rather than cutting off and either excluding from the score or
+// spending a retry on it. The real backstop against a single call eating the whole
+// invocation isn't this constant, it's the ctx it's given: ReplayAgainstExamples' caller
+// (improveAndFinalizeSuggestion, improve.go) already derives ctx from the worker's own
+// Lambda deadline minus improveWorkerMargin, and context.WithTimeout below only ever
+// shortens that, never extends it — so raising these values can't let a call (or a whole
+// stuck batch) outlive the worker's real budget, it only raises how long a call is allowed
+// to wait while that budget still has room.
+func replayCallTimeout(tier string) time.Duration {
+	if tier == TierFlex {
+		return 8 * time.Minute
+	}
+	return 3 * time.Minute
+}
 
 // LogLevelTimeout is the db.Log level written when a Converse call is aborted by
 // bedrockHTTPTimeout, so the dashboard can count these over a rolling window.
@@ -173,12 +192,20 @@ const (
 	// less noisy pass/fail score, at the cost of more classify calls during replay.
 	// Meaningless with replay disabled (SettingImproveReplay).
 	SettingReplayExampleCap = "replay_example_cap"
+	// SettingReplayConcurrency caps how many classify calls ReplayAgainstExamples runs at
+	// once. Read directly via db.Store.GetSetting from improve.go, the same
+	// caller-orchestrated pattern as SettingReplayExampleCap — replay's fan-out size is
+	// this package's business (it's the one making the calls), but how many run
+	// concurrently is a resource-budget decision the caller owns, same as
+	// SettingImproveMaxRounds/SettingReplayExampleCap. See ReplayConcurrencyDefault.
+	SettingReplayConcurrency = "replay_concurrency"
 )
 
 // ImproveMaxRoundsDefault/ImproveMaxRoundsCap bound SettingImproveMaxRounds: unset (or
 // unparsable) falls back to the default; anything above the cap is clamped down to it. A
 // cap exists because each extra round costs one improve call plus a full replay fan-out
-// (up to ~30 classify calls) — see improveRunner.improveMaxRounds, improve.go.
+// (per-verdict cap × len(db.VerdictOrder) classify calls, throttled to
+// ReplayConcurrencyDefault at a time) — see improveRunner.improveMaxRounds, improve.go.
 const (
 	ImproveMaxRoundsDefault = 3
 	ImproveMaxRoundsCap     = 5
@@ -186,15 +213,30 @@ const (
 
 // ImproveExampleCapDefault/ImproveExampleCapMax bound SettingImproveExampleCap — the small,
 // token-bounded set the improve prompt itself sees. ReplayExampleCapDefault/
-// ReplayExampleCapMax bound SettingReplayExampleCap — deliberately much larger, since
-// replay's cost is classify calls, not prompt tokens; see improve.go's sampleExamples for
-// the selection policy that fills either cap.
+// ReplayExampleCapMax bound SettingReplayExampleCap — deliberately larger, since replay's
+// cost is classify calls, not prompt tokens; see improve.go's sampleExamples for the
+// selection policy that fills either cap. Both caps are per-verdict (db.VerdictOrder:
+// confirmed_positive, confirmed_negative), so the default replay fan-out is up to
+// len(db.VerdictOrder)x ReplayExampleCapDefault classify calls (30, at today's two
+// verdicts), not ReplayExampleCapDefault itself — kept modest (rather than matching
+// ReplayExampleCapMax) so one round's fan-out comfortably finishes within a Lambda
+// invocation even under Bedrock throttling; ReplayConcurrencyDefault bounds how many of
+// those run at once.
 const (
 	ImproveExampleCapDefault = 12
 	ImproveExampleCapMax     = 20
-	ReplayExampleCapDefault  = 40
+	ReplayExampleCapDefault  = 15
 	ReplayExampleCapMax      = 100
 )
+
+// ReplayConcurrencyDefault bounds how many classify calls ReplayAgainstExamples runs at
+// once (SettingReplayConcurrency). Unbounded fan-out (the old behavior) starts every
+// example's replayCallTimeout clock at once, so throttling under load times out the whole
+// batch together rather than a few calls at a time — exactly the failure mode that
+// collapsed ReplayResult.Total to a handful of examples in production. In line with
+// cfg.ClassifyConcurrency's own default (config.go) for the same kind of fan-out against
+// the same API.
+const ReplayConcurrencyDefault = 8
 
 // Values for SettingImproveReasoningEffort. Every reasoning-capable model this project has
 // tested on Bedrock exposes reasoning_config as a bare on/off switch, not a real graduated
@@ -886,7 +928,12 @@ func (c *Client) ClassifyEmailBatch(ctx context.Context, store StoreLogger, emai
 	res.LatencyMs = time.Since(start).Milliseconds()
 	if err != nil {
 		if isBedrockTimeout(err) {
-			store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call exceeded the %s client timeout (tier: %s): %v", bedrockHTTPTimeout, tierLabel, err))
+			// Which timeout actually fired (bedrockHTTPTimeout, replayCallTimeout, the
+			// improve stall guard, or a caller-supplied ctx) isn't visible from here —
+			// this call only sees the ctx it was given. Report the elapsed time instead
+			// of guessing a constant name; res.LatencyMs is exactly how long this call
+			// ran before its context gave up.
+			store.Log(LogLevelTimeout, fmt.Sprintf("Bedrock Converse call timed out after %dms (tier: %s): %v", res.LatencyMs, tierLabel, err))
 		}
 		store.Log("ERROR", fmt.Sprintf("LLM request failed after %dms (tier: %s): %v", res.LatencyMs, tierLabel, err))
 		return res, &Error{Msg: fmt.Sprintf("LLM request failed: %v", err)}
@@ -988,13 +1035,22 @@ func drainConverseStream(es *bedrockruntime.ConverseStreamEventStream, onText, o
 	return stopReason, es.Err()
 }
 
+// generateSystemPrompt is streamGenerate's system prompt, pulled out to a named constant
+// (rather than a local literal) for the same reason improveSystemPrompt is one: it's
+// asserted against directly in tests (see TestGenerateAndImprovePrompts_NoWordCountTarget)
+// so a future edit can't quietly reintroduce a numeric word-count ceiling in one prompt
+// without the other. Same one-line/no-markdown shape as improveSystemPrompt, so a rule
+// written by the builder and a rule rewritten by the improver read the same way — both end
+// up inline in buildUserTurn's numbered rule list at classify time, and both are applied by
+// a small model with reasoning disabled. Deliberately no word-count target: a stated
+// number reads as a bar to fill, not a ceiling, and a small model tends to pad a short
+// answer out to meet it. "Fewest words" asks for the opposite without giving it a number to
+// fixate on.
+const generateSystemPrompt = "You write email filter rules for an AI classifier. Output only the rule text: one line, plain declarative prose, using the fewest words that capture the category. No bullets, headings, markdown, quotes, preamble, or self-critique."
+
 func (c *Client) streamGenerate(ctx context.Context, description string, ch chan<- StreamChunk) error {
 	model := c.resolveModel(ctx, SettingImproveModel)
-	// Same 60-word/single-line/no-markdown shape as improveSystemPrompt, so a rule
-	// written by the builder and a rule rewritten by the improver read the same way — both
-	// end up inline in buildUserTurn's numbered rule list at classify time, and both are
-	// applied by a small model with reasoning disabled.
-	systemPrompt := "You write email filter rules for an AI classifier. Output only the rule text: one line, at most 60 words, plain declarative prose, no bullets, headings, markdown, quotes, preamble, or self-critique."
+	systemPrompt := generateSystemPrompt
 	userMsg := fmt.Sprintf(
 		"Write a one-line classifier instruction for emails matching: %q\n\n"+
 			"The instruction must describe: what the email is about, its purpose/intent, "+
@@ -1091,18 +1147,34 @@ func sanitizeRuleText(s string) string {
 // a single mishandled email and told the model to "think as long as you need internally,"
 // which is exactly backwards for that target: it produced long, hedged, multi-clause rules
 // that a reasoning-disabled classifier then had to interpret under the same constraint.
+//
+// Two things this prompt deliberately does NOT do, both from observed failure modes on
+// real (small) models:
+//
+//   - No word-count ceiling. An earlier version said "at most 60 words" — the model
+//     reliably read that as a target to fill, not a limit, and produced rules that hovered
+//     right at 60 words regardless of how simple the distinction was. selectBestRound
+//     (improve.go) now rewards a shorter candidate on an otherwise-equal score, so brevity
+//     has to earn itself through the replay score rather than being asked for and ignored.
+//   - No abstract "generalize" instruction on its own. Telling the model not to cite the
+//     examples while handing it a numbered list of them and asking it to satisfy every
+//     line just produced a rule that enumerated the list in different words. The
+//     buildImproveUserTurn user turn (below) now frames the examples explicitly as a
+//     sample the rewrite will be scored against emails *outside of*, and the naming test
+//     below gives "generalize" something concrete to check itself against.
 const improveSystemPrompt = `You rewrite email-classification rules. Output only the rewritten rule text.
 
-- One paragraph, one line, at most 60 words.
-- First sentence: what the email IS, by purpose and intent.
+- One paragraph, one line. Use the fewest words that make the decision clear — every extra clause is another way for a small model to misread it.
+- First sentence: what the email IS, by purpose and intent — the category, not the list of examples that prompted this rewrite.
 - Then, only if needed: what to exclude, phrased as "Do not match ...".
 - Keep the original scope. Never widen a narrow rule into a catch-all.
-- Never cite a sender, subject, or body phrase from the examples. Generalize to the category.
+- Never name a sender, domain, brand, subject line, or body phrase from the examples. If you can't state what the examples have in common without naming one of them, you haven't found the category yet — look again.
 - Plain declarative prose. No bullets, headings, markdown, quotes, or hedging.
 - If PAST ATTEMPTS are shown, do not restate one of them. They already failed.
 
-A small model with no reasoning applies this rule to one email at a time.
-It must be decidable from the email alone.`
+A small model with no reasoning applies this rule to one email at a time, including emails
+never shown to you. It must be decidable from the email alone, and it must work for mail
+outside the examples, not just the examples themselves.`
 
 // formatExampleRefs renders a labeled-example group as "- sender | subject | excerpt" lines
 // for the improve user turn, one call per ImproveRequest slice (ShouldMatch/ShouldNotMatch).
@@ -1132,12 +1204,23 @@ func formatExampleRefs(refs []ExampleRef) string {
 
 // buildImproveUserTurn renders one ImproveRequest as the improve call's first user turn.
 // Sections for empty example groups are omitted rather than printed empty.
+//
+// The examples are framed explicitly as a sample, not the target, before any are listed:
+// without that framing the closing "rewrite CURRENT so every SHOULD MATCH matches" line
+// reads as "satisfy this list," and a small model satisfies a list by enumerating it. The
+// replay score backs the framing up (see ReplayExample.HeldOut) — a rewrite scored on
+// examples it never saw can't pass by naming the ones it did see.
 func buildImproveUserTurn(req ImproveRequest) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "RULE: %s   LABEL: %s\n\nCURRENT:\n%s\n", req.PromptName, req.LabelName, req.OriginalInstructions)
 
 	if s := formatAttempts(req.PastAttempts); s != "" {
 		fmt.Fprintf(&sb, "\nPAST ATTEMPTS (already tried on this rule; each still had problems — do not repeat them):\n%s", s)
+	}
+
+	hasExamples := len(req.ShouldMatch) > 0 || len(req.ShouldNotMatch) > 0
+	if hasExamples {
+		sb.WriteString("\nThe lines below are a SAMPLE of a category, not the whole category — the rewrite will be tested against other emails of the same kind that are not listed here. A rule that only fits the lines below will fail that test.\n")
 	}
 
 	// Each clause of the closing instruction is only meaningful if its section was
@@ -1167,7 +1250,7 @@ func buildImproveUserTurn(req ImproveRequest) string {
 	}
 
 	if len(goals) > 0 {
-		fmt.Fprintf(&sb, "\nRewrite CURRENT so %s.", strings.Join(goals, ", "))
+		fmt.Fprintf(&sb, "\nFirst, name what these examples have in common as a KIND of email — not a list of senders or subjects, the shared purpose. Then rewrite CURRENT for that kind, so %s.", strings.Join(goals, ", "))
 		if anyRecurred {
 			sb.WriteString(" The [RECURRED] cases survived an earlier rewrite — a small wording tweak will not fix them; change what the rule actually checks for.")
 		}
@@ -1289,9 +1372,10 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 	// retry, since that retry must never re-run after a partial answer has already been
 	// shown to the caller.
 	stream := func(f document.Interface) (answer string, stopReason types.StopReason, emitted bool, err error) {
-		// 2048 when reasoning is off/suppressed: with a 60-word target in the system prompt,
-		// anything near that signals a truncation or a suppression failure, not a
-		// legitimately long answer — worth keeping tight as that signal. But when reasoning
+		// 2048 when reasoning is off/suppressed: improveSystemPrompt asks for one short
+		// prose line, so a response anywhere near this ceiling signals a truncation or a
+		// suppression failure, not a legitimately long answer — worth keeping tight as
+		// that signal even though the prompt no longer states a numeric target. But when reasoning
 		// fields are actually being sent (f != nil), 2048 is the wrong side of that same
 		// argument: it's a token budget for the *final answer*, and a model that's genuinely
 		// thinking spends most of its budget on the reasoning trace first (observed up to
@@ -1410,18 +1494,37 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 // ============================================================
 
 // ReplayExample is one labeled example scored during replay validation. Want is what the
-// candidate rule is expected to output for it (true for a false_negative or
-// confirmed_positive example, false for a false_positive one) — that verdict→bool mapping
-// is the caller's job (recategorize.go's db.Verdict* constants aren't visible from this
-// package, and shouldn't be: this package stays decoupled from db, see the Settings
-// interface above for the same reasoning). Verdict is carried through only for display in
-// ReplayFailures.
+// candidate rule is expected to output for it (true for a confirmed_positive example,
+// false for a confirmed_negative one) — that verdict→bool mapping is the caller's job
+// (recategorize.go's db.Verdict* constants aren't visible from this package, and
+// shouldn't be: this package stays decoupled from db, see the Settings interface above for
+// the same reasoning). Verdict is carried through only for display in ReplayFailures.
+//
+// HeldOut marks an example the improve call's own prompt did NOT see (it wasn't in the
+// small improveExampleCap-sized set fed to buildImproveUserTurn) — the caller sets this by
+// checking membership against that set before calling ReplayAgainstExamples. Scoring
+// held-out examples separately (ReplayResult.HeldOutTotal/HeldOutPassed) is what makes
+// enumerating the shown examples a losing strategy for the improver: a rule that lists the
+// examples verbatim scores well on the shown set and poorly on the held-out one, and
+// selectBestRound (improve.go) ranks on the held-out rate when there's enough of it to
+// trust.
+//
+// WasCorrect is whether the *original* rule (before this rewrite) already classified this
+// example correctly — the inverse of db.PromptExample.Missed, not of Verdict: Missed is
+// true exactly when the user's review changed this rule's checkbox, i.e. the rule
+// disagreed with the correct answer, regardless of which side (confirmed_positive or
+// confirmed_negative) that answer was on. Carried per-example, rather than recomputed
+// from Verdict downstream, so ReplayResult.Baseline can share Total's exact denominator
+// (only examples that were actually scored) instead of counting confirmed_positives across
+// the whole submitted corpus regardless of which of those calls errored.
 type ReplayExample struct {
-	Verdict string
-	Sender  string
-	Subject string
-	Excerpt string
-	Want    bool
+	Verdict    string
+	Sender     string
+	Subject    string
+	Excerpt    string
+	Want       bool
+	HeldOut    bool
+	WasCorrect bool
 }
 
 // ReplayFailure is one example the candidate rule scored incorrectly, for display next to
@@ -1444,13 +1547,29 @@ type ReplayFailure struct {
 
 // ReplayResult summarizes a replay run. Total counts only examples that were successfully
 // classified — a Bedrock error for one example (throttling, a transient timeout) isn't a
-// signal about the candidate rule's quality, so it's logged and excluded rather than
-// counted as a failure; Total < len(examples) is possible when that happens.
+// signal about the candidate rule's quality, so it's excluded rather than counted as a
+// failure; Total < len(examples) is possible when that happens (Errored makes up the
+// difference: Total+Errored == len(examples) submitted, after the one retry pass below).
+//
+// Baseline shares Total's exact denominator — it's how many of the *scored* examples the
+// original rule already got right (ReplayExample.WasCorrect), not a count over the whole
+// submitted corpus. That distinction is load-bearing: a baseline counted over the full
+// corpus while Total counts only successful calls is how a suggestion's detail page once
+// rendered a nonsensical "23/3" (23 confirmed-positives in the corpus, only 3 of the
+// corpus's calls actually completed). Baseline <= Total always holds.
+//
+// HeldOutTotal/HeldOutPassed are the subset of Total/Passed whose ReplayExample.HeldOut
+// was true — examples the improve call's prompt never saw. See selectBestRound (improve.go)
+// for why this is the score a candidate is actually ranked on when there's enough of it.
 type ReplayResult struct {
-	Model    string
-	Total    int
-	Passed   int
-	Failures []ReplayFailure
+	Model         string
+	Total         int
+	Passed        int
+	Baseline      int
+	Errored       int
+	HeldOutTotal  int
+	HeldOutPassed int
+	Failures      []ReplayFailure
 }
 
 // ReplayAgainstExamples re-runs candidateInstructions through the *classification* model —
@@ -1467,11 +1586,13 @@ type ReplayResult struct {
 // here and reused across every example, exactly as ResolveClassifySettings' own doc
 // comment directs for a batch of calls.
 //
-// concurrency <= 0 means unbounded: every example is classified at once, no semaphore.
-// The MODE=improve worker (improve.go) always passes 0 — it runs inside its own 900s/1024MB
-// Lambda invocation with no live HTTP request sharing the budget, so there's no reason to
-// throttle a call fan-out that newBedrockRetryer's adaptive rate limiting already
-// backpressures. A positive value still throttles, for any other caller that does need it.
+// concurrency <= 0 means unbounded: every example is classified at once, no semaphore. Not
+// recommended — see ReplayConcurrencyDefault's doc comment for why an earlier version of
+// this codebase always passing 0 is what produced replay rounds where most of the corpus
+// timed out together. A positive value throttles the initial fan-out; the one retry pass
+// below always runs at a quarter of it (min 1), since by definition every call left in
+// that pass already failed once and re-flooding the same throttled endpoint at full
+// concurrency would just repeat the failure.
 func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, candidateInstructions string, examples []ReplayExample, concurrency int) ReplayResult {
 	model, tier, reasoningOverride := c.ResolveClassifySettings(ctx)
 	result := ReplayResult{Model: model}
@@ -1483,6 +1604,7 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 	// text being evaluated — so ClassifyEmailBatch only ever sees one prompt per call and
 	// its id is never persisted or shown to the user.
 	candidatePrompt := []Prompt{{ID: 1, Name: "candidate", Instructions: candidateInstructions}}
+	callTimeout := replayCallTimeout(tier)
 
 	type outcome struct {
 		ex      ReplayExample
@@ -1490,43 +1612,84 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 		errored bool
 	}
 	outcomes := make([]outcome, len(examples))
-	var sem chan struct{}
-	if concurrency > 0 {
-		sem = make(chan struct{}, concurrency)
-	}
-	var wg sync.WaitGroup
 
-	for i, ex := range examples {
-		if sem != nil {
-			sem <- struct{}{}
+	// classifyOne runs a single example's classify call under its own timeout and writes
+	// its outcome — shared by the initial fan-out and the errored-only retry pass so the
+	// two can't drift.
+	classifyOne := func(i int, ex ReplayExample) {
+		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+		email := Email{Sender: ex.Sender, Subject: ex.Subject, Body: ex.Excerpt}
+		res, err := c.ClassifyEmailBatch(callCtx, store, email, candidatePrompt, model, tier, reasoningOverride, false)
+		if err != nil {
+			outcomes[i] = outcome{ex: ex, errored: true}
+			return
 		}
-		wg.Go(func() {
-			if sem != nil {
-				defer func() { <-sem }()
-			}
-			// See replayCallTimeout's doc comment: bounds this one example's classify call
-			// so a single stuck call can't hold up the whole batch until bedrockHTTPTimeout.
-			callCtx, cancel := context.WithTimeout(ctx, replayCallTimeout)
-			defer cancel()
-			email := Email{Sender: ex.Sender, Subject: ex.Subject, Body: ex.Excerpt}
-			res, err := c.ClassifyEmailBatch(callCtx, store, email, candidatePrompt, model, tier, reasoningOverride, false)
-			if err != nil {
-				outcomes[i] = outcome{ex: ex, errored: true}
-				return
-			}
-			outcomes[i] = outcome{ex: ex, got: res.Results[1]}
-		})
+		outcomes[i] = outcome{ex: ex, got: res.Results[1]}
 	}
-	wg.Wait()
+
+	// runFanOut classifies every index in indices concurrently, bounded by conc (<=0 means
+	// unbounded — every call at once, no semaphore).
+	runFanOut := func(indices []int, conc int) {
+		var sem chan struct{}
+		if conc > 0 {
+			sem = make(chan struct{}, conc)
+		}
+		var wg sync.WaitGroup
+		for _, i := range indices {
+			if sem != nil {
+				sem <- struct{}{}
+			}
+			ex := examples[i]
+			wg.Go(func() {
+				if sem != nil {
+					defer func() { <-sem }()
+				}
+				classifyOne(i, ex)
+			})
+		}
+		wg.Wait()
+	}
+
+	all := make([]int, len(examples))
+	for i := range examples {
+		all[i] = i
+	}
+	runFanOut(all, concurrency)
+
+	// One retry pass over whatever errored — a transient throttle or a single slow call
+	// shouldn't permanently shrink the sample when a second attempt would likely succeed.
+	var retried []int
+	for i, o := range outcomes {
+		if o.errored {
+			retried = append(retried, i)
+		}
+	}
+	if len(retried) > 0 {
+		retryConc := concurrency / 4
+		if retryConc < 1 {
+			retryConc = 1
+		}
+		runFanOut(retried, retryConc)
+	}
 
 	for i, o := range outcomes {
 		if o.errored {
-			store.Log("ERROR", fmt.Sprintf("replay validation: classify failed for example (verdict=%s), excluded from score", o.ex.Verdict))
+			result.Errored++
 			continue
 		}
 		result.Total++
+		if o.ex.HeldOut {
+			result.HeldOutTotal++
+		}
+		if o.ex.WasCorrect {
+			result.Baseline++
+		}
 		if o.got == o.ex.Want {
 			result.Passed++
+			if o.ex.HeldOut {
+				result.HeldOutPassed++
+			}
 		} else {
 			result.Failures = append(result.Failures, ReplayFailure{
 				Verdict: o.ex.Verdict, Sender: o.ex.Sender, Subject: o.ex.Subject, Got: o.got,
@@ -1534,7 +1697,79 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 			})
 		}
 	}
+
+	// One summary line per round rather than one per failed example — with an unbounded
+	// fan-out timing out en masse this used to write the identical line dozens of times in
+	// a row, which is what made the underlying problem hard to see in the logs in the
+	// first place.
+	if result.Errored > 0 {
+		store.Log("ERROR", fmt.Sprintf("replay validation: %d/%d example(s) failed to classify (tier: %s) and were excluded from the %d/%d score", result.Errored, len(examples), tier, result.Passed, result.Total))
+	}
 	return result
+}
+
+// commonEmailProviders are free/webmail domains excluded from senderDomainLabel — "gmail"
+// or "outlook" doesn't identify any one example, so flagging a candidate that happens to
+// say "gmail" would be a false positive on a legitimately generic rule.
+var commonEmailProviders = map[string]bool{
+	"gmail": true, "googlemail": true, "yahoo": true, "outlook": true, "hotmail": true,
+	"live": true, "icloud": true, "me": true, "aol": true, "protonmail": true, "proton": true,
+	"mail": true, "msn": true, "comcast": true, "yandex": true, "zoho": true,
+}
+
+// citesExamplesTokenRe extracts word-ish tokens for CitesExamples' verbatim check.
+var citesExamplesTokenRe = regexp.MustCompile(`[A-Za-z0-9]+`)
+
+// senderDomainLabel returns the distinctive part of a From header's domain — "github" from
+// "notifications@github.com" or `"GitHub" <notifications@github.com>` — or "" if there's
+// no @-address, the domain is a common free-mail provider (not distinctive to this
+// example), or the label is too short to be a meaningful token.
+func senderDomainLabel(sender string) string {
+	at := strings.LastIndex(sender, "@")
+	if at < 0 {
+		return ""
+	}
+	rest := sender[at+1:]
+	if end := strings.IndexAny(rest, " \t\r\n>"); end >= 0 {
+		rest = rest[:end]
+	}
+	label := strings.ToLower(strings.SplitN(rest, ".", 2)[0])
+	if len(label) < 3 || commonEmailProviders[label] {
+		return ""
+	}
+	return label
+}
+
+// CitesExamples reports which distinctive tokens from examples' senders (the domain label
+// — see senderDomainLabel) appear verbatim, case-insensitive, as a whole word in candidate.
+// It's a feedback signal, not a hard rule: only tokens tied to one specific example's
+// sender identity are checked, so a legitimately generic category word ("invoice",
+// "receipt") is never flagged just because it happens to also appear in some sender's
+// domain. See buildReplayFeedbackTurn (improve.go) for how the result is used — prepended
+// to the next round's feedback rather than rejecting the candidate outright, since a false
+// positive here would otherwise kill a correct rewrite over a coincidental word match.
+func CitesExamples(candidate string, examples []ReplayExample) []string {
+	tokens := make(map[string]bool)
+	for _, ex := range examples {
+		if label := senderDomainLabel(ex.Sender); label != "" {
+			tokens[label] = true
+		}
+	}
+	if len(tokens) == 0 {
+		return nil
+	}
+	candidateWords := make(map[string]bool)
+	for _, w := range citesExamplesTokenRe.FindAllString(strings.ToLower(candidate), -1) {
+		candidateWords[w] = true
+	}
+	var hits []string
+	for t := range tokens {
+		if candidateWords[t] {
+			hits = append(hits, t)
+		}
+	}
+	sort.Strings(hits)
+	return hits
 }
 
 // ============================================================

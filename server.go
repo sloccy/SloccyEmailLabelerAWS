@@ -1785,12 +1785,15 @@ type suggestionView struct {
 	// a rule's example corpus for every card in the list would be N*3 extra queries for
 	// nothing shown). ExampleGroups is the corpus the improver/replay actually used, in
 	// place of the single mishandled-email snapshot the pre-corpus UI showed.
-	ExampleGroups  []exampleGroup
-	ReplayModel    string
-	ReplayTotal    int64
-	ReplayPassed   int64
-	ReplayBaseline int64
-	ReplayFailures []llm.ReplayFailure
+	ExampleGroups       []exampleGroup
+	ReplayModel         string
+	ReplayTotal         int64
+	ReplayPassed        int64
+	ReplayBaseline      int64
+	ReplayErrored       int64
+	ReplayHeldOutTotal  int64
+	ReplayHeldOutPassed int64
+	ReplayFailures      []llm.ReplayFailure
 
 	// Rounds is the improve<->replay trajectory (improve.go's loop), parsed from
 	// PromptSuggestion.RoundsJSON — empty for a suggestion generated before the loop
@@ -1871,6 +1874,9 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 	view.ReplayTotal = sg.ReplayTotal
 	view.ReplayPassed = sg.ReplayPassed
 	view.ReplayBaseline = sg.ReplayBaseline
+	view.ReplayErrored = sg.ReplayErrored
+	view.ReplayHeldOutTotal = sg.ReplayHeldOutTotal
+	view.ReplayHeldOutPassed = sg.ReplayHeldOutPassed
 	if sg.ReplayFailures != "" {
 		_ = json.Unmarshal([]byte(sg.ReplayFailures), &view.ReplayFailures)
 	}
@@ -2023,7 +2029,9 @@ func (s *server) handlePromptSuggestionDetail(w http.ResponseWriter, r *http.Req
 
 // handlePromptSuggestionRegenerate kicks off a fresh improve+replay round for an existing
 // suggestion, async via the improve worker (see dispatchImprove, improve.go) — a full round
-// (improve call plus ~30 replay classify calls) can't run synchronously in the request.
+// (improve call plus, by default, up to 30 replay classify calls — 2 verdicts x
+// llm.ReplayExampleCapDefault, throttled to llm.ReplayConcurrencyDefault at a time) can't
+// run synchronously in the request.
 // Returns the same 'generating' view the detail page already renders with a spinner for a
 // brand-new suggestion (prompt_suggestion_detail.html); its own poll while generating (see
 // prompt_suggestion_detail.html) picks up the finished result.

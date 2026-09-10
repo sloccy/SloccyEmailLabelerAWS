@@ -383,6 +383,7 @@ func TestSuggestionRoundTrip_ReplayFields(t *testing.T) {
 	want := PromptSuggestion{
 		ID: 9, PromptID: 5, Status: "pending",
 		ReplayModel: "us.amazon.nova-micro-v1:0", ReplayTotal: 30, ReplayPassed: 27, ReplayBaseline: 24,
+		ReplayErrored: 3, ReplayHeldOutTotal: 12, ReplayHeldOutPassed: 10,
 		ReplayFailures: `[{"Verdict":"false_positive","Sender":"a@example.com","Subject":"s","Got":true}]`,
 	}
 	item := mustMarshalMap(want)
@@ -400,13 +401,17 @@ func TestSuggestionRoundTrip_ReplayFields(t *testing.T) {
 func TestSuggestionRoundTrip_ReplayFieldsOmittedWhenZero(t *testing.T) {
 	want := PromptSuggestion{ID: 9, PromptID: 5, Status: "pending"}
 	item := mustMarshalMap(want)
-	for _, attr := range []string{"replayModel", "replayTotal", "replayPassed", "replayBaseline", "replayFailures"} {
+	for _, attr := range []string{
+		"replayModel", "replayTotal", "replayPassed", "replayBaseline",
+		"replayErrored", "replayHeldOutTotal", "replayHeldOutPassed", "replayFailures",
+	} {
 		if _, ok := item[attr]; ok {
 			t.Errorf("item[%q] present; want omitted (omitempty) when zero-value", attr)
 		}
 	}
 	got := unmarshalItem[PromptSuggestion](item)
-	if got.ReplayTotal != 0 || got.ReplayPassed != 0 || got.ReplayBaseline != 0 || got.ReplayModel != "" || got.ReplayFailures != "" {
+	if got.ReplayTotal != 0 || got.ReplayPassed != 0 || got.ReplayBaseline != 0 || got.ReplayModel != "" || got.ReplayFailures != "" ||
+		got.ReplayErrored != 0 || got.ReplayHeldOutTotal != 0 || got.ReplayHeldOutPassed != 0 {
 		t.Errorf("decoded replay fields not zero: %+v", got)
 	}
 }
