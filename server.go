@@ -48,6 +48,7 @@ const scanCadenceLabel = "Daily · 2 AM ET"
 const (
 	triggerShowToast              = "showToast"
 	triggerRefreshSuggestionBadge = "refreshSuggestionBadge"
+	triggerRefreshSuggestions     = "refreshSuggestions"
 	toastKeyMessage               = "message"
 	jsonKeyType                   = "type"
 	jsonKeyText                   = "text"
@@ -653,7 +654,7 @@ func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Reques
 	ctx := r.Context()
 	counts, err := s.store.CountExamplesByVerdict(ctx, id)
 	if err != nil {
-		slog.Error("count prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt — nothing free-form for a log line to inject
+		slog.Error("count prompt examples", "prompt_id", id, "err", err)
 	}
 	var total int64
 	for _, n := range counts {
@@ -691,7 +692,7 @@ func (s *server) handlePromptExamples(w http.ResponseWriter, r *http.Request) {
 	for _, v := range db.VerdictOrder {
 		examples, err := s.store.ListExamplesByVerdict(ctx, id, v, promptExamplesPerVerdict+1)
 		if err != nil {
-			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt, v is one of db.VerdictOrder's fixed constants — nothing free-form for a log line to inject
+			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err)
 			continue
 		}
 		if len(examples) == 0 {
@@ -716,7 +717,7 @@ func (s *server) handleClearPromptExamples(w http.ResponseWriter, r *http.Reques
 	id := pathInt(r, "id")
 	ctx := r.Context()
 	if err := s.store.DeleteExamplesForPrompt(ctx, id); err != nil {
-		slog.Error("clear prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt — nothing free-form for a log line to inject
+		slog.Error("clear prompt examples", "prompt_id", id, "err", err)
 	}
 	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: 0}, "Examples cleared")
 }
@@ -1879,7 +1880,7 @@ func (s *server) handleImproveQueueStart(w http.ResponseWriter, r *http.Request)
 	}
 	setHxTrigger(w, map[string]any{
 		triggerRefreshSuggestionBadge: "1",
-		"refreshSuggestions":          "1",
+		triggerRefreshSuggestions:     "1",
 	})
 	w.WriteHeader(http.StatusOK)
 }
@@ -1903,7 +1904,7 @@ func (s *server) handleImproveQueueStartAll(w http.ResponseWriter, r *http.Reque
 	s.dispatchImprove(ctx, targets)
 	setHxTrigger(w, map[string]any{
 		triggerRefreshSuggestionBadge: "1",
-		"refreshSuggestions":          "1",
+		triggerRefreshSuggestions:     "1",
 	})
 	w.WriteHeader(http.StatusOK)
 }
@@ -1918,7 +1919,7 @@ func (s *server) handleImproveQueueClear(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "clear failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	setHxTrigger(w, map[string]any{"refreshSuggestions": "1"})
+	setHxTrigger(w, map[string]any{triggerRefreshSuggestions: "1"})
 	w.WriteHeader(http.StatusOK)
 }
 
