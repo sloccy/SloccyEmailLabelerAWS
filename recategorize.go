@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -295,11 +294,12 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 	verdicts := singleRecategorizeVerdicts(allPromptIDs, currentIDs, requested)
 	var msg gmail.Message
 	haveMsg := false
-	if svc != nil && (len(verdicts) > 0 || len(improveSet) > 0) {
+	if svc != nil && len(verdicts) > 0 {
 		// Fetched once at the larger 4000-char size (matching the existing suggestion
-		// snapshot) and reused for both the example excerpt (further truncated below) and
-		// seedImproveSuggestions' EmailBodySnapshot — a second FetchMessage call here would
-		// be a second Gmail API round trip for content we already have.
+		// snapshot) and reused only for the example excerpt (further truncated below) — the
+		// improve queue write below has no Gmail dependency at all (see enqueueImproveFlags),
+		// so a failed fetch no longer blocks flagging a rule for improvement the way it did
+		// when seedImproveSuggestions needed EmailBodySnapshot from this same call.
 		if m, err := gmail.FetchMessage(ctx, svc, row.MessageID, 0); err == nil {
 			msg = m
 			haveMsg = true
@@ -337,17 +337,21 @@ func (s *server) handleRecategorize(w http.ResponseWriter, r *http.Request) {
 		KeptIDs: keptIDs, AddedPrompts: addedPrompts,
 	}})
 
-	correctionID, corrErr := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
+	if _, err := s.store.InsertEmailCorrection(ctx, db.InsertEmailCorrectionParams{
 		AccountID:        row.AccountID,
 		MessageID:        row.MessageID,
 		AddedPrompts:     joinIDs(addedIDs),
 		RemovedPrompts:   joinIDs(removedIDs),
 		CurrentPromptIds: joinIDs(requestedList),
 		Note:             note,
-	})
+	}); err != nil {
+		slog.Error("recategorize: insert email correction", "err", err)
+	}
 
-	// Insert placeholder suggestion rows immediately, then kick off the LLM in the background.
-	s.seedImproveSuggestions(ctx, row, promptByID, addedIDs, improveSet, correctionID, corrErr, note, msg, haveMsg)
+	// Queue flagged rules for improvement instead of starting a round now — see
+	// db.ImproveQueueEntry's doc comment. Nothing calls the improve worker until the user
+	// presses Start on the Prompt Updates page (handleImproveQueueStart/StartAll, server.go).
+	s.enqueueImproveFlags(ctx, improveSet, addedIDs, row.MessageID, row.Sender, row.Subject, note)
 
 	setHxTrigger(w, map[string]any{
 		triggerShowToast:              map[string]any{toastKeyMessage: "Recategorization applied", jsonKeyType: toastTypeSuccess},
@@ -509,62 +513,37 @@ func (s *server) applyRecategorizeToGmail(ctx context.Context, svc *gmail.Client
 	}
 }
 
-// seedImproveSuggestions inserts a "generating" placeholder suggestion row for each prompt
-// flagged for improvement, then hands the batch off to the improve worker (see
-// server.dispatchImprove, improve.go) so handleRecategorize can return without waiting on
-// Bedrock. No-op if improveSet is empty or svc is nil (fetching the message body needs a
-// live Gmail client).
-func (s *server) seedImproveSuggestions(ctx context.Context, row db.CategorizationHistory, promptByID map[int64]db.Prompt, addedIDs []int64, improveSet map[int64]bool, correctionID int64, corrErr error, note string, msg gmail.Message, haveMsg bool) {
-	// msg/haveMsg come from handleRecategorize's single upfront fetch (see the example
-	// recording block above it) rather than fetching again here — same message, same
-	// content, no reason for a second Gmail API round trip.
-	if len(improveSet) == 0 || !haveMsg {
-		return
-	}
-
-	var corrID sql.NullInt64
-	if corrErr == nil {
-		corrID = sql.NullInt64{Int64: correctionID, Valid: true}
-	}
-
-	triggerKinds := make(map[int64]string, len(improveSet))
+// enqueueImproveFlags queues each rule in improveSet for improvement instead of starting a
+// round now — see db.ImproveQueueEntry's doc comment for why (a review session that flags
+// the same rule from several emails used to fan out one improve+replay round per flag,
+// against a corpus that barely differed between them). Shared by the single-email
+// (handleRecategorize) and bulk (recategorize_bulk.go) recategorize paths so the queue-write
+// shape can't drift between them.
+//
+// No Gmail dependency, unlike the old seedImproveSuggestions this replaced: the improve
+// worker always reads the rule's example corpus fresh at Start time
+// (selectExamplesForImprove, improve.go), so nothing here needs the email body — only enough
+// to label the queue card (sender/subject) and to classify the flag as a miss or a wrong
+// match (triggerKind, mirroring PromptSuggestion.TriggerKind's own vocabulary).
+func (s *server) enqueueImproveFlags(ctx context.Context, improveSet map[int64]bool, addedIDs []int64, messageID, sender, subject, note string) {
 	for pid := range improveSet {
-		if slices.Contains(addedIDs, pid) {
-			triggerKinds[pid] = db.TriggerKindFalseNegative
-		} else {
-			triggerKinds[pid] = db.TriggerKindFalsePositive
+		ref := db.QueuedEmailRef{MessageID: messageID, Sender: sender, Subject: subject, TriggerKind: improveTriggerKind(pid, addedIDs)}
+		if err := s.store.EnqueueImprove(ctx, pid, ref, note); err != nil {
+			slog.Error("enqueue improve", "prompt_id", pid, "err", err)
 		}
 	}
+}
 
-	var targets []improveTarget
-	for pid := range improveSet {
-		p, ok := promptByID[pid]
-		if !ok {
-			continue
-		}
-		sid, insertErr := s.store.InsertPromptSuggestion(ctx, db.InsertPromptSuggestionParams{
-			PromptID:              p.ID,
-			CorrectionID:          corrID,
-			TriggerKind:           triggerKinds[pid],
-			MessageID:             row.MessageID,
-			EmailSubject:          row.Subject,
-			EmailSender:           row.Sender,
-			EmailBodySnapshot:     msg.Body,
-			OriginalInstructions:  p.Instructions,
-			SuggestedInstructions: "",
-			ConversationJSON:      "[]",
-			Status:                db.SuggestionStatusGenerating,
-		})
-		if insertErr != nil {
-			slog.Error("recategorize: insert generating suggestion", "prompt_id", pid, "err", insertErr)
-			continue
-		}
-		targets = append(targets, improveTarget{
-			SuggestionID:         sid,
-			PromptID:             p.ID,
-			OriginalInstructions: p.Instructions,
-			Note:                 note,
-		})
+// improveTriggerKind reports why a rule was flagged for improvement: pid in addedIDs means
+// the review added it — the rule missed the email (false_negative); otherwise the review
+// removed it — the rule wrongly caught it (false_positive). Shared by the single-email
+// (addedIDs is handleRecategorize's own diff) and bulk (addedIDs is the uniform apply-list,
+// recategorize_bulk.go — every rule offered for improvement there is guaranteed to be in
+// exactly one of apply/remove, since the UI only shows the improve checkbox once an action
+// is chosen for it) call sites of enqueueImproveFlags, so the two can't drift apart.
+func improveTriggerKind(pid int64, addedIDs []int64) string {
+	if slices.Contains(addedIDs, pid) {
+		return db.TriggerKindFalseNegative
 	}
-	s.dispatchImprove(ctx, targets)
+	return db.TriggerKindFalsePositive
 }

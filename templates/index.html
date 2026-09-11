@@ -353,6 +353,15 @@
       <div class="d-flex align-items-center justify-content-between mb-4 pb-3 border-bottom">
         <div><h2 class="fw-bold mb-1">Prompt Updates</h2><div class="small text-muted">AI-suggested improvements from manual corrections</div></div>
       </div>
+      {{/* Rules flagged for improvement but not yet started (see improve_queue.html) —
+           above the suggestion list since a queued flag is what a suggestion card starts
+           from. Same refresh signal as #suggestions-list-container below: a recategorize
+           action can add to this container, and Start/Clear move a card out of it into (or
+           away from) that one, so both need to react to the same event. */}}
+      <div id="improve-queue-container"
+        hx-get="/fragments/improve-queue"
+        hx-trigger="intersect once, refreshSuggestions from:window"
+        hx-swap="innerHTML"></div>
       {{/* The recurring poll interval lives inside the fragment itself now (see
            prompt_suggestions_list.html's #suggestions-poll), not here — this container
            is never swapped via outerHTML, so an attribute on it could never become

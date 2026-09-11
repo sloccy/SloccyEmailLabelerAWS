@@ -14,7 +14,10 @@
 {{if .Items}}
 <div class="d-flex flex-column gap-3" id="suggestions-list">
   {{range .Items}}
-  <div class="card p-3 suggestion-card" id="suggestion-row-{{.ID}}">
+  {{/* data-no-gain flags a suggestion that didn't beat the rule it would replace (see
+       PromptSuggestion.NoGain's doc comment, db/models.go) — read by _refreshSuggestionsBadge
+       (static/app.js) so the nav count only counts suggestions actually worth looking at. */}}
+  <div class="card p-3 suggestion-card" id="suggestion-row-{{.ID}}" data-no-gain="{{if .NoGain}}1{{end}}">
     <div class="d-flex align-items-start justify-content-between gap-2 flex-wrap">
       <div class="flex-grow-1" style="min-width:0">
         <div class="d-flex align-items-center gap-2 flex-wrap mb-1">
@@ -25,6 +28,7 @@
             <span class="badge text-bg-danger">wrong match</span>
           {{end}}
           {{template "suggestion_status_badge" .Status}}
+          {{if .NoGain}}<span class="badge border border-secondary text-secondary">no better than current</span>{{end}}
         </div>
         <div class="small text-muted text-truncate mb-2">{{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</div>
         {{/* Generating is now included here (it used to be pending|failed only) — a

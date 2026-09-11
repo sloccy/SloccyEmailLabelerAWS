@@ -1533,6 +1533,69 @@ func TestReplayAgainstExamples_HeldOutSplit(t *testing.T) {
 	}
 }
 
+// TestClassCountsBalanced checks the mean-of-recall-and-specificity formula and its -1
+// "no such score" sentinel for an empty bucket — see ClassCounts' doc comment for why plain
+// accuracy alone lets a rule that matches everything score well on a lopsided corpus.
+func TestClassCountsBalanced(t *testing.T) {
+	cases := []struct {
+		name string
+		c    ClassCounts
+		want float64
+	}{
+		{"perfect on both buckets", ClassCounts{PosTotal: 10, PosPassed: 10, NegTotal: 5, NegPassed: 5}, 1.0},
+		{"matches everything: perfect positive, zero negative", ClassCounts{PosTotal: 10, PosPassed: 10, NegTotal: 5, NegPassed: 0}, 0.5},
+		{"empty positive bucket has no balanced score", ClassCounts{PosTotal: 0, NegTotal: 5, NegPassed: 3}, -1},
+		{"empty negative bucket has no balanced score", ClassCounts{PosTotal: 5, PosPassed: 3, NegTotal: 0}, -1},
+		{"both empty", ClassCounts{}, -1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.c.Balanced(); got != c.want {
+				t.Errorf("Balanced() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestReplayAgainstExamples_ClassCountsSplitByBucket checks All/HeldOut are tallied by
+// verdict bucket (Want), not just overall — the "match everything" corpus this backs:
+// two confirmed_positive examples (both pass) and one confirmed_negative (fails), one of
+// each held out.
+func TestReplayAgainstExamples_ClassCountsSplitByBucket(t *testing.T) {
+	fake := &fakeConverseAPI{outputs: []*bedrockruntime.ConverseOutput{
+		textOutput(`{"1": true}`),
+		textOutput(`{"1": true}`),
+		textOutput(`{"1": true}`), // wrongly matches the confirmed_negative example
+	}}
+	cl := &Client{br: fake, defaultModel: "m"}
+	examples := []ReplayExample{
+		{Verdict: "confirmed_positive", Sender: "a@example.com", Want: true, HeldOut: false},
+		{Verdict: "confirmed_positive", Sender: "b@example.com", Want: true, HeldOut: true},
+		{Verdict: "confirmed_negative", Sender: "c@example.com", Want: false, HeldOut: true},
+	}
+	res := cl.ReplayAgainstExamples(context.Background(), db.NewFake(), "candidate", examples, 1)
+
+	if res.All.PosTotal != 2 || res.All.PosPassed != 2 {
+		t.Errorf("All.Pos = %d/%d, want 2/2", res.All.PosPassed, res.All.PosTotal)
+	}
+	if res.All.NegTotal != 1 || res.All.NegPassed != 0 {
+		t.Errorf("All.Neg = %d/%d, want 0/1", res.All.NegPassed, res.All.NegTotal)
+	}
+	if res.HeldOut.PosTotal != 1 || res.HeldOut.PosPassed != 1 {
+		t.Errorf("HeldOut.Pos = %d/%d, want 1/1", res.HeldOut.PosPassed, res.HeldOut.PosTotal)
+	}
+	if res.HeldOut.NegTotal != 1 || res.HeldOut.NegPassed != 0 {
+		t.Errorf("HeldOut.Neg = %d/%d, want 0/1", res.HeldOut.NegPassed, res.HeldOut.NegTotal)
+	}
+	if len(res.PassedIndices) != 2 {
+		t.Fatalf("PassedIndices = %v, want exactly indices 0 and 1", res.PassedIndices)
+	}
+	gotPassed := map[int]bool{res.PassedIndices[0]: true, res.PassedIndices[1]: true}
+	if !gotPassed[0] || !gotPassed[1] {
+		t.Errorf("PassedIndices = %v, want {0,1}", res.PassedIndices)
+	}
+}
+
 // ============================================================
 // senderDomainLabel / CitesExamples
 // ============================================================

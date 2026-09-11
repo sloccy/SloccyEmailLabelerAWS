@@ -165,18 +165,6 @@ func fetchExcerptsBounded(ctx context.Context, svc *gmail.Client, messageIDs []s
 	return result
 }
 
-// bulkTriggerKind reports why a rule was flagged for improvement in a bulk action: "apply"
-// actions mean the rule missed some of the selection (false_negative), "remove" actions
-// mean it wrongly caught some of it (false_positive). Every prompt id offered for
-// improvement in the bulk form is guaranteed to be in exactly one of applySet/removeSet —
-// the UI only shows the improve checkbox next to a rule once an action is chosen for it.
-func bulkTriggerKind(pid int64, applySet map[int64]bool) string {
-	if applySet[pid] {
-		return db.TriggerKindFalseNegative
-	}
-	return db.TriggerKindFalsePositive
-}
-
 // bulkRecategorizeFormData feeds bulk_recategorize_form.html. Selections is re-serialized
 // as hidden "selections" inputs in the form (same "<accountID>:<messageID>" encoding used
 // on both the GET query string that built this data and the POST that submits the form),
@@ -258,7 +246,6 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 	applyIDs := parseIDList(r.Form["apply_prompt_ids"])
 	removeIDs := parseIDList(r.Form["remove_prompt_ids"])
 	improveIDs := parseIDList(r.Form["improve_prompt_ids"])
-	applySet := idSet(applyIDs)
 	improveSet := idSet(improveIDs)
 	note := r.FormValue("note")
 
@@ -369,36 +356,13 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		incrementVersionObservedFor(ctx, s.store, allExamples)
 	}
 
-	// One suggestion per flagged rule, not per email — the corpus (just written above)
-	// already carries every touched message's examples, so the improve worker needs
-	// nothing email-specific to run; it reads the corpus fresh via selectExamplesForImprove.
-	var targets []improveTarget
-	for pid := range improveSet {
-		p, ok := promptByID[pid]
-		if !ok {
-			continue
-		}
-		sid, err := s.store.InsertPromptSuggestion(ctx, db.InsertPromptSuggestionParams{
-			PromptID:              p.ID,
-			TriggerKind:           bulkTriggerKind(pid, applySet),
-			EmailSubject:          fmt.Sprintf("Bulk recategorization (%d emails)", len(selections)),
-			OriginalInstructions:  p.Instructions,
-			SuggestedInstructions: "",
-			ConversationJSON:      "[]",
-			Status:                db.SuggestionStatusGenerating,
-		})
-		if err != nil {
-			slog.Error("bulk recategorize: insert generating suggestion", "prompt_id", pid, "err", err)
-			continue
-		}
-		targets = append(targets, improveTarget{
-			SuggestionID:         sid,
-			PromptID:             p.ID,
-			OriginalInstructions: p.Instructions,
-			Note:                 note,
-		})
-	}
-	s.dispatchImprove(ctx, targets)
+	// Queue one entry per flagged rule, not per email — the corpus (just written above)
+	// already carries every touched message's examples, so a rule's queue entry needs
+	// nothing email-specific either; the improve worker reads the corpus fresh via
+	// selectExamplesForImprove once Start is pressed (see db.ImproveQueueEntry's doc
+	// comment). No single email to give as a ref (a bulk action touches many), so the queue
+	// card gets the same synthetic subject the suggestion row used to carry.
+	s.enqueueImproveFlags(ctx, improveSet, applyIDs, "", "", fmt.Sprintf("Bulk recategorization (%d emails)", len(selections)), note)
 
 	setHxTrigger(w, map[string]any{
 		triggerShowToast:              map[string]any{toastKeyMessage: fmt.Sprintf("Recategorized %d emails", len(selections)), jsonKeyType: toastTypeSuccess},

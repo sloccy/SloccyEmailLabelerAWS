@@ -6,14 +6,13 @@ package main
 //
 // db.PromptExample has no TTL: it's a rule's permanent history, and at this app's scale
 // that's cheap (see the "Growth and retention" doc comment on the Prompt examples section,
-// db/store.go). But it's genuinely unbounded — passive confirmation
-// (processor.processEmail) writes a confirmed_positive row on every routine match, not just
-// a manual correction, so a heavily-used rule's corpus grows forever with nothing to stop
-// it short of the user manually clearing it.
+// db/store.go). But it's still unbounded — every explicit human review (a recategorize or a
+// Confirm, see PromptExample's doc comment) writes a fresh row, so a rule reviewed often
+// enough grows a corpus with nothing to stop it short of the user manually clearing it.
 //
 // This file runs the example-selection sampler (improve.go's sampleVerdict) in reverse:
 // whatever falls outside the same priority order selection already uses — recurred first,
-// then manually-reviewed, then passive, each spread across sender/subject buckets — is, by
+// then Missed, then plain confirmations, each spread across sender/subject buckets — is, by
 // construction, exactly what selection would never show the improver or score against, so
 // it's safe to delete permanently. See pruneKeepSet (improve.go) for the actual policy,
 // including why resolved examples are kept separately from live ones.

@@ -275,6 +275,84 @@ func TestBuildReplayFeedbackTurn_OutOfRangeIndexSkippedNotPanicked(t *testing.T)
 	}
 }
 
+// TestBuildReplayFeedbackTurn_HeldOutFailuresNeverShowContent guards the whole reason
+// buildReplayFeedbackTurn splits by HeldOut: selectBestRound ranks a round on its held-out
+// pass rate precisely because it can't be satisfied by enumerating the examples the model
+// was shown — if a held-out failure's sender/subject/excerpt ever leaked into the feedback
+// turn, the very next round's "held-out" score would actually be measuring an example the
+// model had just been handed.
+func TestBuildReplayFeedbackTurn_HeldOutFailuresNeverShowContent(t *testing.T) {
+	examples := []db.PromptExample{
+		{Sender: "shown@example.com", Subject: "Shown failure", BodyExcerpt: "shown body"},
+		{Sender: "secret@example.com", Subject: "Held-out failure", BodyExcerpt: "held-out body"},
+	}
+	replayLLMExamples := []llm.ReplayExample{
+		{HeldOut: false},
+		{HeldOut: true},
+	}
+	replay := llm.ReplayResult{
+		Total: 5, Passed: 3, HeldOutTotal: 1,
+		Failures: []llm.ReplayFailure{
+			{Verdict: db.VerdictConfirmedNegative, Got: true, ExampleIndex: 0},  // shown, wrongly matched
+			{Verdict: db.VerdictConfirmedPositive, Got: false, ExampleIndex: 1}, // held-out, wrongly missed
+		},
+	}
+
+	turn := buildReplayFeedbackTurn("a generic candidate rule", replay, examples, replayLLMExamples)
+
+	if strings.Contains(turn, "secret@example.com") || strings.Contains(turn, "Held-out failure") || strings.Contains(turn, "held-out body") {
+		t.Errorf("held-out failure's content leaked into the feedback turn: %s", turn)
+	}
+	if !strings.Contains(turn, "shown@example.com") || !strings.Contains(turn, "shown body") {
+		t.Errorf("shown failure's content missing from the feedback turn: %s", turn)
+	}
+	if !strings.Contains(turn, "1 of the 1 emails you weren't shown") {
+		t.Errorf("expected a count-only held-out summary line: %s", turn)
+	}
+}
+
+// ============================================================
+// roundBetter / balanced accuracy
+// ============================================================
+
+// TestRoundBetter_BalancedAccuracyBeatsMatchEverything guards the fix for a lopsided corpus
+// (mostly confirmed_positive, a handful of confirmed_negative — see
+// db.VerdictConfirmedNegative's doc comment): round A matches everything, scoring perfectly
+// on the large positive bucket and failing every negative; round B is slightly worse on raw
+// accuracy but actually distinguishes the two. Balanced accuracy must prefer B even though
+// raw accuracy would have picked A.
+func TestRoundBetter_BalancedAccuracyBeatsMatchEverything(t *testing.T) {
+	matchEverything := db.SuggestionRoundSummary{
+		N: 1, Candidate: "match everything",
+		Passed: 18, Total: 20, PosTotal: 18, PosPassed: 18, NegTotal: 2, NegPassed: 0,
+	}
+	discriminates := db.SuggestionRoundSummary{
+		N: 2, Candidate: "discriminates",
+		Passed: 17, Total: 20, PosTotal: 18, PosPassed: 16, NegTotal: 2, NegPassed: 1,
+	}
+	if matchEverything.Passed <= discriminates.Passed {
+		// sanity check on the fixture: raw accuracy alone would pick the wrong round
+		t.Fatalf("fixture bug: expected matchEverything's raw Passed to exceed discriminates'")
+	}
+	if !roundBetter(discriminates, matchEverything, 0) {
+		t.Error("expected the discriminating round to win on balanced accuracy despite a lower raw pass rate")
+	}
+	if roundBetter(matchEverything, discriminates, 0) {
+		t.Error("expected the match-everything round to lose on balanced accuracy")
+	}
+}
+
+// TestRoundBetter_OneEmptyBucketFallsBackToRawRate checks that an empty bucket (Balanced
+// returns -1, llm.ClassCounts) doesn't crash the comparison or wrongly declare a winner —
+// it just falls through to raw pass rate, same as before balanced accuracy existed.
+func TestRoundBetter_OneEmptyBucketFallsBackToRawRate(t *testing.T) {
+	a := db.SuggestionRoundSummary{N: 1, Passed: 8, Total: 10, PosTotal: 10, PosPassed: 8} // NegTotal 0
+	b := db.SuggestionRoundSummary{N: 2, Passed: 6, Total: 10, PosTotal: 10, PosPassed: 6}
+	if !roundBetter(a, b, 0) {
+		t.Error("expected a (higher raw pass rate) to win when neither round has negative-bucket evidence")
+	}
+}
+
 // ============================================================
 // terminalWriteCtx
 // ============================================================

@@ -521,7 +521,13 @@ function _refreshSuggestionsBadge() {
   fetch('/fragments/prompt-suggestions')
     .then(r => r.text())
     .then(html => {
-      const count = (html.match(/class="suggestion-card"/g) || []).filter((_, i, a) => true).length;
+      // A suggestion card marked data-no-gain="1" (see PromptSuggestion.NoGain's doc
+      // comment, db/models.go) didn't beat the rule it would replace — it's still shown in
+      // the list, but excluded here so the nav count only counts suggestions actually worth
+      // looking at.
+      const total = (html.match(/class="suggestion-card"/g) || []).length;
+      const noGain = (html.match(/data-no-gain="1"/g) || []).length;
+      const count = total - noGain;
       const badge = document.getElementById('suggestions-badge');
       if (!badge) return;
       if (count > 0) {
@@ -534,11 +540,18 @@ function _refreshSuggestionsBadge() {
 }
 
 document.body.addEventListener('refreshSuggestionBadge', _refreshSuggestionsBadge);
-// refreshSuggestions is only ever fired alongside refreshSuggestionBadge (see
-// recategorize.go/recategorize_bulk.go's setHxTrigger calls) — the badge listener above
-// already handles the count update, so this only needs to reload the list itself, not
-// call _refreshSuggestionsBadge() a second time for the same response.
+// refreshSuggestions is fired alongside refreshSuggestionBadge by every handler that changes
+// the suggestion count (recategorize.go/recategorize_bulk.go, handleImproveQueueStart/
+// StartAll) — the badge listener above already handles the count update in that case, so
+// this only needs to reload the list itself. handleImproveQueueClear fires refreshSuggestions
+// alone (clearing a queued flag never changes the suggestion count), and this still needs to
+// react to that: it also reloads #improve-queue-container, which every one of these actions
+// can change (a flag lands there, Start/Clear remove one).
 window.addEventListener('refreshSuggestions', function() {
+  const queueContainer = document.getElementById('improve-queue-container');
+  if (queueContainer && document.getElementById('page-prompt-suggestions').classList.contains('active')) {
+    htmx.ajax('GET', '/fragments/improve-queue', { target: '#improve-queue-container', swap: 'innerHTML' });
+  }
   const listContainer = document.getElementById('suggestions-list-container');
   if (listContainer && document.getElementById('page-prompt-suggestions').classList.contains('active')) {
     htmx.ajax('GET', '/fragments/prompt-suggestions', { target: '#suggestions-list-container', swap: 'innerHTML' });

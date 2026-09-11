@@ -235,13 +235,13 @@ func TestParseBulkSelections(t *testing.T) {
 	}
 }
 
-func TestBulkTriggerKind(t *testing.T) {
-	applySet := map[int64]bool{1: true}
-	if got := bulkTriggerKind(1, applySet); got != db.TriggerKindFalseNegative {
-		t.Errorf("apply rule trigger kind = %q, want false_negative", got)
+func TestImproveTriggerKind(t *testing.T) {
+	addedIDs := []int64{1}
+	if got := improveTriggerKind(1, addedIDs); got != db.TriggerKindFalseNegative {
+		t.Errorf("added rule trigger kind = %q, want false_negative", got)
 	}
-	if got := bulkTriggerKind(2, applySet); got != db.TriggerKindFalsePositive {
-		t.Errorf("remove rule trigger kind = %q, want false_positive", got)
+	if got := improveTriggerKind(2, addedIDs); got != db.TriggerKindFalsePositive {
+		t.Errorf("removed rule trigger kind = %q, want false_positive", got)
 	}
 }
 
@@ -447,13 +447,15 @@ func TestFilterResolved(t *testing.T) {
 
 // TestProblemExampleKeys checks problemExampleKeys only picks Missed entries — a plain
 // confirmation is a guardrail, not a problem, and must never end up marked resolved.
+// replayOn=false: no evidence to gate on, so every Missed key resolves (pre-replay-gating
+// behavior — see problemExampleKeys' doc comment).
 func TestProblemExampleKeys(t *testing.T) {
 	examples := []db.PromptExample{
 		{ID: 1, PromptID: 5, Verdict: db.VerdictConfirmedPositive, Missed: true, CreatedAt: "2026-07-01 12:00:00"},
 		{ID: 2, PromptID: 5, Verdict: db.VerdictConfirmedNegative, Missed: true, CreatedAt: "2026-07-01 12:00:01"},
 		{ID: 3, PromptID: 5, Verdict: db.VerdictConfirmedPositive, CreatedAt: "2026-07-01 12:00:02"},
 	}
-	got := problemExampleKeys(examples)
+	got := problemExampleKeys(examples, false, nil)
 	if len(got) != 2 {
 		t.Fatalf("got %d keys, want 2 (plain confirmation excluded): %+v", len(got), got)
 	}
@@ -465,5 +467,22 @@ func TestProblemExampleKeys(t *testing.T) {
 		if k.PromptID != 5 {
 			t.Errorf("key PromptID = %d, want 5", k.PromptID)
 		}
+	}
+}
+
+// TestProblemExampleKeys_ReplayGated checks the replay-gated case (replayOn=true): a Missed
+// example only resolves when the winning round's replay actually confirmed it fixed
+// (fixedMessageIDs) — one still-failing and one never-scored Missed example must both stay
+// unresolved, so a future improve round still sees them as live problems.
+func TestProblemExampleKeys_ReplayGated(t *testing.T) {
+	examples := []db.PromptExample{
+		{ID: 1, PromptID: 5, MessageID: "fixed", Verdict: db.VerdictConfirmedPositive, Missed: true, CreatedAt: "2026-07-01 12:00:00"},
+		{ID: 2, PromptID: 5, MessageID: "still-broken", Verdict: db.VerdictConfirmedNegative, Missed: true, CreatedAt: "2026-07-01 12:00:01"},
+		{ID: 3, PromptID: 5, MessageID: "never-scored", Verdict: db.VerdictConfirmedPositive, Missed: true, CreatedAt: "2026-07-01 12:00:02"},
+	}
+	fixed := map[string]bool{"fixed": true}
+	got := problemExampleKeys(examples, true, fixed)
+	if len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("got %+v, want only example 1 (the confirmed-fixed one) resolved", got)
 	}
 }
