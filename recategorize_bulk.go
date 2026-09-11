@@ -369,7 +369,7 @@ func (s *server) handleBulkRecategorize(w http.ResponseWriter, r *http.Request) 
 		"closeModal":                  "recategorize-modal",
 		triggerRefreshSuggestionBadge: "1",
 		"refreshHistory":              "1",
-		"refreshSuggestions":          "1",
+		triggerRefreshSuggestions:     "1",
 	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 }
