@@ -40,10 +40,11 @@ import (
 // this code between the batch and regenerate call sites.
 
 // improveTarget is one suggestion row to work in an improveEvent. The row itself
-// (status='generating') is already inserted/marked by the caller — seedImproveSuggestions
-// (recategorize.go), handleBulkRecategorize (recategorize_bulk.go), or
-// handlePromptSuggestionRegenerate (server.go) — before the async invoke fires, so the
-// worker only ever needs the id plus enough context to run one improve call.
+// (status='generating') is already inserted/marked by the caller —
+// server.startImproveQueueEntry (called from handleImproveQueueStart/StartAll once a queued
+// rule's flag is actually started) or handlePromptSuggestionRegenerate (server.go) — before
+// the async invoke fires, so the worker only ever needs the id plus enough context to run
+// one improve call.
 type improveTarget struct {
 	SuggestionID         int64             `json:"suggestion_id"`
 	PromptID             int64             `json:"prompt_id"`
@@ -583,10 +584,27 @@ func filterResolved(examples []db.PromptExample) []db.PromptExample {
 // suggestion is applied. Plain confirmations (Missed == false) are never included: they
 // aren't problems to resolve, they're guardrails a rewrite shouldn't have broken, and
 // marking one resolved would just hide it from future improve rounds for no reason.
-func problemExampleKeys(examples []db.PromptExample) []db.ResolvedExampleKey {
+//
+// Gated on fixedMessageIDs (see fixedByReplay) when replayOn: a Missed example only resolves
+// if the winning round's replay actually scored it against the candidate and got it right.
+// Without this gate, applying a suggestion resolved every Missed example it was built from
+// regardless of whether the winning candidate still failed it in replay — filterResolved
+// (this file) then drops that example from every future improve round, so the evidence for
+// a problem the rewrite never actually fixed silently disappeared. An example replay never
+// scored at all (outside the replay sample, or errored out — errored examples don't appear
+// in fixedMessageIDs; see ReplayResult.PassedIndices' doc comment, llm/bedrock.go) has no
+// evidence either way and, like a still-failing one, stays unresolved.
+//
+// replayOn=false means there's no evidence to gate on at all (replay didn't run — disabled,
+// or the improve call failed before any round completed), so every Missed key resolves,
+// matching this function's behavior before replay-gated resolution existed.
+func problemExampleKeys(examples []db.PromptExample, replayOn bool, fixedMessageIDs map[string]bool) []db.ResolvedExampleKey {
 	var keys []db.ResolvedExampleKey
 	for _, ex := range examples {
 		if !ex.Missed {
+			continue
+		}
+		if replayOn && !fixedMessageIDs[ex.MessageID] {
 			continue
 		}
 		keys = append(keys, db.ResolvedExampleKey{
@@ -597,6 +615,23 @@ func problemExampleKeys(examples []db.PromptExample) []db.ResolvedExampleKey {
 		})
 	}
 	return keys
+}
+
+// fixedByReplay returns the MessageIDs the winning round's replay actually confirmed the
+// candidate rule got right (ReplayResult.PassedIndices), resolved back to their source
+// example via replayExamples — the same slice, same order, that replayExamplesFor built the
+// scored []llm.ReplayExample from, so PassedIndices' positions line up with it directly.
+// Safe to call with a zero-value ReplayResult (replay off, or a round that failed before
+// scoring): PassedIndices is nil, so the returned map is empty and problemExampleKeys'
+// replayOn=false branch does the resolving instead.
+func fixedByReplay(replay llm.ReplayResult, replayExamples []db.PromptExample) map[string]bool {
+	fixed := make(map[string]bool, len(replay.PassedIndices))
+	for _, idx := range replay.PassedIndices {
+		if idx >= 0 && idx < len(replayExamples) {
+			fixed[replayExamples[idx].MessageID] = true
+		}
+	}
+	return fixed
 }
 
 // improveRequestExamples groups a rule's example corpus into the two llm.ExampleRef slices
@@ -738,8 +773,46 @@ func passRate(passed, total int64) float64 {
 	return float64(passed) / float64(total)
 }
 
+// classCounts builds an llm.ClassCounts from one round's stored per-bucket fields
+// (db.SuggestionRoundSummary), so roundBetter can reuse llm.ClassCounts.Balanced instead of
+// duplicating that formula here.
+func classCounts(posTotal, posPassed, negTotal, negPassed int64) llm.ClassCounts {
+	return llm.ClassCounts{
+		PosTotal: int(posTotal), PosPassed: int(posPassed),
+		NegTotal: int(negTotal), NegPassed: int(negPassed),
+	}
+}
+
+// scoreBetter compares two scores where -1 means "no such score" (passRate's zero-total
+// case, or llm.ClassCounts.Balanced with an empty bucket) — never treated as beating a real
+// score. decided is false when this comparison doesn't settle anything (either score is
+// missing, or they're numerically equal), telling the caller to fall through to the next
+// comparison in roundBetter's ordering rather than declare a winner on a non-difference.
+func scoreBetter(a, b float64) (decided, aWins bool) {
+	if a < 0 || b < 0 || a == b {
+		return false, false
+	}
+	return true, a > b
+}
+
 // roundBetter reports whether a is strictly better than b, under selectBestRound's
 // ordering. heldOutSubmitted is passed through unchanged from selectBestRound.
+//
+// The comparison runs in order, each step only settling the result when it actually
+// distinguishes a from b (see scoreBetter) — otherwise falling through to the next:
+//  1. adequate coverage (hasAdequateCoverage) beats inadequate.
+//  2. When both rounds have adequate held-out coverage, held-out balanced accuracy
+//     (llm.ClassCounts.Balanced — mean of positive recall and negative specificity, see its
+//     doc comment for why raw accuracy alone lets a rule that matches everything win).
+//  3. Held-out raw pass rate, the same held-out score this comparison used before balanced
+//     accuracy existed — reached only when balanced accuracy tied or wasn't computable
+//     (one bucket empty).
+//  4. When both rounds have adequate overall coverage, overall balanced accuracy.
+//  5. Overall raw pass rate.
+//  6. Shorter candidate wins — concision has to earn a win through the score instead of
+//     being asked for in the prompt and ignored (see improveSystemPrompt, llm/bedrock.go,
+//     and this repo's word-count-fixation fix).
+//  7. Fully tied: keep the earlier round (caller only replaces on strict >).
 func roundBetter(a, b db.SuggestionRoundSummary, heldOutSubmitted int64) bool {
 	aCov := hasAdequateCoverage(a.Total, a.Total+a.Errored)
 	bCov := hasAdequateCoverage(b.Total, b.Total+b.Errored)
@@ -747,21 +820,33 @@ func roundBetter(a, b db.SuggestionRoundSummary, heldOutSubmitted int64) bool {
 		return aCov
 	}
 
-	var aRate, bRate float64
 	if aCov && bCov && heldOutSubmitted > 0 &&
 		hasAdequateCoverage(a.HeldOutTotal, heldOutSubmitted) && hasAdequateCoverage(b.HeldOutTotal, heldOutSubmitted) {
-		aRate, bRate = passRate(a.HeldOutPassed, a.HeldOutTotal), passRate(b.HeldOutPassed, b.HeldOutTotal)
-	} else {
-		aRate, bRate = passRate(a.Passed, a.Total), passRate(b.Passed, b.Total)
+		aBal := classCounts(a.HeldOutPosTotal, a.HeldOutPosPassed, a.HeldOutNegTotal, a.HeldOutNegPassed).Balanced()
+		bBal := classCounts(b.HeldOutPosTotal, b.HeldOutPosPassed, b.HeldOutNegTotal, b.HeldOutNegPassed).Balanced()
+		if decided, aWins := scoreBetter(aBal, bBal); decided {
+			return aWins
+		}
+		aRate, bRate := passRate(a.HeldOutPassed, a.HeldOutTotal), passRate(b.HeldOutPassed, b.HeldOutTotal)
+		if decided, aWins := scoreBetter(aRate, bRate); decided {
+			return aWins
+		}
 	}
-	if aRate != bRate {
-		return aRate > bRate
+
+	if aCov && bCov {
+		aBal := classCounts(a.PosTotal, a.PosPassed, a.NegTotal, a.NegPassed).Balanced()
+		bBal := classCounts(b.PosTotal, b.PosPassed, b.NegTotal, b.NegPassed).Balanced()
+		if decided, aWins := scoreBetter(aBal, bBal); decided {
+			return aWins
+		}
+	}
+
+	aRate, bRate := passRate(a.Passed, a.Total), passRate(b.Passed, b.Total)
+	if decided, aWins := scoreBetter(aRate, bRate); decided {
+		return aWins
 	}
 
 	if len(a.Candidate) != len(b.Candidate) {
-		// Shorter wins: concision now has to earn a win through the score instead of
-		// being asked for in the prompt and ignored (see improveSystemPrompt,
-		// llm/bedrock.go, and this repo's word-count-fixation fix).
 		return len(a.Candidate) < len(b.Candidate)
 	}
 	return false // fully tied: keep the earlier round (caller only replaces on strict >)
@@ -867,6 +952,15 @@ func hasTimeForAnotherRound(ctx context.Context, lastRound time.Duration) bool {
 // generalization failure the score alone doesn't surface (a rewrite that names "github.com"
 // can still score well if the corpus happens to be mostly GitHub mail). Purely advisory:
 // prepended to the feedback when it fires, never blocks or lowers the score.
+//
+// Held-out failures (llm.ReplayExample.HeldOut, via replayLLMExamples) are deliberately
+// never shown verbatim — only a count. selectBestRound ranks a round on its held-out pass
+// rate precisely because a rewrite can't satisfy it by enumerating the examples it was
+// shown; printing a held-out failure's sender/subject/excerpt here would hand the model
+// exactly that example on the very next round, so from round 2 on the "held-out" score
+// would actually be measuring examples the model had already seen. The count alone still
+// tells the model it's losing points outside the sample, which is the generalization
+// pressure this function exists to apply — it just can't be satisfied by memorizing lines.
 func buildReplayFeedbackTurn(candidate string, replay llm.ReplayResult, examples []db.PromptExample, replayLLMExamples []llm.ReplayExample) string {
 	var sb strings.Builder
 
@@ -880,11 +974,24 @@ func buildReplayFeedbackTurn(candidate string, replay llm.ReplayResult, examples
 	}
 	sb.WriteString(".\n")
 
+	// isHeldOut is defensive about a bad index the same way the old code's bounds check on
+	// examples was: never trust ExampleIndex blindly, even though replayLLMExamples and
+	// examples are always the same length in practice (replayExamplesFor's contract).
+	isHeldOut := func(idx int) bool {
+		return idx >= 0 && idx < len(replayLLMExamples) && replayLLMExamples[idx].HeldOut
+	}
+
 	var wronglyMatched, wronglyMissed []llm.ReplayFailure
+	var heldOutMatched, heldOutMissed int
 	for _, f := range replay.Failures {
-		if f.Got {
+		switch {
+		case isHeldOut(f.ExampleIndex) && f.Got:
+			heldOutMatched++
+		case isHeldOut(f.ExampleIndex):
+			heldOutMissed++
+		case f.Got:
 			wronglyMatched = append(wronglyMatched, f)
-		} else {
+		default:
 			wronglyMissed = append(wronglyMissed, f)
 		}
 	}
@@ -903,6 +1010,10 @@ func buildReplayFeedbackTurn(candidate string, replay llm.ReplayResult, examples
 	}
 	writeGroup("STILL WRONGLY CAUGHT (must not match)", wronglyMatched)
 	writeGroup("STILL MISSED (must match)", wronglyMissed)
+	if heldOutFails := heldOutMatched + heldOutMissed; heldOutFails > 0 {
+		fmt.Fprintf(&sb, "\nAlso failing: %d of the %d emails you weren't shown (%d wrongly caught, %d missed). You can't see them — fix the category, not these lines.\n",
+			heldOutFails, replay.HeldOutTotal, heldOutMatched, heldOutMissed)
+	}
 
 	fmt.Fprintf(&sb, "\nRewrite again to fix these without breaking the %d it already gets right. Prefer the shortest rewrite that does. Same constraints.", replay.Passed)
 	return sb.String()
@@ -1042,6 +1153,10 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 			N: n, Candidate: suggested,
 			Passed: int64(replay.Passed), Total: int64(replay.Total), Errored: int64(replay.Errored),
 			HeldOutTotal: int64(replay.HeldOutTotal), HeldOutPassed: int64(replay.HeldOutPassed),
+			PosTotal: int64(replay.All.PosTotal), PosPassed: int64(replay.All.PosPassed),
+			NegTotal: int64(replay.All.NegTotal), NegPassed: int64(replay.All.NegPassed),
+			HeldOutPosTotal: int64(replay.HeldOut.PosTotal), HeldOutPosPassed: int64(replay.HeldOut.PosPassed),
+			HeldOutNegTotal: int64(replay.HeldOut.NegTotal), HeldOutNegPassed: int64(replay.HeldOut.NegPassed),
 		})
 		candidates = append(candidates, suggested)
 		convs = append(convs, conv)
@@ -1074,8 +1189,10 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 	// Recorded on every generate/regenerate round, so applying whichever round's
 	// suggestion the user actually accepts marks the examples that shaped *that* version —
 	// not stale keys from an earlier round if the corpus shifted in between (see this
-	// function's doc comment).
-	problemKeysJSON, keysErr := json.Marshal(problemExampleKeys(examples))
+	// function's doc comment). Gated on the winning round's own replay evidence
+	// (fixedByReplay) — see problemExampleKeys' doc comment for why a Missed example the
+	// winning candidate never actually confirmed fixed must not resolve.
+	problemKeysJSON, keysErr := json.Marshal(problemExampleKeys(examples, replayOn, fixedByReplay(bestReplay, replayExamples)))
 	roundsJSON, roundsErr := json.Marshal(rounds)
 	// These are concrete slices of plain structs, so a failure means one of those types
 	// grew a field JSON can't encode. Bail rather than finalize the suggestion with a
@@ -1109,8 +1226,24 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 		finalize.ReplayHeldOutTotal = int64(bestReplay.HeldOutTotal)
 		finalize.ReplayHeldOutPassed = int64(bestReplay.HeldOutPassed)
 		finalize.ReplayFailures = string(failuresJSON)
-		if !hasAdequateCoverage(finalize.ReplayTotal, finalize.ReplayTotal+finalize.ReplayErrored) {
+		finalize.ReplayPosTotal = int64(bestReplay.All.PosTotal)
+		finalize.ReplayPosPassed = int64(bestReplay.All.PosPassed)
+		finalize.ReplayNegTotal = int64(bestReplay.All.NegTotal)
+		finalize.ReplayNegPassed = int64(bestReplay.All.NegPassed)
+		adequateCoverage := hasAdequateCoverage(finalize.ReplayTotal, finalize.ReplayTotal+finalize.ReplayErrored)
+		if !adequateCoverage {
 			tw.Event(ctx, db.TraceKindNote, int64(bestN), fmt.Sprintf("only %d of %d submitted examples were actually scored — this score is not reliable", finalize.ReplayTotal, finalize.ReplayTotal+finalize.ReplayErrored))
+		}
+		// NoGain: the winning round didn't beat the rule it's proposing to replace, over the
+		// same scored examples (ReplayBaseline shares ReplayTotal's exact denominator — see
+		// its doc comment, db/models.go). selectBestRound only ever ranks rounds against each
+		// other, so without this a rewrite that's measurably worse than what's already live
+		// would still finalize as an ordinary pending suggestion. Only checked with adequate
+		// coverage — a low-coverage comparison isn't trustworthy either way (see
+		// hasAdequateCoverage's doc comment).
+		if adequateCoverage && finalize.ReplayPassed <= finalize.ReplayBaseline {
+			finalize.NoGain = true
+			tw.Event(ctx, db.TraceKindNote, int64(bestN), fmt.Sprintf("no better than the current rule (%d/%d vs. %d/%d already) — review before applying", finalize.ReplayPassed, finalize.ReplayTotal, finalize.ReplayBaseline, finalize.ReplayTotal))
 		}
 	}
 	// The done event is emitted only after FinalizePromptSuggestion actually lands — the

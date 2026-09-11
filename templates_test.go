@@ -199,6 +199,9 @@ func TestPromptSuggestionsListTemplate_Renders(t *testing.T) {
 		{"dismissed falls through to the else branch", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
 			{ID: 4, PromptName: "Spam", TriggerKind: "false_negative", Status: "dismissed"},
 		}}},
+		{"no-gain badge", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
+			{ID: 5, PromptName: "Receipts", TriggerKind: "false_positive", Status: "pending", NoGain: true},
+		}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -276,11 +279,89 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 			return v
 		}()},
 		{"dismissed: renders the terminal-status branch", func() suggestionView { v := base; v.Status = "dismissed"; return v }()},
+		{"pending with no-gain badge and demoted apply button", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ReplayTotal, v.ReplayPassed, v.ReplayBaseline = 10, 6, 8
+			v.NoGain = true
+			return v
+		}()},
+		{"pending with balanced per-bucket replay split", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match promotional newsletters."
+			v.ReplayTotal, v.ReplayPassed, v.ReplayBaseline = 14, 12, 10
+			v.ReplayPosTotal, v.ReplayPosPassed = 9, 8
+			v.ReplayNegTotal, v.ReplayNegPassed = 5, 4
+			return v
+		}()},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if err := tmpl.ExecuteTemplate(io.Discard, "prompt_suggestion_detail.html", c.view); err != nil {
 				t.Errorf("execute: %v", err)
+			}
+		})
+	}
+}
+
+// TestImproveQueueTemplate_Renders exercises the "Queued for improvement" cards
+// (improve_queue.html). Asserts the "Start all" button only appears with more than one
+// queued rule, and that a MoreEmails count only appears when there actually are more.
+func TestImproveQueueTemplate_Renders(t *testing.T) {
+	tmpl := mustLoadTemplates(t)
+
+	cases := []struct {
+		name         string
+		view         improveQueueListView
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:       "empty queue renders nothing",
+			view:       improveQueueListView{},
+			wantAbsent: []string{"Queued for improvement"},
+		},
+		{
+			name: "one queued rule has no Start all button",
+			view: improveQueueListView{Items: []improveQueueCardView{
+				{PromptID: 1, PromptName: "Newsletters", FlaggedCount: 1, Emails: []db.QueuedEmailRef{
+					{MessageID: "m1", Sender: "a@example.com", Subject: "Weekly digest", TriggerKind: db.TriggerKindFalseNegative},
+				}},
+			}},
+			wantContains: []string{"Newsletters", "Weekly digest", "missed it"},
+			wantAbsent:   []string{"Start all", "more"},
+		},
+		{
+			name: "several queued rules show Start all and a more-emails count",
+			view: improveQueueListView{Items: []improveQueueCardView{
+				{PromptID: 1, PromptName: "Newsletters", FlaggedCount: 5, MoreEmails: 4, Emails: []db.QueuedEmailRef{
+					{MessageID: "m1", Sender: "a@example.com", Subject: "Weekly digest", TriggerKind: db.TriggerKindFalsePositive},
+				}},
+				{PromptID: 2, PromptName: "Receipts", FlaggedCount: 1, Emails: []db.QueuedEmailRef{
+					{MessageID: "m2", Sender: "b@example.com", Subject: "Order #1", TriggerKind: db.TriggerKindFalseNegative},
+				}},
+			}},
+			wantContains: []string{"Start all", "wrong match", "4 more"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := tmpl.ExecuteTemplate(&buf, "improve_queue.html", c.view); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			got := buf.String()
+			for _, want := range c.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q\n%s", want, got)
+				}
+			}
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("output should not contain %q\n%s", absent, got)
+				}
 			}
 		})
 	}

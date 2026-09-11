@@ -281,6 +281,10 @@ func (s *server) registerRoutes() {
 	s.mux.HandleFunc("GET /fragments/history/bulk-recategorize", s.handleBulkRecategorizeForm)
 	s.mux.HandleFunc("POST /fragments/history/bulk-recategorize", s.handleBulkRecategorize)
 	s.mux.HandleFunc("POST /fragments/history/bulk-confirm", s.handleBulkConfirmCategorization)
+	s.mux.HandleFunc("GET /fragments/improve-queue", s.handleImproveQueueList)
+	s.mux.HandleFunc("POST /fragments/improve-queue/{id}/start", s.handleImproveQueueStart)
+	s.mux.HandleFunc("POST /fragments/improve-queue/start-all", s.handleImproveQueueStartAll)
+	s.mux.HandleFunc("DELETE /fragments/improve-queue/{id}", s.handleImproveQueueClear)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions", s.handlePromptSuggestionsList)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}", s.handlePromptSuggestionDetail)
 	s.mux.HandleFunc("GET /fragments/prompt-suggestions/{id}/trace", s.handlePromptSuggestionTrace)
@@ -649,7 +653,7 @@ func (s *server) handlePromptExamplesBadge(w http.ResponseWriter, r *http.Reques
 	ctx := r.Context()
 	counts, err := s.store.CountExamplesByVerdict(ctx, id)
 	if err != nil {
-		slog.Error("count prompt examples", "prompt_id", id, "err", err)
+		slog.Error("count prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt — nothing free-form for a log line to inject
 	}
 	var total int64
 	for _, n := range counts {
@@ -687,7 +691,7 @@ func (s *server) handlePromptExamples(w http.ResponseWriter, r *http.Request) {
 	for _, v := range db.VerdictOrder {
 		examples, err := s.store.ListExamplesByVerdict(ctx, id, v, promptExamplesPerVerdict+1)
 		if err != nil {
-			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err)
+			slog.Error("list prompt examples", "prompt_id", id, "verdict", v, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt, v is one of db.VerdictOrder's fixed constants — nothing free-form for a log line to inject
 			continue
 		}
 		if len(examples) == 0 {
@@ -712,7 +716,7 @@ func (s *server) handleClearPromptExamples(w http.ResponseWriter, r *http.Reques
 	id := pathInt(r, "id")
 	ctx := r.Context()
 	if err := s.store.DeleteExamplesForPrompt(ctx, id); err != nil {
-		slog.Error("clear prompt examples", "prompt_id", id, "err", err)
+		slog.Error("clear prompt examples", "prompt_id", id, "err", err) //nolint:gosec // G706: id is an int64 already parsed by pathInt/strconv.ParseInt — nothing free-form for a log line to inject
 	}
 	s.fragmentResponse(w, "prompt_examples_badge.html", promptExamplesBadgeData{ID: id, Total: 0}, "Examples cleared")
 }
@@ -1762,6 +1766,163 @@ func (s *server) handleGenerateStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================
+// Improve queue
+// ============================================================
+//
+// Checking "Improve prompt with AI" while reviewing an email (recategorize.go's
+// enqueueImproveFlags) used to start an improve+replay round immediately, inside the
+// recategorize request — which meant a review session that flagged the same rule from
+// several emails fanned out one round per flag against a corpus that barely differed
+// between them, and each round saw the corpus as of that one instant rather than as of the
+// end of the session. Flagging now just writes/updates a db.ImproveQueueEntry; nothing here
+// calls the improve worker until the user presses Start.
+
+// improveQueueCardView is one queue card's render shape. MoreEmails is FlaggedCount minus
+// how many QueuedEmailRef the entry actually carries (see queuedEmailDisplayCap, db/models.go)
+// — the "…N more" line prompt_examples_list.html already uses this same pattern for.
+type improveQueueCardView struct {
+	PromptID     int64
+	PromptName   string
+	FlaggedCount int64
+	Emails       []db.QueuedEmailRef
+	MoreEmails   int64
+}
+
+type improveQueueListView struct {
+	Items []improveQueueCardView
+}
+
+func (s *server) handleImproveQueueList(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	entries, _ := s.store.ListImproveQueue(ctx)
+
+	allPrompts, _ := s.store.ListPrompts(ctx)
+	promptNames := make(map[int64]string, len(allPrompts))
+	for _, p := range allPrompts {
+		promptNames[p.ID] = p.Name
+	}
+
+	views := make([]improveQueueCardView, len(entries))
+	for i, e := range entries {
+		views[i] = improveQueueCardView{
+			PromptID:     e.PromptID,
+			PromptName:   promptNames[e.PromptID],
+			FlaggedCount: e.FlaggedCount,
+			Emails:       e.Emails,
+			MoreEmails:   e.FlaggedCount - int64(len(e.Emails)),
+		}
+	}
+	s.fragmentResponse(w, "improve_queue.html", improveQueueListView{Items: views}, "")
+}
+
+// startImproveQueueEntry does the actual "start" work for one rule's queued entry: insert a
+// generating suggestion row (seeded from the entry's newest email ref, same fields
+// seedImproveSuggestions used to stamp directly from the live request), then delete the
+// queue entry — in that order, so a crash between the two leaves the flag still queued
+// (retryable by a later Start) rather than silently dropped. Returns the resulting
+// improveTarget on success so handleImproveQueueStartAll can batch several rules into one
+// dispatchImprove call instead of one async Invoke per rule; ok is false on any store
+// failure, already logged, with nothing left half-done for the caller to clean up.
+func (s *server) startImproveQueueEntry(ctx context.Context, entry db.ImproveQueueEntry) (target improveTarget, ok bool) {
+	p, err := s.store.GetPrompt(ctx, entry.PromptID)
+	if err != nil {
+		slog.Error("start improve queue entry: get prompt", "prompt_id", entry.PromptID, "err", err)
+		return improveTarget{}, false
+	}
+
+	var ref db.QueuedEmailRef
+	if len(entry.Emails) > 0 {
+		ref = entry.Emails[0] // newest-first
+	}
+	note := strings.Join(entry.Notes, "; ")
+
+	sid, err := s.store.InsertPromptSuggestion(ctx, db.InsertPromptSuggestionParams{
+		PromptID:              p.ID,
+		TriggerKind:           ref.TriggerKind,
+		MessageID:             ref.MessageID,
+		EmailSubject:          ref.Subject,
+		EmailSender:           ref.Sender,
+		OriginalInstructions:  p.Instructions,
+		SuggestedInstructions: "",
+		ConversationJSON:      "[]",
+		Status:                db.SuggestionStatusGenerating,
+	})
+	if err != nil {
+		slog.Error("start improve queue entry: insert generating suggestion", "prompt_id", entry.PromptID, "err", err)
+		return improveTarget{}, false
+	}
+	if err := s.store.DeleteImproveQueueEntry(ctx, entry.PromptID); err != nil {
+		slog.Error("start improve queue entry: delete queue entry", "prompt_id", entry.PromptID, "err", err)
+	}
+
+	return improveTarget{
+		SuggestionID:         sid,
+		PromptID:             p.ID,
+		OriginalInstructions: p.Instructions,
+		Note:                 note,
+	}, true
+}
+
+func (s *server) handleImproveQueueStart(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	entry, err := s.store.GetImproveQueueEntry(ctx, id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if target, ok := s.startImproveQueueEntry(ctx, entry); ok {
+		s.dispatchImprove(ctx, []improveTarget{target})
+	}
+	setHxTrigger(w, map[string]any{
+		triggerRefreshSuggestionBadge: "1",
+		"refreshSuggestions":          "1",
+	})
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleImproveQueueStartAll starts every currently queued rule in one dispatchImprove call
+// — improveRunner.handle (improve.go) already loops over a batch of targets, so starting
+// N rules costs one async Invoke instead of N.
+func (s *server) handleImproveQueueStartAll(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	entries, err := s.store.ListImproveQueue(ctx)
+	if err != nil {
+		http.Error(w, "list queue failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var targets []improveTarget
+	for _, e := range entries {
+		if target, ok := s.startImproveQueueEntry(ctx, e); ok {
+			targets = append(targets, target)
+		}
+	}
+	s.dispatchImprove(ctx, targets)
+	setHxTrigger(w, map[string]any{
+		triggerRefreshSuggestionBadge: "1",
+		"refreshSuggestions":          "1",
+	})
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *server) handleImproveQueueClear(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	if err := s.store.DeleteImproveQueueEntry(ctx, id); err != nil {
+		http.Error(w, "clear failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setHxTrigger(w, map[string]any{"refreshSuggestions": "1"})
+	w.WriteHeader(http.StatusOK)
+}
+
+// ============================================================
 // Prompt Suggestions
 // ============================================================
 
@@ -1779,6 +1940,12 @@ type suggestionView struct {
 	SuggestedInstructions string
 	UserComment           string
 	Status                string
+	// NoGain — see PromptSuggestion.NoGain's doc comment (db/models.go). Carried at the
+	// base-field level (not detail-view-only) since both the compact list card and the
+	// detail page need it: the list badges a NoGain suggestion differently and excludes it
+	// from the nav count (see suggestionsBadgeCount), the detail page demotes its Apply
+	// button.
+	NoGain bool
 
 	// Detail-view only (populated by suggestionDetailView, left zero-value by the compact
 	// list view in handlePromptSuggestionsList — that view never renders them, and fetching
@@ -1794,6 +1961,13 @@ type suggestionView struct {
 	ReplayHeldOutTotal  int64
 	ReplayHeldOutPassed int64
 	ReplayFailures      []llm.ReplayFailure
+	// ReplayPosTotal/ReplayPosPassed/ReplayNegTotal/ReplayNegPassed split ReplayTotal/
+	// ReplayPassed by verdict bucket — see PromptSuggestion's doc comment (db/models.go) for
+	// why raw accuracy alone can hide a rule that just matches everything.
+	ReplayPosTotal  int64
+	ReplayPosPassed int64
+	ReplayNegTotal  int64
+	ReplayNegPassed int64
 
 	// Rounds is the improve<->replay trajectory (improve.go's loop), parsed from
 	// PromptSuggestion.RoundsJSON — empty for a suggestion generated before the loop
@@ -1844,6 +2018,7 @@ func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView 
 		SuggestedInstructions: sg.SuggestedInstructions,
 		UserComment:           sg.UserComment,
 		Status:                sg.Status,
+		NoGain:                sg.NoGain,
 	}
 }
 
@@ -1877,6 +2052,10 @@ func (s *server) suggestionDetailView(ctx context.Context, sg db.PromptSuggestio
 	view.ReplayErrored = sg.ReplayErrored
 	view.ReplayHeldOutTotal = sg.ReplayHeldOutTotal
 	view.ReplayHeldOutPassed = sg.ReplayHeldOutPassed
+	view.ReplayPosTotal = sg.ReplayPosTotal
+	view.ReplayPosPassed = sg.ReplayPosPassed
+	view.ReplayNegTotal = sg.ReplayNegTotal
+	view.ReplayNegPassed = sg.ReplayNegPassed
 	if sg.ReplayFailures != "" {
 		_ = json.Unmarshal([]byte(sg.ReplayFailures), &view.ReplayFailures)
 	}

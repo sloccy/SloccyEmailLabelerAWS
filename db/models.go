@@ -250,6 +250,51 @@ type ResolvedExampleKey struct {
 	ID        int64  `json:"id"`
 }
 
+// queuedEmailDisplayCap bounds how many QueuedEmailRef entries an ImproveQueueEntry keeps
+// for display — the improve worker always reads the corpus fresh (selectExamplesForImprove,
+// improve.go), so these are purely what the "Queued for improvement" card lists, not what
+// the round actually sees. FlaggedCount is the true, uncapped count.
+const queuedEmailDisplayCap = 10
+
+// queuedNoteDisplayCap bounds how many distinct notes an ImproveQueueEntry keeps, same
+// reasoning as queuedEmailDisplayCap.
+const queuedNoteDisplayCap = 5
+
+// QueuedEmailRef is one email that flagged a rule for improvement, kept only for display on
+// the queue card — see ImproveQueueEntry.
+type QueuedEmailRef struct {
+	MessageID string `dynamodbav:"messageId"`
+	Sender    string `dynamodbav:"sender"`
+	Subject   string `dynamodbav:"subject"`
+	// TriggerKind is one of the TriggerKind* constants (db/consts.go) — false_negative when
+	// this email's review added the rule, false_positive when it removed it, matching
+	// PromptSuggestion.TriggerKind's own vocabulary so the queue card can reuse the same
+	// "missed it" / "wrong match" badges the suggestion list already renders.
+	TriggerKind string `dynamodbav:"triggerKind"`
+}
+
+// ImproveQueueEntry is one rule flagged for improvement and waiting for a human to press
+// Start on the Prompt Updates page — the queue that replaced firing an improve+replay round
+// synchronously from inside the recategorize request. Checking "Improve prompt with AI"
+// while reviewing an email now just enqueues the rule (see server.enqueueImproveFlags);
+// nothing calls the improve worker until Start (handleImproveQueueStart/StartAll, server.go)
+// reads this entry and dispatches it. Stored under PK = "IMPROVE_QUEUE", SK = padID(promptId)
+// — one row per rule, so flagging the same rule again updates the existing entry instead of
+// creating a second one, and a review session that touches a rule from several emails
+// collapses to one round instead of one per email. No TTL: an unstarted flag is a standing
+// request, not a transient artifact, and shouldn't silently disappear because nobody got to
+// it this week.
+type ImproveQueueEntry struct {
+	PromptID  int64  `dynamodbav:"promptId"`
+	CreatedAt string `dynamodbav:"createdAt"`
+	UpdatedAt string `dynamodbav:"updatedAt"`
+	// FlaggedCount is the true number of times this rule has been flagged, uncapped —
+	// Emails/Notes below are display samples, not the full history.
+	FlaggedCount int64            `dynamodbav:"flaggedCount"`
+	Emails       []QueuedEmailRef `dynamodbav:"emails,omitempty"` // newest-first, capped at queuedEmailDisplayCap
+	Notes        []string         `dynamodbav:"notes,omitempty"`  // newest-first, deduped, capped at queuedNoteDisplayCap
+}
+
 type PromptSuggestion struct {
 	ID                    int64  `dynamodbav:"id"`
 	CreatedAt             string `dynamodbav:"createdAt"`
@@ -293,6 +338,17 @@ type PromptSuggestion struct {
 	ReplayHeldOutPassed int64  `dynamodbav:"replayHeldOutPassed,omitempty"`
 	ReplayFailures      string `dynamodbav:"replayFailures,omitempty"` // JSON []ReplayFailure
 
+	// ReplayPosTotal/ReplayPosPassed/ReplayNegTotal/ReplayNegPassed split ReplayTotal/
+	// ReplayPassed by verdict bucket (llm.ReplayResult.All) — same purpose as
+	// SuggestionRoundSummary's fields of the same name, carried at the top level too since
+	// this is the winning round's own score, mirroring how ReplayTotal/ReplayPassed
+	// themselves duplicate the winning entry in RoundsJSON so the detail page doesn't need
+	// to parse that JSON just to show the headline score.
+	ReplayPosTotal  int64 `dynamodbav:"replayPosTotal,omitempty"`
+	ReplayPosPassed int64 `dynamodbav:"replayPosPassed,omitempty"`
+	ReplayNegTotal  int64 `dynamodbav:"replayNegTotal,omitempty"`
+	ReplayNegPassed int64 `dynamodbav:"replayNegPassed,omitempty"`
+
 	// ProblemExampleKeys is a JSON-encoded []ResolvedExampleKey identifying the
 	// false_negative/false_positive PromptExample rows this suggestion (in its current,
 	// possibly-regenerated form) was built from. Recorded on every generate/regenerate
@@ -313,6 +369,17 @@ type PromptSuggestion struct {
 	RoundsJSON string `dynamodbav:"roundsJson,omitempty"`
 	RoundsRun  int64  `dynamodbav:"roundsRun,omitempty"`
 	BestRound  int64  `dynamodbav:"bestRound,omitempty"`
+
+	// NoGain is set on the winning round when replay ran with adequate coverage and the
+	// candidate did not beat ReplayBaseline — the original rule, over the same scored
+	// examples. selectBestRound (improve.go) only ever ranks rounds against each other, so
+	// without this a rewrite that is measurably worse than the rule already live still
+	// finalizes as an ordinary pending suggestion with nothing distinguishing it from one
+	// that actually improved things. Purely informational: status stays "pending" and Apply
+	// still works, this only changes how the suggestion is presented (see
+	// prompt_suggestions_list.html/prompt_suggestion_detail.html) and excludes it from the
+	// nav badge count (server.go's suggestionsBadgeCount).
+	NoGain bool `dynamodbav:"noGain,omitempty"`
 }
 
 // SuggestionRoundSummary is one entry in PromptSuggestion.RoundsJSON: what one
@@ -334,6 +401,24 @@ type SuggestionRoundSummary struct {
 	Errored       int64 `json:"errored,omitempty"`
 	HeldOutTotal  int64 `json:"heldOutTotal,omitempty"`
 	HeldOutPassed int64 `json:"heldOutPassed,omitempty"`
+
+	// PosTotal/PosPassed/NegTotal/NegPassed (and their HeldOut* counterparts) split
+	// Total/Passed (HeldOutTotal/HeldOutPassed) by which of the two verdict buckets each
+	// scored example belongs to (llm.ReplayExample.Want) — mirroring llm.ReplayResult's
+	// ClassCounts fields of the same purpose (see that type's doc comment, llm/bedrock.go)
+	// so roundBetter (improve.go) can rank rounds on balanced accuracy (mean of positive
+	// recall and negative specificity) instead of raw pass rate, which a lopsided corpus
+	// (see db.VerdictConfirmedNegative's doc comment) lets a rule that simply matches
+	// everything win.
+	PosTotal  int64 `json:"posTotal,omitempty"`
+	PosPassed int64 `json:"posPassed,omitempty"`
+	NegTotal  int64 `json:"negTotal,omitempty"`
+	NegPassed int64 `json:"negPassed,omitempty"`
+
+	HeldOutPosTotal  int64 `json:"heldOutPosTotal,omitempty"`
+	HeldOutPosPassed int64 `json:"heldOutPosPassed,omitempty"`
+	HeldOutNegTotal  int64 `json:"heldOutNegTotal,omitempty"`
+	HeldOutNegPassed int64 `json:"heldOutNegPassed,omitempty"`
 }
 
 type Setting struct {

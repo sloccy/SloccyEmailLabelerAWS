@@ -9,6 +9,7 @@ import (
 	"maps"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -153,6 +154,7 @@ func sv(v string) types.AttributeValue { return &types.AttributeValueMemberS{Val
 func nv(v int64) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}
 }
+func bv(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 
 // i32 clamps an int64 into the int32 range (DynamoDB Limit fields are int32).
 func i32(v int64) int32 {
@@ -2407,11 +2409,13 @@ func (s *Store) InsertPromptExamples(ctx context.Context, examples []PromptExamp
 	// localIDs, not nextIDs: same reasoning as BatchInsertProcessingResults — the SK already
 	// carries CreatedAt for ordering, so the id only needs to be unique, not a counter round
 	// trip. This also matters for correctness, not just cost: gatherRawExamples' (improve.go)
-	// "newest verdict wins" dedup depends on every PromptExample write
-	// path — this one (manual recategorize) and BatchInsertProcessingResults' (passive
-	// confirmation on classify) — sharing the same monotonically-ordered id source, so a
-	// later correction's id reliably outranks an earlier passive confirmation's regardless
-	// of which of the two code paths wrote which.
+	// "newest verdict wins" dedup depends on a monotonically-ordered id, so a later
+	// correction on the same message reliably outranks an earlier one regardless of which
+	// verdict either landed under. There is exactly one write path now — an explicit human
+	// review (recategorize.go's handleRecategorize/handleConfirmCategorization and
+	// recategorize_bulk.go's bulk counterparts) — since e6478bf removed the passive
+	// confirmed_positive write BatchInsertProcessingResults used to make on every routine
+	// classify match; see PromptExample's doc comment (db/models.go).
 	ids := localIDs(len(examples))
 	ts := Now()
 	items := make([]map[string]types.AttributeValue, len(examples))
@@ -2509,6 +2513,104 @@ func (s *Store) DeletePromptExamples(ctx context.Context, examples []PromptExamp
 		}
 	}
 	return s.batchDelete(ctx, keys)
+}
+
+// ============================================================
+// Improve queue
+// ============================================================
+//
+// One item per rule (PK = "IMPROVE_QUEUE", SK = padID(promptId) — see ImproveQueueEntry's
+// doc comment), read-modify-written on every flag so repeated flags on the same rule
+// collapse into one entry instead of one row per flag.
+
+func itemToImproveQueueEntry(it map[string]types.AttributeValue) ImproveQueueEntry {
+	return unmarshalItem[ImproveQueueEntry](it)
+}
+
+// mergeQueueEntry folds one newly flagged email into existing (the zero value for a rule
+// with nothing queued yet), bumping FlaggedCount and prepending to the capped display
+// slices — factored out as a pure function (no *Store) so the merge policy (cap, newest-
+// first, note dedup) is unit-testable without DynamoDB. now is passed in rather than read
+// via db.Now() so a test can supply a fixed value.
+func mergeQueueEntry(existing ImproveQueueEntry, promptID int64, ref QueuedEmailRef, note, now string) ImproveQueueEntry {
+	out := existing
+	out.PromptID = promptID
+	if out.CreatedAt == "" {
+		out.CreatedAt = now
+	}
+	out.UpdatedAt = now
+	out.FlaggedCount++
+
+	out.Emails = append([]QueuedEmailRef{ref}, out.Emails...)
+	if len(out.Emails) > queuedEmailDisplayCap {
+		out.Emails = out.Emails[:queuedEmailDisplayCap]
+	}
+
+	if note != "" && !slices.Contains(out.Notes, note) {
+		out.Notes = append([]string{note}, out.Notes...)
+		if len(out.Notes) > queuedNoteDisplayCap {
+			out.Notes = out.Notes[:queuedNoteDisplayCap]
+		}
+	}
+	return out
+}
+
+// EnqueueImprove folds one flagged email into promptID's queue entry, creating it if this
+// is the first flag for that rule. Read-modify-write, not a conditional update: a race
+// between two flags landing at once costs at most one lost display row (Emails/Notes are
+// samples, not the source of truth — see ImproveQueueEntry's doc comment), never a lost
+// flag, since FlaggedCount only ever needs "roughly how many," not an exact atomic counter.
+func (s *Store) EnqueueImprove(ctx context.Context, promptID int64, ref QueuedEmailRef, note string) error {
+	existing, err := s.GetImproveQueueEntry(ctx, promptID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	merged := mergeQueueEntry(existing, promptID, ref, note, Now())
+	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(s.table),
+		Item:      keyedItem(merged, "IMPROVE_QUEUE", padID(promptID), 0),
+	})
+	return err
+}
+
+// GetImproveQueueEntry returns promptID's queue entry, or ErrNotFound if nothing is queued
+// for it.
+func (s *Store) GetImproveQueueEntry(ctx context.Context, promptID int64) (ImproveQueueEntry, error) {
+	item, err := s.getKeyedItem(ctx, "IMPROVE_QUEUE", padID(promptID))
+	if err != nil {
+		return ImproveQueueEntry{}, err
+	}
+	if item == nil {
+		return ImproveQueueEntry{}, ErrNotFound
+	}
+	return itemToImproveQueueEntry(item), nil
+}
+
+// ListImproveQueue returns every rule currently flagged and waiting for Start, newest-first.
+func (s *Store) ListImproveQueue(ctx context.Context) ([]ImproveQueueEntry, error) {
+	items, err := s.queryPartition(ctx, "IMPROVE_QUEUE", withDescending())
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ImproveQueueEntry, len(items))
+	for i, it := range items {
+		result[i] = itemToImproveQueueEntry(it)
+	}
+	return result, nil
+}
+
+// DeleteImproveQueueEntry removes promptID's queue entry — called once Start has handed the
+// entry off to the improve worker (see handleImproveQueueStart, server.go), or when the user
+// clears it without starting a round.
+func (s *Store) DeleteImproveQueueEntry(ctx context.Context, promptID int64) error {
+	_, err := s.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(s.table),
+		Key: map[string]types.AttributeValue{
+			"PK": sv("IMPROVE_QUEUE"),
+			"SK": sv(padID(promptID)),
+		},
+	})
+	return err
 }
 
 // ============================================================
@@ -2621,7 +2723,8 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 		"SET suggestedInstructions = :si, conversationJson = :cj, #s = :st, userComment = :uc, updatedAt = :ua, "+
 			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayErrored = :re, "+
 			"replayHeldOutTotal = :rhot, replayHeldOutPassed = :rhop, replayFailures = :rf, "+
-			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br",
+			"replayPosTotal = :rpt, replayPosPassed = :rpp, replayNegTotal = :rnt, replayNegPassed = :rnp, "+
+			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br, noGain = :ng",
 		map[string]string{"#s": attrStatus},
 		map[string]types.AttributeValue{
 			":si":         sv(arg.SuggestedInstructions),
@@ -2637,10 +2740,15 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			":rhot":       nv(arg.ReplayHeldOutTotal),
 			":rhop":       nv(arg.ReplayHeldOutPassed),
 			":rf":         sv(arg.ReplayFailures),
+			":rpt":        nv(arg.ReplayPosTotal),
+			":rpp":        nv(arg.ReplayPosPassed),
+			":rnt":        nv(arg.ReplayNegTotal),
+			":rnp":        nv(arg.ReplayNegPassed),
 			":pk":         sv(arg.ProblemExampleKeys),
 			":rj":         sv(arg.RoundsJSON),
 			":rr":         nv(arg.RoundsRun),
 			":br":         nv(arg.BestRound),
+			":ng":         bv(arg.NoGain),
 		})
 }
 
@@ -3109,6 +3217,13 @@ type FinalizePromptSuggestionParams struct {
 	ReplayHeldOutPassed int64
 	ReplayFailures      string
 
+	// ReplayPosTotal/ReplayPosPassed/ReplayNegTotal/ReplayNegPassed — see
+	// PromptSuggestion's doc comment in db/models.go.
+	ReplayPosTotal  int64
+	ReplayPosPassed int64
+	ReplayNegTotal  int64
+	ReplayNegPassed int64
+
 	// ProblemExampleKeys is a JSON-encoded []ResolvedExampleKey — see PromptSuggestion's
 	// doc comment in db/models.go. Empty ("") on a failed improve call, since nothing was
 	// built from anything in that case.
@@ -3119,6 +3234,9 @@ type FinalizePromptSuggestionParams struct {
 	RoundsJSON string
 	RoundsRun  int64
 	BestRound  int64
+
+	// NoGain — see PromptSuggestion.NoGain's doc comment in db/models.go.
+	NoGain bool
 }
 
 type SetGlobalRetentionParams struct {

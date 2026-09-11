@@ -1561,6 +1561,10 @@ type ReplayFailure struct {
 // HeldOutTotal/HeldOutPassed are the subset of Total/Passed whose ReplayExample.HeldOut
 // was true — examples the improve call's prompt never saw. See selectBestRound (improve.go)
 // for why this is the score a candidate is actually ranked on when there's enough of it.
+//
+// All/HeldOut split Total/Passed and HeldOutTotal/HeldOutPassed further, by which verdict
+// bucket (ReplayExample.Want) each scored example belongs to — see ClassCounts' doc
+// comment for why raw Total/Passed alone lets a rule that matches everything score well.
 type ReplayResult struct {
 	Model         string
 	Total         int
@@ -1570,6 +1574,44 @@ type ReplayResult struct {
 	HeldOutTotal  int
 	HeldOutPassed int
 	Failures      []ReplayFailure
+
+	All     ClassCounts
+	HeldOut ClassCounts
+
+	// PassedIndices is the ExampleIndex (into the []ReplayExample passed to
+	// ReplayAgainstExamples, same indexing ReplayFailure.ExampleIndex uses) of every example
+	// the candidate scored correctly — the complement to Failures among the successfully
+	// classified ones. Exists so a caller can tell "this example was actually confirmed
+	// fixed" apart from "this example was never scored at all" (a Bedrock error, not
+	// evidence either way): a plain Total/Passed count can't make that distinction, but
+	// problemExampleKeys (improve.go) needs it to avoid resolving a Missed example the
+	// winning round never validated.
+	PassedIndices []int
+}
+
+// ClassCounts is one scored population (all of it, or just the held-out subset) split by
+// which of the two verdict buckets each example belongs to. Plain accuracy (Passed/Total)
+// treats every example the same regardless of which bucket it's in, but a rule's corpus is
+// structurally lopsided: confirmed_positive examples come from every review and every
+// Confirm, while confirmed_negative is only ever written when a user actively unchecks a
+// rule (see db.VerdictConfirmedNegative's doc comment, which this package can't reference
+// directly — see the Settings interface's doc comment above for why this package stays
+// decoupled from db). A corpus that's mostly positives plus a handful of hard negatives lets
+// "match everything" score well on raw accuracy; Balanced weights the two buckets equally so
+// widening a rule can't win purely by inflating the larger bucket.
+type ClassCounts struct {
+	PosTotal, PosPassed int
+	NegTotal, NegPassed int
+}
+
+// Balanced returns the mean of positive recall (PosPassed/PosTotal) and negative
+// specificity (NegPassed/NegTotal), or -1 when either bucket is empty — there's no balanced
+// score to have without evidence from both sides of the rule.
+func (c ClassCounts) Balanced() float64 {
+	if c.PosTotal == 0 || c.NegTotal == 0 {
+		return -1
+	}
+	return (float64(c.PosPassed)/float64(c.PosTotal) + float64(c.NegPassed)/float64(c.NegTotal)) / 2
 }
 
 // ReplayAgainstExamples re-runs candidateInstructions through the *classification* model —
@@ -1666,11 +1708,25 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 		}
 	}
 	if len(retried) > 0 {
-		retryConc := concurrency / 4
-		if retryConc < 1 {
-			retryConc = 1
+		runFanOut(retried, max(concurrency/4, 1))
+	}
+
+	// addClassCount tallies one scored outcome into counts by which bucket it belongs to
+	// (Want == true is confirmed_positive, false is confirmed_negative — see
+	// ReplayExample.Want's doc comment) — shared by the All and HeldOut accumulations below
+	// so the two bucket definitions can't drift apart.
+	addClassCount := func(counts *ClassCounts, want, passed bool) {
+		if want {
+			counts.PosTotal++
+			if passed {
+				counts.PosPassed++
+			}
+		} else {
+			counts.NegTotal++
+			if passed {
+				counts.NegPassed++
+			}
 		}
-		runFanOut(retried, retryConc)
 	}
 
 	for i, o := range outcomes {
@@ -1685,8 +1741,14 @@ func (c *Client) ReplayAgainstExamples(ctx context.Context, store StoreLogger, c
 		if o.ex.WasCorrect {
 			result.Baseline++
 		}
-		if o.got == o.ex.Want {
+		passed := o.got == o.ex.Want
+		addClassCount(&result.All, o.ex.Want, passed)
+		if o.ex.HeldOut {
+			addClassCount(&result.HeldOut, o.ex.Want, passed)
+		}
+		if passed {
 			result.Passed++
+			result.PassedIndices = append(result.PassedIndices, i)
 			if o.ex.HeldOut {
 				result.HeldOutPassed++
 			}

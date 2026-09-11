@@ -9,6 +9,7 @@
           <span class="badge text-bg-danger">wrong match (false positive)</span>
         {{end}}
         {{template "suggestion_status_badge" .Status}}
+        {{if .NoGain}}<span class="badge border border-secondary text-secondary">no better than current</span>{{end}}
       </div>
     </div>
     <button type="button" class="btn btn-outline-secondary btn-sm"
@@ -42,6 +43,13 @@
     <span class="fw-semibold">Validation:</span>
     {{.ReplayPassed}}/{{.ReplayTotal}} correct
     <span class="text-muted">({{.ReplayBaseline}}/{{.ReplayTotal}} at time of correction)</span>
+    {{if and (gt .ReplayPosTotal 0) (gt .ReplayNegTotal 0)}}
+    {{/* Split by bucket — see PromptSuggestion's doc comment (db/models.go) for why raw
+         accuracy alone can hide a rule that just matches everything. Only shown when both
+         buckets have evidence; a corpus with only one is exactly the lopsided case this
+         can't say anything useful about yet. */}}
+    <span class="text-muted">&middot; {{.ReplayPosPassed}}/{{.ReplayPosTotal}} should-match, {{.ReplayNegPassed}}/{{.ReplayNegTotal}} should-not-match</span>
+    {{end}}
     {{if gt .ReplayHeldOutTotal 0}}
     <span class="text-muted">&middot; {{.ReplayHeldOutPassed}}/{{.ReplayHeldOutTotal}} on emails it wasn't shown</span>
     {{end}}
@@ -127,7 +135,10 @@
     <div class="d-flex gap-2 flex-wrap">
       <button type="submit" class="btn btn-outline-primary btn-sm" hx-disabled-elt="this">{{if eq .Status "pending"}}Regenerate with AI{{else}}Retry with AI{{end}}</button>
       {{if eq .Status "pending"}}
-      <button type="button" class="btn btn-success btn-sm"
+      {{/* NoGain gets the outline (secondary) styling instead of the filled success button
+           — still one click away, just not presented as the obvious next step for a
+           suggestion that didn't beat the rule it would replace. */}}
+      <button type="button" class="btn btn-sm {{if .NoGain}}btn-outline-secondary{{else}}btn-success{{end}}"
         hx-post="/fragments/prompt-suggestions/{{.ID}}/apply"
         hx-target="#suggestion-row-{{.ID}}"
         hx-swap="delete"

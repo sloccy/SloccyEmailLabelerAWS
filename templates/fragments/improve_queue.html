@@ -1,0 +1,67 @@
+{{/* Rules flagged for improvement (recategorize.go's enqueueImproveFlags) but not yet
+     started — checking "Improve prompt with AI" while reviewing an email queues the rule
+     here instead of firing an improve+replay round immediately, so a review session that
+     flags the same rule from several emails collapses into one card, one round, instead of
+     one round per flag. Nothing calls the improve worker until Start is pressed
+     (handleImproveQueueStart/StartAll, server.go). Rendered above #suggestions-list-container
+     on the Prompt Updates page; refreshed by the same refreshSuggestions event the
+     suggestion list already listens for (static/app.js), since both containers change
+     together whenever a recategorize action flags a rule or a Start moves one out of here. */}}
+{{if .Items}}
+<div class="mb-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h6 class="fw-bold mb-0">Queued for improvement</h6>
+    {{if gt (len .Items) 1}}
+    <button type="button" class="btn btn-primary btn-sm"
+      hx-post="/fragments/improve-queue/start-all"
+      hx-swap="none"
+      hx-disabled-elt="this">
+      Start all &#9656;
+    </button>
+    {{end}}
+  </div>
+  <div class="d-flex flex-column gap-3" id="improve-queue-list">
+    {{range .Items}}
+    <div class="card p-3" id="improve-queue-row-{{.PromptID}}">
+      <div class="d-flex align-items-start justify-content-between gap-2 flex-wrap">
+        <div class="flex-grow-1" style="min-width:0">
+          <div class="d-flex align-items-center gap-2 flex-wrap mb-1">
+            <span class="fw-semibold">{{.PromptName}}</span>
+            <span class="badge text-bg-secondary">{{.FlaggedCount}} email{{if ne .FlaggedCount 1}}s{{end}}</span>
+          </div>
+          <ul class="list-unstyled small text-muted mb-0 d-flex flex-column gap-1">
+            {{range .Emails}}
+            <li class="text-truncate" style="max-width:100%">
+              {{if eq .TriggerKind "false_negative"}}
+                <span class="badge text-bg-warning">missed it</span>
+              {{else}}
+                <span class="badge text-bg-danger">wrong match</span>
+              {{end}}
+              {{if .Subject}}{{.Subject}}{{else}}(no subject){{end}} &mdash; {{.Sender}}
+            </li>
+            {{end}}
+            {{if gt .MoreEmails 0}}
+            <li>&hellip;{{.MoreEmails}} more</li>
+            {{end}}
+          </ul>
+        </div>
+        <div class="d-flex gap-2 flex-shrink-0">
+          <button type="button" class="btn btn-outline-secondary btn-sm"
+            hx-delete="/fragments/improve-queue/{{.PromptID}}"
+            hx-swap="none"
+            hx-confirm="Clear this rule from the improvement queue?">
+            Clear
+          </button>
+          <button type="button" class="btn btn-primary btn-sm"
+            hx-post="/fragments/improve-queue/{{.PromptID}}/start"
+            hx-swap="none"
+            hx-disabled-elt="this">
+            Start &#9656;
+          </button>
+        </div>
+      </div>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}

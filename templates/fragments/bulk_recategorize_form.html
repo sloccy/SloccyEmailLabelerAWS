@@ -3,7 +3,7 @@
   <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
 </div>
 <div class="modal-body">
-  <p class="small text-muted mb-3">Choose an action for each rule below — it's applied to all {{.Count}} selected emails at once, and Gmail labels update immediately. Check <em>Improve prompt</em> on any rule you act on to have AI rewrite its instructions from the examples this creates (one suggestion per rule, not per email).</p>
+  <p class="small text-muted mb-3">Choose an action for each rule below — it's applied to all {{.Count}} selected emails at once, and Gmail labels update immediately. Check <em>Improve prompt</em> on any rule you act on to queue it for improvement (one queue entry per rule, not per email) — nothing runs yet; review the queue and press Start on the Prompt Updates page when you're ready.</p>
   <form id="bulk-recategorize-form"
     hx-post="/fragments/history/bulk-recategorize"
     hx-swap="none"
