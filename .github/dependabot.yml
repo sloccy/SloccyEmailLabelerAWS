@@ -1,7 +1,7 @@
 version: 2
 # Policy: dependencies move ONLY for known security issues, at the minimum fixed
 # version — never routine version bumps. Enforcement:
-#  - Go code paths: vuln-autofix.yml (govulncheck, weekly) opens PRs only for
+#  - Go code paths: vuln-autofix.yml (govulncheck, daily) opens PRs only for
 #    vulnerabilities in CALLED symbols (exercised code paths) and bumps each module
 #    to govulncheck's fixed_version, which is the minimum fix.
 #  - Everything else (and Go advisories Dependabot notices first): Dependabot
