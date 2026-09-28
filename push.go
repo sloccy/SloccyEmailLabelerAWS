@@ -175,10 +175,16 @@ func (h *pushHandler) process(ctx context.Context, email string, historyID uint6
 
 // verify validates the Pub/Sub OIDC bearer token: Google-signed, non-expired, matching
 // our configured audience, and issued by the expected push service account. This is the
-// only thing guarding the public endpoint, so it fails closed on any misconfiguration.
+// only thing guarding the public endpoint, so it fails closed on any misconfiguration —
+// including PushServiceAccount, which used to be optional here despite PushAudience
+// (checked below) failing closed one line above it. The audience alone isn't a secret:
+// it's a fixed, guessable string (see template.yaml's PushOidcAudience), and Verify
+// will happily mint a valid token for it from *any* Google service account. Without the
+// service-account narrowing, a blank PushServiceAccount silently reopened the endpoint
+// to anyone with a Google account instead of refusing to start like its sibling check.
 func (h *pushHandler) verify(ctx context.Context, r *http.Request) error {
-	if h.cfg.PushAudience == "" || h.verifier == nil {
-		return errors.New("push audience not configured")
+	if h.cfg.PushAudience == "" || h.verifier == nil || h.cfg.PushServiceAccount == "" {
+		return errors.New("push auth not configured")
 	}
 	authz := r.Header.Get("Authorization")
 	token, ok := strings.CutPrefix(authz, "Bearer ")
@@ -191,16 +197,14 @@ func (h *pushHandler) verify(ctx context.Context, r *http.Request) error {
 	if err != nil {
 		return fmt.Errorf("invalid token: %w", err)
 	}
-	if h.cfg.PushServiceAccount != "" {
-		var claims struct {
-			Email string `json:"email"`
-		}
-		if err := idTok.Claims(&claims); err != nil {
-			return fmt.Errorf("invalid token claims: %w", err)
-		}
-		if claims.Email != h.cfg.PushServiceAccount {
-			return fmt.Errorf("unexpected token issuer %q", claims.Email)
-		}
+	var claims struct {
+		Email string `json:"email"`
+	}
+	if err := idTok.Claims(&claims); err != nil {
+		return fmt.Errorf("invalid token claims: %w", err)
+	}
+	if claims.Email != h.cfg.PushServiceAccount {
+		return fmt.Errorf("unexpected token issuer %q", claims.Email)
 	}
 	return nil
 }

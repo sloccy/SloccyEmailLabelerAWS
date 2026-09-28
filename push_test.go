@@ -127,9 +127,10 @@ func TestPushVerify(t *testing.T) {
 			cfg:   Config{PushAudience: testAudience, PushServiceAccount: testSA},
 		},
 		{
-			name:  "valid token with no service account pinned skips the email check",
-			authz: "Bearer " + mint(wrongEmail),
-			cfg:   Config{PushAudience: testAudience},
+			name:    "service account unconfigured fails closed",
+			authz:   "Bearer " + mint(validClaims()),
+			cfg:     Config{PushAudience: testAudience},
+			wantErr: "not configured",
 		},
 		{
 			name:    "token minted for another audience",
