@@ -1246,6 +1246,25 @@ func (r *improveRunner) improveAndFinalizeSuggestion(ctx context.Context, tw *tr
 			tw.Event(ctx, db.TraceKindNote, int64(bestN), fmt.Sprintf("no better than the current rule (%d/%d vs. %d/%d already) — review before applying", finalize.ReplayPassed, finalize.ReplayTotal, finalize.ReplayBaseline, finalize.ReplayTotal))
 		}
 	}
+	// UnsafeRewrite: improveSystemPrompt already instructs the model never to name a
+	// sender, domain, brand, subject line, or body phrase from the examples — but that's an
+	// instruction, not a guarantee against a poisoned example (an attacker's own
+	// sender/excerpt) getting echoed verbatim into a rule that then governs all future
+	// classification. Checked on the winning candidate specifically: CitesExamples already
+	// runs per-round to steer the *next* rewrite (see the round loop above), but nothing
+	// previously checked the round that actually gets stored and offered for Apply.
+	var unsafeReasons []string
+	if hits := llm.CitesExamples(bestSuggested, replayLLMExamples); len(hits) > 0 {
+		unsafeReasons = append(unsafeReasons, fmt.Sprintf("names %s from the examples' senders", strings.Join(hits, ", ")))
+	}
+	if llm.ContainsEmailOrURL(bestSuggested) {
+		unsafeReasons = append(unsafeReasons, "contains a raw email address or URL")
+	}
+	if len(unsafeReasons) > 0 {
+		finalize.UnsafeRewrite = true
+		finalize.UnsafeRewriteReason = strings.Join(unsafeReasons, "; ")
+		tw.Event(ctx, db.TraceKindNote, int64(bestN), "review before applying — "+finalize.UnsafeRewriteReason)
+	}
 	// The done event is emitted only after FinalizePromptSuggestion actually lands — the
 	// trace poll's completion signal (see the trace endpoint, server.go) tells the browser
 	// it's safe to re-fetch the suggestion card, and that's only true once the terminal

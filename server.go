@@ -1947,6 +1947,12 @@ type suggestionView struct {
 	// from the nav count (see suggestionsBadgeCount), the detail page demotes its Apply
 	// button.
 	NoGain bool
+	// UnsafeRewrite/UnsafeRewriteReason — see PromptSuggestion's doc comments (db/models.go).
+	// Same base-field-level treatment as NoGain: badged and demoted in both the list card
+	// and the detail page, but (unlike NoGain) still counted in the nav badge — this is a
+	// pending suggestion that needs review, just a more cautious one, not one to hide.
+	UnsafeRewrite       bool
+	UnsafeRewriteReason string
 
 	// Detail-view only (populated by suggestionDetailView, left zero-value by the compact
 	// list view in handlePromptSuggestionsList — that view never renders them, and fetching
@@ -2020,6 +2026,8 @@ func toSuggestionView(sg db.PromptSuggestion, promptName string) suggestionView 
 		UserComment:           sg.UserComment,
 		Status:                sg.Status,
 		NoGain:                sg.NoGain,
+		UnsafeRewrite:         sg.UnsafeRewrite,
+		UnsafeRewriteReason:   sg.UnsafeRewriteReason,
 	}
 }
 

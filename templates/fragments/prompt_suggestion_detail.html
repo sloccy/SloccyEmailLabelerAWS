@@ -10,6 +10,7 @@
         {{end}}
         {{template "suggestion_status_badge" .Status}}
         {{if .NoGain}}<span class="badge border border-secondary text-secondary">no better than current</span>{{end}}
+        {{if .UnsafeRewrite}}<span class="badge border border-warning text-warning" title="{{.UnsafeRewriteReason}}">review before applying</span>{{end}}
       </div>
     </div>
     <button type="button" class="btn btn-outline-secondary btn-sm"
@@ -135,10 +136,11 @@
     <div class="d-flex gap-2 flex-wrap">
       <button type="submit" class="btn btn-outline-primary btn-sm" hx-disabled-elt="this">{{if eq .Status "pending"}}Regenerate with AI{{else}}Retry with AI{{end}}</button>
       {{if eq .Status "pending"}}
-      {{/* NoGain gets the outline (secondary) styling instead of the filled success button
-           — still one click away, just not presented as the obvious next step for a
-           suggestion that didn't beat the rule it would replace. */}}
-      <button type="button" class="btn btn-sm {{if .NoGain}}btn-outline-secondary{{else}}btn-success{{end}}"
+      {{/* NoGain/UnsafeRewrite get the outline (secondary) styling instead of the filled
+           success button — still one click away, just not presented as the obvious next
+           step for a suggestion that didn't beat the rule it would replace, or that may
+           have leaked example content into the rewrite (see UnsafeRewriteReason above). */}}
+      <button type="button" class="btn btn-sm {{if or .NoGain .UnsafeRewrite}}btn-outline-secondary{{else}}btn-success{{end}}"
         hx-post="/fragments/prompt-suggestions/{{.ID}}/apply"
         hx-target="#suggestion-row-{{.ID}}"
         hx-swap="delete"

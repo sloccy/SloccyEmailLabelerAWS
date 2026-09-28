@@ -202,6 +202,9 @@ func TestPromptSuggestionsListTemplate_Renders(t *testing.T) {
 		{"no-gain badge", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
 			{ID: 5, PromptName: "Receipts", TriggerKind: "false_positive", Status: "pending", NoGain: true},
 		}}},
+		{"unsafe-rewrite badge", suggestionsListView{PollEvery: "60s", Items: []suggestionView{
+			{ID: 6, PromptName: "Receipts", TriggerKind: "false_positive", Status: "pending", UnsafeRewrite: true, UnsafeRewriteReason: "contains a raw email address or URL"},
+		}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -285,6 +288,14 @@ func TestPromptSuggestionDetailTemplate_Renders(t *testing.T) {
 			v.SuggestedInstructions = "Match promotional newsletters."
 			v.ReplayTotal, v.ReplayPassed, v.ReplayBaseline = 10, 6, 8
 			v.NoGain = true
+			return v
+		}()},
+		{"pending, unsafe rewrite demotes Apply", func() suggestionView {
+			v := base
+			v.Status = "pending"
+			v.SuggestedInstructions = "Match mail from attacker@evil.example."
+			v.UnsafeRewrite = true
+			v.UnsafeRewriteReason = "contains a raw email address or URL"
 			return v
 		}()},
 		{"pending with balanced per-bucket replay split", func() suggestionView {

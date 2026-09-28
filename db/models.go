@@ -380,6 +380,19 @@ type PromptSuggestion struct {
 	// prompt_suggestions_list.html/prompt_suggestion_detail.html) and excludes it from the
 	// nav badge count (server.go's suggestionsBadgeCount).
 	NoGain bool `dynamodbav:"noGain,omitempty"`
+
+	// UnsafeRewrite flags a winning candidate that violates improveSystemPrompt's own
+	// constraint against naming a sender, domain, brand, subject line, or body phrase from
+	// the examples (see llm.CitesExamples and llm.ContainsEmailOrURL) — evidence the
+	// rewrite leaked a poisoned example's content into the rule text rather than
+	// generalizing it. UnsafeRewriteReason is the short human-readable reason(s), joined
+	// with "; " if more than one check fired. Same purely-informational treatment as
+	// NoGain: Apply still works, this only demotes its button and shows the reason, since
+	// a false positive here (a legitimately generic word coinciding with some sender's
+	// domain) must never silently block an otherwise-correct rewrite — a human reading the
+	// rewrite text is the actual gate, this is just what puts it in front of them.
+	UnsafeRewrite       bool   `dynamodbav:"unsafeRewrite,omitempty"`
+	UnsafeRewriteReason string `dynamodbav:"unsafeRewriteReason,omitempty"`
 }
 
 // SuggestionRoundSummary is one entry in PromptSuggestion.RoundsJSON: what one

@@ -2724,7 +2724,8 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			"replayModel = :rm, replayTotal = :rt, replayPassed = :rp, replayBaseline = :rb, replayErrored = :re, "+
 			"replayHeldOutTotal = :rhot, replayHeldOutPassed = :rhop, replayFailures = :rf, "+
 			"replayPosTotal = :rpt, replayPosPassed = :rpp, replayNegTotal = :rnt, replayNegPassed = :rnp, "+
-			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br, noGain = :ng",
+			"problemExampleKeys = :pk, roundsJson = :rj, roundsRun = :rr, bestRound = :br, noGain = :ng, "+
+			"unsafeRewrite = :ur, unsafeRewriteReason = :urr",
 		map[string]string{"#s": attrStatus},
 		map[string]types.AttributeValue{
 			":si":         sv(arg.SuggestedInstructions),
@@ -2749,6 +2750,8 @@ func (s *Store) FinalizePromptSuggestion(ctx context.Context, arg FinalizePrompt
 			":rr":         nv(arg.RoundsRun),
 			":br":         nv(arg.BestRound),
 			":ng":         bv(arg.NoGain),
+			":ur":         bv(arg.UnsafeRewrite),
+			":urr":        sv(arg.UnsafeRewriteReason),
 		})
 }
 
@@ -3237,6 +3240,10 @@ type FinalizePromptSuggestionParams struct {
 
 	// NoGain — see PromptSuggestion.NoGain's doc comment in db/models.go.
 	NoGain bool
+
+	// UnsafeRewrite/UnsafeRewriteReason — see PromptSuggestion's doc comments in db/models.go.
+	UnsafeRewrite       bool
+	UnsafeRewriteReason string
 }
 
 type SetGlobalRetentionParams struct {

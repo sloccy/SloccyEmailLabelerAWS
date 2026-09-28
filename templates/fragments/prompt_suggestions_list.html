@@ -29,6 +29,7 @@
           {{end}}
           {{template "suggestion_status_badge" .Status}}
           {{if .NoGain}}<span class="badge border border-secondary text-secondary">no better than current</span>{{end}}
+          {{if .UnsafeRewrite}}<span class="badge border border-warning text-warning" title="{{.UnsafeRewriteReason}}">review before applying</span>{{end}}
         </div>
         <div class="small text-muted text-truncate mb-2">{{if .EmailSubject}}{{.EmailSubject}}{{else}}(no subject){{end}} &mdash; {{.EmailSender}}</div>
         {{/* Generating is now included here (it used to be pending|failed only) — a
