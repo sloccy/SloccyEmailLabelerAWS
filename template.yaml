@@ -77,6 +77,15 @@ Parameters:
   # Lambda Web Adapter layer (arm64) — lets the custom-runtime binary serve plain HTTP.
   # Referenced by both WebFunction and PushFunction via !Sub (below) so the region stays
   # dynamic (${AWS::Region}); only the version number is duplicated, and only here.
+  #
+  # SECURITY NOTE — this is a blind spot in the vuln pipeline, not an oversight: it's a
+  # third-party compiled binary sitting in the request path of both public Function
+  # URLs, but govulncheck only scans Go modules and Dependabot has no ecosystem for
+  # Lambda layers, so nothing currently watches this version for advisories. Check
+  # https://github.com/awslabs/aws-lambda-web-adapter/releases (and .../security/advisories)
+  # periodically and bump the Default below when warranted — there's no fixed mapping
+  # between this ARN's version number and the project's tagged releases, so this has to
+  # be a manual judgment call, not an automatable version comparison.
   LambdaWebAdapterLayerVersion:
     Type: Number
     Default: 28
