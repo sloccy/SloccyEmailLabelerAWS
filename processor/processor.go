@@ -21,11 +21,6 @@ const (
 	logDebug   = "DEBUG"
 )
 
-// ptr returns a pointer to v — for building the *int64/*string nullable fields on
-// db.HistoryEntry from a computed value (Go has no address-of operator for a struct
-// field expression like p.ID).
-func ptr[T any](v T) *T { return &v }
-
 // labelNamePtr returns nil for an empty label (matching the "no label" NULL-sentinel
 // semantics of db.HistoryEntry.LabelName), or a pointer to name otherwise.
 func labelNamePtr(name string) *string {
@@ -467,8 +462,8 @@ func processEmail(ctx context.Context, bc *batchCtx, msg gmailpkg.Message) (modi
 			MessageID:    msg.ID,
 			Subject:      msg.Subject,
 			Sender:       msg.Sender,
-			PromptID:     ptr(p.ID),
-			PromptName:   ptr(p.Name),
+			PromptID:     new(p.ID),
+			PromptName:   new(p.Name),
 			LabelName:    labelNamePtr(p.LabelName),
 			Actions:      strings.Join(actions, ", "),
 			LlmResponse:  classified.RawResponse,

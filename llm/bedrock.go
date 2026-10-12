@@ -1493,8 +1493,7 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 		// log instead), but the suggestion still gets generated. Gated on !emitted: once any
 		// delta has reached the sink, a retry would replay a second (different) answer on
 		// top of a partial one the caller has already seen — surface the error instead.
-		var ve *types.ValidationException
-		if errors.As(err, &ve) {
+		if _, ok := errors.AsType[*types.ValidationException](err); ok {
 			slog.Warn("improve call rejected reasoning fields, retrying without them", "model", model, "effort", effort, "err", err)
 			answer, stopReason, _, err = stream(nil)
 		}

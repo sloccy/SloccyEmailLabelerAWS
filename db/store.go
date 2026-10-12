@@ -167,11 +167,6 @@ func i32(v int64) int32 {
 	return int32(v)
 }
 
-// ptr returns a pointer to v — for building *string/*int64 field literals from computed
-// values (Go has no address-of operator for non-addressable expressions like a struct
-// field or map value).
-func ptr[T any](v T) *T { return &v }
-
 // nullInt64Ptr converts the sql.NullInt64 "optional filter/DTO value" idiom (still used
 // for params structs and query filters throughout this file) into the *int64 form used
 // by attributevalue-tagged model fields.
@@ -633,8 +628,7 @@ func (s *Store) getAccountToken(ctx context.Context, id int64) (string, error) {
 		WithDecryption: aws.Bool(true),
 	})
 	if err != nil {
-		var notFound *ssmtypes.ParameterNotFound
-		if errors.As(err, &notFound) {
+		if _, ok := errors.AsType[*ssmtypes.ParameterNotFound](err); ok {
 			return "", nil
 		}
 		return "", fmt.Errorf("get account token %d: %w", id, err)
@@ -663,8 +657,7 @@ func (s *Store) deleteAccountToken(ctx context.Context, id int64) error {
 		Name: aws.String(tokenParamName(id)),
 	})
 	if err != nil {
-		var notFound *ssmtypes.ParameterNotFound
-		if errors.As(err, &notFound) {
+		if _, ok := errors.AsType[*ssmtypes.ParameterNotFound](err); ok {
 			return nil
 		}
 		return fmt.Errorf("delete account token %d: %w", id, err)
@@ -1910,7 +1903,7 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 		for _, prompt := range p.AddedPrompts {
 			var labelName *string
 			if prompt.LabelName != "" {
-				labelName = ptr(prompt.LabelName)
+				labelName = new(prompt.LabelName)
 			}
 			putItems = append(putItems, historyItem(localID(), ts, HistoryEntry{
 				AccountID:    accountID,
@@ -1918,8 +1911,8 @@ func (s *Store) RewriteHistoryForMessages(ctx context.Context, accountID int64, 
 				MessageID:    p.MessageID,
 				Subject:      p.Subject,
 				Sender:       p.Sender,
-				PromptID:     ptr(prompt.ID),
-				PromptName:   ptr(prompt.Name),
+				PromptID:     new(prompt.ID),
+				PromptName:   new(prompt.Name),
 				LabelName:    labelName,
 				Actions:      "manual",
 			}))
@@ -3321,6 +3314,6 @@ func isConditionFailed(err error) bool {
 	}
 	// errors.As unwraps the smithy OperationError that the SDK wraps the
 	// ConditionalCheckFailedException in; a plain type assertion would miss it.
-	var ccf *types.ConditionalCheckFailedException
-	return errors.As(err, &ccf)
+	_, ok := errors.AsType[*types.ConditionalCheckFailedException](err)
+	return ok
 }

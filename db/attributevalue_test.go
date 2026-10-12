@@ -209,7 +209,7 @@ func TestHistoryRoundTrip_Matched(t *testing.T) {
 	arg := HistoryEntry{
 		AccountID: 1, AccountEmail: "user@example.com", MessageID: "msg1",
 		Subject: "Sale", Sender: "shop@example.com",
-		PromptID: ptr(int64(101)), PromptName: ptr("Newsletter"), LabelName: ptr("Newsletters"),
+		PromptID: new(int64(101)), PromptName: new("Newsletter"), LabelName: new("Newsletters"),
 		Actions: "labeled → Newsletters", LlmResponse: `{"1":true}`, DurationMs: 842,
 	}
 	item := historyItem(1, "2026-07-01 12:00:00", arg)

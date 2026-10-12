@@ -435,8 +435,7 @@ func ListHistoryAddedMessageIDs(ctx context.Context, svc *Client, startHistoryID
 		}
 		var res apiHistoryResponse
 		if err := svc.get(ctx, "/history", params, &res); err != nil {
-			var statusErr *httpStatusError
-			if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
+			if statusErr, ok := errors.AsType[*httpStatusError](err); ok && statusErr.status == http.StatusNotFound {
 				return nil, latest, ErrHistoryTooOld
 			}
 			return nil, latest, err
