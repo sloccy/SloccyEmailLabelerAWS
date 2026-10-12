@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
           cache: true
 
       # static/vendor is gitignored and fetched at build time (the Makefile does this via
@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
           cache: true
 
       - name: golangci-lint
