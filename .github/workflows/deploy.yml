@@ -6,11 +6,18 @@ on:
   # Manual escape hatch: a merge pushed by GITHUB_TOKEN (bot-enabled auto-merge) can't
   # trigger this workflow, so allow deploying main by hand from the Actions tab.
   workflow_dispatch:
+    inputs:
+      force_smoke_fail:
+        description: "Drill: fail the first post-deploy smoke test to exercise the rollback"
+        type: boolean
+        default: false
 
 # Required for GitHub OIDC -> AWS role assumption (no long-lived keys).
 permissions:
   id-token: write
   contents: read
+  actions: read   # last-good-deploy lookup for rollback
+  issues: write   # failure report
 
 concurrency:
   group: deploy-ollamail
@@ -53,6 +60,20 @@ jobs:
         with:
           use-installer: true
 
+      # Newest successful deploy run before this one: what to roll back to if the smoke
+      # test below fails. Empty on the very first run (then there is nothing to roll back to).
+      - name: Record last good deploy
+        id: lastgood
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh run list --workflow deploy.yml --branch main --status success -L 1 \
+                  --json headSha --jq '.[0].headSha // ""')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "last good deploy: ${sha:-none}"
+          # Rollback checks out an older tree, which may predate the smoke script.
+          cp scripts/smoke-test.sh "$RUNNER_TEMP/smoke-test.sh"
+
       - name: SAM build
         run: sam build
 
@@ -62,7 +83,44 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset
 
+      # CloudFormation already rolls back a failed stack update by itself; this catches the
+      # case it can't: a deploy that "succeeds" but ships something that doesn't serve
+      # (e.g. a bad Lambda Web Adapter layer bumped by lwa-autofix).
+      - name: Smoke test
+        id: smoke
+        env:
+          SMOKE_FORCE_FAIL: ${{ inputs.force_smoke_fail }}
+        run: "$RUNNER_TEMP/smoke-test.sh"
+
+      # The job still ends red afterwards (the smoke step failed), so a bad commit on main
+      # can't look green. A later push or manual dispatch would redeploy it, which is what
+      # the failure report below is the prompt to fix.
+      - name: Roll back to last good deploy
+        if: failure() && steps.smoke.outcome == 'failure' && steps.lastgood.outputs.sha != ''
+        env:
+          LAST_GOOD: ${{ steps.lastgood.outputs.sha }}
+        run: |
+          git checkout --force "$LAST_GOOD"
+          sam build
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+          "$RUNNER_TEMP/smoke-test.sh"
+
       # Drops the artifacts the deploy just superseded. Runs only on success, so a
       # failed deploy leaves the previous set intact for CloudFormation to roll back to.
       - name: Prune superseded deploy artifacts
         run: ./scripts/prune-sam-bucket.sh
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}  # not a PAT: self-authored activity sends the owner no email
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --label deploy-failure --state open \
+                       --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Failed again: $RUN_URL" || true
+          else
+            gh issue create --title "deploy is failing" --label deploy-failure \
+              --body "A deploy or its post-deploy smoke test failed (a rollback to the last good deploy is attempted when the smoke test fails). Latest run: $RUN_URL" || true
+          fi
