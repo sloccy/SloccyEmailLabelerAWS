@@ -1888,3 +1888,34 @@ func TestImprovePromptInstructions_RetryGetsItsOwnFreshGuard(t *testing.T) {
 		t.Errorf("suggestion = %q, want %q", suggestion, "Match newsletters.")
 	}
 }
+
+// TestImproveModelCalls_OmitTemperature pins that the improve-model calls (improve and
+// generate) send no Temperature: the improve model is swapped often and some models (e.g.
+// Kimi K3) reject the field. Classify, by contrast, must keep its forced Temperature 0.
+func TestImproveModelCalls_OmitTemperature(t *testing.T) {
+	fake := &fakeConverseAPI{streamEvents: [][]types.ConverseStreamOutput{textStreamOutput(), textStreamOutput()}}
+	cl := &Client{br: fake, defaultModel: "moonshotai.kimi-k3", settings: &fixedSettings{}}
+
+	if _, _, err := cl.ImprovePromptInstructions(context.Background(), testImproveRequest(), nil); err != nil {
+		t.Fatalf("ImprovePromptInstructions error: %v", err)
+	}
+	ch := make(chan StreamChunk, 64)
+	if err := cl.streamGenerate(context.Background(), "newsletters", ch); err != nil {
+		t.Fatalf("streamGenerate error: %v", err)
+	}
+	if len(fake.streamCalls) != 2 {
+		t.Fatalf("expected 2 ConverseStream calls, got %d", len(fake.streamCalls))
+	}
+	for i, call := range fake.streamCalls {
+		if call.InferenceConfig.Temperature != nil {
+			t.Errorf("call %d sent Temperature %v, want nil", i, *call.InferenceConfig.Temperature)
+		}
+	}
+}
+
+func TestClassifyPayload_KeepsZeroTemperature(t *testing.T) {
+	_, inf, _, _ := classifyPayload(Email{}, []Prompt{{}}, "moonshotai.kimi-k3", "")
+	if inf.Temperature == nil || *inf.Temperature != 0 {
+		t.Errorf("classify Temperature = %v, want 0", inf.Temperature)
+	}
+}

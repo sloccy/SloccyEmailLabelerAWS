@@ -1106,9 +1106,9 @@ func (c *Client) streamGenerate(ctx context.Context, description string, ch chan
 		ModelId:  aws.String(model),
 		System:   sys,
 		Messages: []types.Message{userMessage(userMsg)},
+		// MaxTokens only, same as ImprovePromptInstructions: no Temperature on improve-model calls.
 		InferenceConfig: &types.InferenceConfiguration{
-			MaxTokens:   aws.Int32(2048),
-			Temperature: aws.Float32(0.7),
+			MaxTokens: aws.Int32(2048),
 		},
 		ServiceTier:                  serviceTierFor(c.resolveImproveTier(ctx)),
 		AdditionalModelRequestFields: fields,
@@ -1451,9 +1451,10 @@ func (c *Client) ImprovePromptInstructions(ctx context.Context, req ImproveReque
 			ModelId:  aws.String(model),
 			System:   sys,
 			Messages: msgs,
+			// MaxTokens only: the improve model is swapped often, and some models (e.g.
+			// Kimi K3) reject Temperature outright. Classify keeps its forced Temperature 0.
 			InferenceConfig: &types.InferenceConfiguration{
-				MaxTokens:   aws.Int32(maxTokens),
-				Temperature: aws.Float32(0.4),
+				MaxTokens: aws.Int32(maxTokens),
 			},
 			ServiceTier:                  serviceTierFor(tier),
 			AdditionalModelRequestFields: f,
