@@ -1,6 +1,6 @@
 module github.com/sloccy/ollamail-aws
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/aws/aws-lambda-go v1.54.0
