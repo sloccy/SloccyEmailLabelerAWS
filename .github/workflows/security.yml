@@ -33,7 +33,8 @@ jobs:
       target_branch: ${{ inputs.target_branch || '' }}
       # Same gate as ci.yml: front-end vendor assets are embedded, so fetch them first.
       test_command: ./scripts/vendor.sh && go build ./... && go test ./...
-      # Lambda Web Adapter layer: govulncheck cannot see it.
-      extra_fix_script: ./scripts/lwa-autofix.sh
+      # Lambda Web Adapter layer (govulncheck cannot see it) and vendor.sha256 regeneration
+      # when the npm step bumps Bootstrap/htmx.
+      extra_fix_script: ./scripts/security-extra.sh
     secrets:
       token: ${{ secrets.WORKFLOW_TOKEN }}

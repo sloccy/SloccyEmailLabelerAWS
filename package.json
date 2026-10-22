@@ -1,6 +1,6 @@
 {
   "private": true,
-  "description": "Pinned front-end vendor deps. Bumped by hand when GitHub raises a Dependabot alert; scripts/vendor.sh materializes them into static/vendor/ at build time (see Makefile). npm itself is never run.",
+  "description": "Pinned front-end vendor deps. Bumped automatically (minimum fixed version) by the nightly security job; scripts/vendor.sh materializes them into static/vendor/ at build time (see Makefile). npm itself is never run.",
   "dependencies": {
     "bootstrap": "5.3.8",
     "htmx.org": "2.0.10"

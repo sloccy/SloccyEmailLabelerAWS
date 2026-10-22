@@ -184,7 +184,7 @@ Outputs include the **WebFunctionUrl** (Function URL), **WebDistributionDomain**
 
 #### Dependency updates (security-only)
 
-Routine version bumps are disabled. Dependencies move only for security reasons. A nightly `security.yml` workflow (shared from `sloccy/shared-ci`) runs `govulncheck`, bumps modules with *called* vulnerable code to the minimum fixed version (and the pinned Lambda Web Adapter layer via `scripts/lwa-autofix.sh`), runs the tests, and pushes straight to `main`, which then deploys. If the tests fail nothing is pushed and a single "Security automation is failing" issue is opened (it closes itself on the next green run). It needs the `WORKFLOW_TOKEN` repo secret, a fine-grained PAT with Contents read/write: a push made by the built-in token would not trigger the deploy workflow. The front-end vendor pins (Bootstrap, htmx) have no lockfile by design, so they are not audited by the job; GitHub's Dependabot *alerts* tell you when to bump them by hand.
+Routine version bumps are disabled. Dependencies move only for security reasons. A nightly `security.yml` workflow (shared from `sloccy/shared-ci`) runs `govulncheck`, bumps modules with *called* vulnerable code to the minimum fixed version (and the pinned Lambda Web Adapter layer via `scripts/lwa-autofix.sh`), runs the tests, and pushes straight to `main`, which then deploys. If the tests fail nothing is pushed and a single "Security automation is failing" issue is opened (it closes itself on the next green run). It needs the `WORKFLOW_TOKEN` repo secret, a fine-grained PAT with Contents read/write: a push made by the built-in token would not trigger the deploy workflow. The front-end vendor pins (Bootstrap, htmx) are covered too: the job audits `package.json` (a throwaway lockfile is generated, nothing extra is committed), bumps an advisory-affected pin to the *lowest* fixed version in the same major, and regenerates `scripts/vendor.sha256` via `scripts/security-extra.sh`.
 
 #### Backups
 
@@ -270,7 +270,7 @@ Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-veri
 git clone https://github.com/sloccy/SloccyEmailLabelerAWS.git
 cd SloccyEmailLabelerAWS
 
-# Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (bumped by hand on a Dependabot alert)
+# Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (bumped automatically by the nightly security job)
 # and fetched into static/vendor/ at build time — run once before serving the UI locally:
 ./scripts/vendor.sh
 

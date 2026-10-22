@@ -2,7 +2,8 @@
 # Materializes pinned front-end deps into static/vendor/ (gitignored), which the Go
 # binary embeds and serves at /static/vendor/ — the UI has no runtime CDN dependency.
 #
-# Versions live in package.json (bumped by hand on a Dependabot alert); this
+# Versions live in package.json (the nightly security job bumps them to the minimum fixed
+# version and regenerates vendor.sha256); this
 # script fetches those exact versions from jsDelivr (same artifacts as the npm
 # registry) so neither node nor npm is ever needed. Pre-gzipped copies are written
 # alongside because server.go serves <asset>.gz when the client accepts gzip.
@@ -23,9 +24,17 @@ HTMX="$(ver 'htmx\.org')"
 
 mkdir -p static/vendor
 
+# VENDOR_UPDATE_CHECKSUMS=1 rewrites scripts/vendor.sha256 from what was just fetched instead
+# of verifying against it. The nightly security job uses this after it bumps a version in
+# package.json; do not set it for a normal build.
+NEWSUMS="$(mktemp)"
+trap 'rm -f "$NEWSUMS"' EXIT
+
 fetch() { # $1=url $2=dest-name
   curl -fsSL "$1" -o "static/vendor/$2"
-  if ! (cd static/vendor && grep " $2\$" ../../scripts/vendor.sha256 | sha256sum -c - >/dev/null); then
+  if [ "${VENDOR_UPDATE_CHECKSUMS:-}" = "1" ]; then
+    (cd static/vendor && sha256sum "$2") >> "$NEWSUMS"
+  elif ! (cd static/vendor && grep " $2\$" ../../scripts/vendor.sha256 | sha256sum -c - >/dev/null); then
     echo "vendor.sh: checksum mismatch for $2 — refusing to embed it in the build." >&2
     echo "  If this is an intentional version bump, regenerate scripts/vendor.sha256:" >&2
     echo "    sha256sum -b static/vendor/$2 | sed 's/\*//' " >&2
@@ -42,3 +51,8 @@ fetch() { # $1=url $2=dest-name
 fetch "https://cdn.jsdelivr.net/npm/bootstrap@${BOOTSTRAP}/dist/css/bootstrap.min.css" bootstrap.min.css
 fetch "https://cdn.jsdelivr.net/npm/bootstrap@${BOOTSTRAP}/dist/js/bootstrap.bundle.min.js" bootstrap.bundle.min.js
 fetch "https://cdn.jsdelivr.net/npm/htmx.org@${HTMX}/dist/htmx.min.js" htmx.min.js
+
+if [ "${VENDOR_UPDATE_CHECKSUMS:-}" = "1" ]; then
+  sort -k2 "$NEWSUMS" > scripts/vendor.sha256
+  echo "  scripts/vendor.sha256 rewritten"
+fi
