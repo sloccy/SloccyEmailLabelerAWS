@@ -1,0 +1,39 @@
+name: Security
+
+# Nightly: scan -> fix -> test -> push; one failure issue.
+# Policy and inputs: see the sloccy/shared-ci README.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Scan, fix and test, but do not push"
+        type: boolean
+        default: true
+      target_branch:
+        description: "Fix and push to this branch instead of main (testing)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: security
+  cancel-in-progress: false
+
+jobs:
+  security:
+    uses: sloccy/shared-ci/.github/workflows/security.yml@v1
+    with:
+      dry_run: ${{ inputs.dry_run == true }}
+      target_branch: ${{ inputs.target_branch || '' }}
+      # Same gate as ci.yml: front-end vendor assets are embedded, so fetch them first.
+      test_command: ./scripts/vendor.sh && go build ./... && go test ./...
+      # Lambda Web Adapter layer: govulncheck cannot see it.
+      extra_fix_script: ./scripts/lwa-autofix.sh
+    secrets:
+      token: ${{ secrets.WORKFLOW_TOKEN }}

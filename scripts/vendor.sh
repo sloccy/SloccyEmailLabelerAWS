@@ -2,7 +2,7 @@
 # Materializes pinned front-end deps into static/vendor/ (gitignored), which the Go
 # binary embeds and serves at /static/vendor/ — the UI has no runtime CDN dependency.
 #
-# Versions live in package.json so Dependabot's npm ecosystem can bump them; this
+# Versions live in package.json (bumped by hand on a Dependabot alert); this
 # script fetches those exact versions from jsDelivr (same artifacts as the npm
 # registry) so neither node nor npm is ever needed. Pre-gzipped copies are written
 # alongside because server.go serves <asset>.gz when the client accepts gzip.
@@ -10,8 +10,8 @@
 # Each fetch is checked against vendor.sha256 before being embedded — a compromised
 # CDN or MITM'd fetch would otherwise ship attacker JS straight into the deployed
 # binary with nothing else in the pipeline to catch it (there's no npm lockfile,
-# by design). When Dependabot bumps BOOTSTRAP/HTMX in package.json, regenerate
-# vendor.sha256 in the same PR (this script's error message says how) — the two
+# by design). When you bump BOOTSTRAP/HTMX in package.json, regenerate
+# vendor.sha256 in the same commit (this script's error message says how) — the two
 # are meant to move together, not drift.
 set -euo pipefail
 cd "$(dirname "$0")/.."

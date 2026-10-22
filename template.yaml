@@ -78,11 +78,11 @@ Parameters:
   # Referenced by both WebFunction and PushFunction via !Sub (below) so the region stays
   # dynamic (${AWS::Region}); only the version number is duplicated, and only here.
   #
-  # SECURITY NOTE — govulncheck and Dependabot can't see Lambda layers, so
-  # .github/workflows/lwa-autofix.yml (scripts/lwa-autofix.sh) covers this one: when upstream
-  # publishes a security advisory the pinned release is still exposed to, it opens an
-  # auto-merging PR bumping this Default to the lowest fixed release's layer version (from
-  # upstream's README at that release tag). It never bumps to latest otherwise.
+  # SECURITY NOTE — govulncheck can't see Lambda layers, so the nightly security workflow
+  # runs scripts/lwa-autofix.sh for this one: when upstream publishes a security advisory
+  # the pinned release is still exposed to, it bumps this Default to the lowest fixed
+  # release's layer version (from upstream's README at that release tag) and pushes after
+  # the tests pass. It never bumps to latest otherwise.
   LambdaWebAdapterLayerVersion:
     Type: Number
     Default: 28

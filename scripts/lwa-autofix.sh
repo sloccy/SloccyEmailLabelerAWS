@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # Conservative auto-bump for the Lambda Web Adapter layer (template.yaml).
 #
-# govulncheck and Dependabot can't see this layer, so this is its equivalent: act only when
+# govulncheck can't see this layer, so this is its equivalent: act only when
 # upstream has PUBLISHED a security advisory that the pinned release is still vulnerable to,
 # and then bump to the lowest layer version that carries the fix — never to "latest".
 #
 # The layer version <-> release mapping comes from upstream's README at each release tag,
 # which names that release's arm64 layer ARN. Anything we can't map or parse exits non-zero
-# (the workflow turns that into a failed run + email) rather than guessing.
+# (the nightly workflow turns that into a failed run + issue) rather than guessing.
 #
-# Prints "bumped=<old>-><new> (<release>, <GHSA ids>)" to $GITHUB_OUTPUT when it edits
-# template.yaml; prints nothing and leaves the file alone when no bump is needed.
+# Run by the shared security workflow as its extra_fix_script. When it edits template.yaml
+# it appends one summary line to $SUMMARY_FILE (used in the commit message); when no bump
+# is needed it prints a note and leaves the file alone.
 set -euo pipefail
 
 REPO=awslabs/aws-lambda-web-adapter
 TEMPLATE=${TEMPLATE:-template.yaml}
-OUT=${GITHUB_OUTPUT:-/dev/stdout}
+OUT=${SUMMARY_FILE:-/dev/stdout}
 
 current=$(awk '/^  LambdaWebAdapterLayerVersion:/{f=1} f&&/Default:/{print $2; exit}' "$TEMPLATE")
 [[ "$current" =~ ^[0-9]+$ ]] || { echo "could not read pinned layer version from $TEMPLATE" >&2; exit 1; }
@@ -64,5 +65,5 @@ new=${layer_of[$need]:-}
 [ "$new" -gt "$current" ] || { echo "mapping for $need ($new) is not newer than pinned $current" >&2; exit 1; }
 
 sed -i "/^  LambdaWebAdapterLayerVersion:/,/Default:/ s/Default: $current/Default: $new/" "$TEMPLATE"
-echo "bumped=layer $current -> $new ($need; fixes${ids})" >> "$OUT"
+echo "Lambda Web Adapter layer $current -> $new ($need; fixes${ids})" >> "$OUT"
 echo "bumped layer $current -> $new for $need"

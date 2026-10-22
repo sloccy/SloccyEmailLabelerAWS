@@ -184,7 +184,7 @@ Outputs include the **WebFunctionUrl** (Function URL), **WebDistributionDomain**
 
 #### Dependency updates (security-only)
 
-Routine version bumps are disabled. Dependencies move only for security reasons: a weekly `govulncheck` workflow (shared from `sloccy/shared-ci`) bumps modules with *called* vulnerable code to the minimum fixed version and opens an auto-merging PR, and Dependabot handles advisory-driven security updates. Both flows need the `WORKFLOW_TOKEN` repo secret (a fine-grained PAT with Contents + Pull requests read/write) — bot-created events can't trigger CI or the deploy workflow, so without it the PRs stall until a human intervenes.
+Routine version bumps are disabled. Dependencies move only for security reasons. A nightly `security.yml` workflow (shared from `sloccy/shared-ci`) runs `govulncheck`, bumps modules with *called* vulnerable code to the minimum fixed version (and the pinned Lambda Web Adapter layer via `scripts/lwa-autofix.sh`), runs the tests, and pushes straight to `main`, which then deploys. If the tests fail nothing is pushed and a single "Security automation is failing" issue is opened (it closes itself on the next green run). It needs the `WORKFLOW_TOKEN` repo secret, a fine-grained PAT with Contents read/write: a push made by the built-in token would not trigger the deploy workflow. The front-end vendor pins (Bootstrap, htmx) have no lockfile by design, so they are not audited by the job; GitHub's Dependabot *alerts* tell you when to bump them by hand.
 
 #### Backups
 
@@ -270,7 +270,7 @@ Real-time labeling runs via the **PushFunction** (public Function URL, OIDC-veri
 git clone https://github.com/sloccy/SloccyEmailLabelerAWS.git
 cd SloccyEmailLabelerAWS
 
-# Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (Dependabot-managed)
+# Frontend vendor assets (Bootstrap, htmx) are pinned in package.json (bumped by hand on a Dependabot alert)
 # and fetched into static/vendor/ at build time — run once before serving the UI locally:
 ./scripts/vendor.sh
 
